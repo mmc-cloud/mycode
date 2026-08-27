@@ -36,7 +36,7 @@ _EXIT_CODES: dict[AgentRunStatus, int] = {
 
 @dataclass(frozen=True)
 class AgentRunOutcome:
-    """Machine-readable run result without model text or exception details."""
+    """Loop termination result; completed does not assert semantic correctness."""
 
     status: AgentRunStatus
     stop_reason: AgentStopReason | None

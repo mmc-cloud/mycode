@@ -1,38 +1,46 @@
 from mycode.prompts import build_agent_system_prompt, build_read_only_agent_system_prompt
 
 
-def test_agent_system_prompt_lists_read_and_write_tools() -> None:
+def test_agent_system_prompt_uses_runtime_schemas_as_tool_fact_source() -> None:
     prompt = build_agent_system_prompt()
 
-    assert "read_file" in prompt
-    assert "glob" in prompt
-    assert "grep" in prompt
-    assert "write_file" in prompt
-    assert "edit_file" in prompt
-    assert "run_command" in prompt
-    assert "run_validation" in prompt
+    assert "tool schemas 是工具名称、参数和可用性的唯一事实来源" in prompt
+    assert "Base Prompt 不维护工具白名单" in prompt
+    assert "当前轮 tool schemas 之外的工具" in prompt
+    assert "可用工具：" not in prompt
+    assert "- read_file：" not in prompt
+    assert "- write_file：" not in prompt
 
 
 def test_agent_system_prompt_sets_write_boundaries() -> None:
     prompt = build_agent_system_prompt()
 
-    assert "必须使用 write_file 或 edit_file" in prompt
-    assert "write_file 是整文件写入" in prompt
-    assert "edit_file 的 old_text 必须来自当前文件内容" in prompt
+    assert "当前 schemas 中适用的写入或编辑工具" in prompt
+    assert "优先使用精确编辑工具" in prompt
+    assert "旧文本必须来自当前文件内容" in prompt
     assert "必须经过权限确认" in prompt
     assert "必须串行推进" in prompt
-    assert "同一轮不要同时发起多个 write_file、edit_file、run_command 或 run_validation 调用" in prompt
+    assert "同一轮不要同时发起多个写入、编辑、命令或验证调用" in prompt
 
 
 def test_agent_system_prompt_sets_command_boundaries() -> None:
     prompt = build_agent_system_prompt()
 
-    assert "必须使用 run_validation" in prompt
-    assert "其他非交互命令使用 run_command" in prompt
+    assert "优先使用当前 schemas 中的验证专用工具" in prompt
+    assert "适用的命令工具" in prompt
     assert "非交互命令" in prompt
     assert "必须经过权限确认" in prompt
     assert "不要尝试删除文件" in prompt
-    assert "不能请求或假装使用 read_file、glob、grep、write_file、edit_file、run_command、run_validation 之外的工具" in prompt
+    assert "不能请求或假装使用当前轮 tool schemas 之外的工具" in prompt
+
+
+def test_agent_system_prompt_requires_artifact_rehydration_without_rerun() -> None:
+    prompt = build_agent_system_prompt()
+
+    assert "[tool result externalized]" in prompt
+    assert "artifact_path" in prompt
+    assert "read_artifact" in prompt
+    assert "不要仅为恢复同一结果重新执行原工具" in prompt
 
 
 def test_agent_system_prompt_sets_general_tool_narration_and_consistency_rules() -> None:
@@ -59,7 +67,7 @@ def test_agent_system_prompt_explains_lightweight_task_phase_loop() -> None:
     assert "任务初始处于 INVESTIGATE" in prompt
     assert "正式修改时进入 ACT" in prompt
     assert "修改后进入 VERIFY" in prompt
-    assert "成功后进入 DONE" in prompt
+    assert "成功后进入 VALIDATED" in prompt
 
 
 def test_agent_system_prompt_handles_sensitive_write_results() -> None:
@@ -84,9 +92,8 @@ def test_agent_system_prompt_appends_project_instructions_with_safety_boundary()
 def test_agent_system_prompt_enables_controlled_memory_tools() -> None:
     prompt = build_agent_system_prompt(memory_enabled=True)
 
-    assert "list_memories" in prompt
-    assert "save_memory" in prompt
-    assert "delete_memory" in prompt
+    assert "具体名称、参数和读写能力仍以 schema 为准" in prompt
+    assert "记忆写入或删除工具" in prompt
     assert "只有用户明确要求" in prompt
     assert "不能保存完整对话" in prompt
     assert "必须经过权限确认" in prompt
@@ -121,12 +128,23 @@ def test_read_only_agent_system_prompt_is_non_empty() -> None:
     assert prompt.strip() != ""
 
 
-def test_read_only_agent_system_prompt_lists_read_only_tools() -> None:
+def test_read_only_agent_system_prompt_uses_runtime_schemas_as_tool_fact_source() -> None:
     prompt = build_read_only_agent_system_prompt()
 
-    assert "read_file" in prompt
-    assert "glob" in prompt
-    assert "grep" in prompt
+    assert "只读 tool schemas 是工具名称、参数和可用性的唯一事实来源" in prompt
+    assert "本 Prompt 不维护工具白名单" in prompt
+    assert "可用工具：" not in prompt
+    assert "- read_file：" not in prompt
+    assert "不要请求或假装使用当前轮只读 tool schemas 之外的工具" in prompt
+
+
+def test_read_only_agent_system_prompt_requires_artifact_rehydration() -> None:
+    prompt = build_read_only_agent_system_prompt()
+
+    assert "[tool result externalized]" in prompt
+    assert "artifact_path" in prompt
+    assert "read_artifact" in prompt
+    assert "不要仅为恢复同一结果重新执行原工具" in prompt
 
 
 def test_read_only_agent_system_prompt_sets_read_only_boundary() -> None:

@@ -18,13 +18,13 @@ from mycode.tools import Workspace, create_default_tool_registry
         ("project_script", True),
         ("python_inline", True),
         ("python_inline_failure", False),
-        ("timeout", False),
+        ("timeout", None),
     ],
 )
 def test_real_main_agent_validation_reaches_run_progress(
     tmp_path: Path,
     case: str,
-    expected_success: bool,
+    expected_success: bool | None,
 ) -> None:
     command, timeout_seconds = _prepare_validation_command(tmp_path, case)
     registry = create_default_tool_registry(
@@ -62,7 +62,7 @@ def test_real_main_agent_validation_reaches_run_progress(
     assert runner.last_run_progress.last_verification_succeeded is expected_success
 
 
-def test_process_start_failure_does_not_reach_verify(
+def test_process_start_failure_records_validation_attempt_without_result(
     tmp_path: Path,
 ) -> None:
     registry = create_default_tool_registry(
@@ -90,7 +90,7 @@ def test_process_start_failure_does_not_reach_verify(
     list(runner.run("run the relevant validation"))
 
     assert runner.last_run_progress is not None
-    assert runner.last_run_progress.verification_turn_count == 0
+    assert runner.last_run_progress.verification_turn_count == 1
     assert runner.last_run_progress.last_verification_succeeded is None
 
 

@@ -53,15 +53,16 @@ class CliPresenter:
         if event.type == "progress":
             if self.mode == "debug" and event.progress is not None:
                 progress = event.progress
-                behaviors = ",".join(progress.behaviors) or "none"
+                effects = ",".join(progress.effects) or "none"
                 self.output(
                     "progress> "
                     f"phase={progress.task_phase} "
-                    f"behaviors={behaviors} "
+                    f"effects={effects} "
                     f"reason={progress.transition_reason} "
                     "ready_investigations="
                     f"{progress.ready_investigation_turn_count} "
-                    f"done_extra_tools={progress.done_extra_tool_turn_count}"
+                    "post_validation_tools="
+                    f"{progress.post_validation_tool_turn_count}"
                 )
             return
 

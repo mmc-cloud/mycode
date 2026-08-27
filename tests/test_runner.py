@@ -25,6 +25,8 @@ from mycode.runner import (
     ToolBatchExecution,
     ToolBatchContractError,
     ToolCallExecution,
+    _execute_tool_batch_with_policy,
+    _observe_tool_turn_progress,
     execute_tool_batch,
     format_tool_result,
 )
@@ -32,6 +34,7 @@ from mycode.run_progress import (
     DEFAULT_READONLY_TURN_LIMIT,
     DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT,
     DEFAULT_READY_ACTION_TURN_LIMIT,
+    RunProgress,
 )
 from mycode.permissions import ConfirmationResult, PermissionDecision
 from mycode.tools import (
@@ -88,7 +91,7 @@ def test_runner_returns_final_answer_without_tools() -> None:
     ]
 
 
-def test_runner_intercepts_unverified_completion_only_once() -> None:
+def test_runner_intercepts_unverified_completion_once_for_current_revision() -> None:
     write_call = AgentToolCall(
         id="call_write",
         name="write_file",
@@ -113,14 +116,18 @@ def test_runner_intercepts_unverified_completion_only_once() -> None:
 
     assert response.content == "cannot validate; incomplete"
     assert runner.last_run_progress is not None
-    assert runner.last_run_progress.completion_correction_used is True
+    assert runner.last_run_progress.completion_correction_revision == 1
     assert len(llm_client.seen_conversations) == 3
     correction_messages = [
         str(message["content"])
         for message in llm_client.seen_conversations[2]
         if message["role"] == "system"
     ]
-    assert any("只会强制一次" in message for message in correction_messages)
+    assert any(
+        "还没有通过 Runtime 认可的最终验证" in message
+        and "`run_validation`" in message
+        for message in correction_messages
+    )
     assert all(
         message.content != "premature"
         for message in runner.conversation.get_messages()
@@ -179,11 +186,180 @@ def test_runner_allows_completion_after_current_revision_validation() -> None:
 
     assert response.content == "verified"
     assert runner.last_run_progress is not None
-    assert runner.last_run_progress.completion_correction_used is False
+    assert runner.last_run_progress.completion_correction_revision is None
     assert runner.last_run_progress.validated_revision == 1
 
 
-def test_runner_does_not_reblock_after_failed_correction_validation() -> None:
+def test_runner_reopens_completion_after_later_validation_failure() -> None:
+    calls = [
+        AgentToolCall(
+            id="write",
+            name="write_file",
+            arguments={"text": "change"},
+        ),
+        AgentToolCall(
+            id="pass",
+            name="run_validation",
+            arguments={"text": "targeted pass"},
+        ),
+        AgentToolCall(
+            id="fail",
+            name="run_validation",
+            arguments={"text": "broader fail"},
+        ),
+    ]
+
+    def validation_sequence(registry, tool_calls):
+        executions = []
+        for call in tool_calls:
+            metadata = {}
+            ok = True
+            if call.id == "pass":
+                metadata = {"exit_code": 0, "timed_out": False}
+            elif call.id == "fail":
+                metadata = {"exit_code": 1, "timed_out": False}
+                ok = False
+            result = (
+                ToolResult.success(f"completed {call.id}", metadata=metadata)
+                if ok
+                else ToolResult.failure(f"failed {call.id}", metadata=metadata)
+            )
+            executions.append(ToolCallExecution(tool_call=call, result=result))
+        return ToolBatchExecution(executions=tuple(executions))
+
+    llm_client = RecordingLLMClient(
+        responses=[
+            *(AgentModelResponse(tool_calls=[call], stop_reason="tool_calls") for call in calls),
+            AgentModelResponse(content="premature after stale pass"),
+            AgentModelResponse(content="reported failed validation"),
+        ]
+    )
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools(
+            [FakeWriteTool(), FakeValidationTool()]
+        ),
+        tool_batch_handler=validation_sequence,
+    )
+
+    response = _run_response(runner, "change and validate")
+
+    assert response.content == "reported failed validation"
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.task_phase == "ACT"
+    assert runner.last_run_progress.mutation_revision == 1
+    assert runner.last_run_progress.validated_revision == 0
+    assert runner.last_run_progress.completion_correction_revision == 1
+    assert len(llm_client.seen_conversations) == 5
+
+
+def test_runner_allows_a_new_completion_correction_after_new_revision() -> None:
+    first_write = AgentToolCall(
+        id="call_write_1",
+        name="write_file",
+        arguments={"text": "first change"},
+    )
+    second_write = AgentToolCall(
+        id="call_write_2",
+        name="write_file",
+        arguments={"text": "second change"},
+    )
+    llm_client = RecordingLLMClient(
+        responses=[
+            AgentModelResponse(tool_calls=[first_write], stop_reason="tool_calls"),
+            AgentModelResponse(content="first premature answer"),
+            AgentModelResponse(tool_calls=[second_write], stop_reason="tool_calls"),
+            AgentModelResponse(content="second premature answer"),
+            AgentModelResponse(content="accepted without validation"),
+        ]
+    )
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools([FakeWriteTool()]),
+        tool_batch_handler=_successful_batch,
+        max_turns=4,
+        convergence_remaining_turns=None,
+        convergence_prompt=None,
+    )
+
+    response = _run_response(runner, "make two changes")
+
+    assert response == AgentModelResponse(content="accepted without validation")
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.completion_correction_revision == 2
+    assert runner.last_run_progress.mutation_revision == 2
+    assert runner.last_run_progress.validated_revision == 0
+    assert runner.last_run_progress.task_phase == "VERIFY"
+    assert len(llm_client.seen_conversations) == 5
+    assert all(
+        message.content
+        not in {"first premature answer", "second premature answer"}
+        for message in runner.conversation.get_messages()
+    )
+
+
+def test_runner_does_not_hard_terminate_after_validation() -> None:
+    calls = [
+        AgentToolCall(
+            id="call_write",
+            name="write_file",
+            arguments={"text": "change"},
+        ),
+        AgentToolCall(
+            id="call_validation",
+            name="run_validation",
+            arguments={"text": "tests"},
+        ),
+        AgentToolCall(
+            id="call_read",
+            name="fake_tool",
+            arguments={"text": "follow-up evidence"},
+        ),
+    ]
+
+    def validation_batch(registry, tool_calls):
+        return ToolBatchExecution(
+            executions=tuple(
+                ToolCallExecution(
+                    tool_call=tool_call,
+                    result=ToolResult.success(
+                        f"completed {tool_call.name}",
+                        metadata=(
+                            {"exit_code": 0, "timed_out": False}
+                            if tool_call.name == "run_validation"
+                            else {}
+                        ),
+                    ),
+                )
+                for tool_call in tool_calls
+            )
+        )
+
+    llm_client = RecordingLLMClient(
+        responses=[
+            AgentModelResponse(tool_calls=[call], stop_reason="tool_calls")
+            for call in calls
+        ]
+        + [AgentModelResponse(content="done after follow-up")]
+    )
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools(
+            [FakeTool(), FakeWriteTool(), FakeValidationTool()]
+        ),
+        tool_batch_handler=validation_batch,
+    )
+
+    response = _run_response(runner, "change, validate, and inspect")
+
+    assert response == AgentModelResponse(content="done after follow-up")
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.task_phase == "VALIDATED"
+    assert runner.last_run_progress.post_validation_tool_turn_count == 1
+    assert len(llm_client.seen_conversations) == 4
+
+
+def test_runner_reopens_correction_after_failed_correction_validation() -> None:
     write_call = AgentToolCall(
         id="call_write",
         name="write_file",
@@ -222,6 +398,7 @@ def test_runner_does_not_reblock_after_failed_correction_validation() -> None:
                 stop_reason="tool_calls",
             ),
             AgentModelResponse(content="tests still fail; incomplete"),
+            AgentModelResponse(content="accepted after renewed correction"),
         ]
     )
     runner = AgentRunner(
@@ -234,10 +411,11 @@ def test_runner_does_not_reblock_after_failed_correction_validation() -> None:
 
     response = _run_response(runner, "make and validate a change")
 
-    assert response.content == "tests still fail; incomplete"
+    assert response.content == "accepted after renewed correction"
     assert runner.last_run_progress is not None
-    assert runner.last_run_progress.completion_correction_used is True
+    assert runner.last_run_progress.completion_correction_revision == 1
     assert runner.last_run_progress.last_verification_succeeded is False
+    assert len(llm_client.seen_conversations) == 5
 
 
 def test_completion_correction_can_validate_and_finish_at_turn_limit() -> None:
@@ -294,6 +472,166 @@ def test_completion_correction_can_validate_and_finish_at_turn_limit() -> None:
     assert response.stop_reason == "final_answer"
     assert response.content == "incomplete after correction"
     assert len(llm_client.seen_conversations) == 4
+
+
+def test_completion_correction_can_accept_second_final_at_turn_limit() -> None:
+    write_call = AgentToolCall(
+        id="call_write",
+        name="write_file",
+        arguments={"text": "change"},
+    )
+    llm_client = RecordingLLMClient(
+        responses=[
+            AgentModelResponse(tool_calls=[write_call], stop_reason="tool_calls"),
+            AgentModelResponse(content="premature"),
+            AgentModelResponse(content="cannot validate; incomplete"),
+        ]
+    )
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools([FakeWriteTool()]),
+        tool_batch_handler=_successful_batch,
+        max_turns=2,
+        convergence_remaining_turns=None,
+        convergence_prompt=None,
+    )
+
+    response = _run_response(runner, "make a change")
+
+    assert response == AgentModelResponse(content="cannot validate; incomplete")
+    assert len(llm_client.seen_conversations) == 3
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.completion_correction_revision == 1
+
+
+def test_historical_completion_correction_does_not_unlock_extra_turns() -> None:
+    calls = [
+        AgentToolCall(
+            id="call_write",
+            name="write_file",
+            arguments={"text": "change"},
+        ),
+        AgentToolCall(
+            id="call_validation",
+            name="run_validation",
+            arguments={"text": "tests"},
+        ),
+        AgentToolCall(
+            id="call_read_1",
+            name="fake_tool",
+            arguments={"text": "follow-up-1"},
+        ),
+        AgentToolCall(
+            id="call_read_2",
+            name="fake_tool",
+            arguments={"text": "follow-up-2"},
+        ),
+    ]
+
+    def validation_batch(registry, tool_calls):
+        return ToolBatchExecution(
+            executions=tuple(
+                ToolCallExecution(
+                    tool_call=tool_call,
+                    result=ToolResult.success(
+                        f"completed {tool_call.name}",
+                        metadata=(
+                            {"exit_code": 0, "timed_out": False}
+                            if tool_call.name == "run_validation"
+                            else {}
+                        ),
+                    ),
+                )
+                for tool_call in tool_calls
+            )
+        )
+
+    llm_client = RecordingLLMClient(
+        responses=[
+            AgentModelResponse(tool_calls=[calls[0]], stop_reason="tool_calls"),
+            AgentModelResponse(content="premature"),
+            AgentModelResponse(tool_calls=[calls[1]], stop_reason="tool_calls"),
+            AgentModelResponse(tool_calls=[calls[2]], stop_reason="tool_calls"),
+            AgentModelResponse(tool_calls=[calls[3]], stop_reason="tool_calls"),
+            AgentModelResponse(content="unexpected extra turn"),
+        ],
+        plain_responses=["checkpoint"],
+    )
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools(
+            [FakeTool(), FakeWriteTool(), FakeValidationTool()]
+        ),
+        tool_batch_handler=validation_batch,
+        max_turns=5,
+        convergence_remaining_turns=None,
+        convergence_prompt=None,
+    )
+
+    response = _run_response(runner, "make, validate, and keep inspecting")
+
+    assert response.stop_reason == "max_turns"
+    assert len(llm_client.seen_conversations) == 5
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.completion_correction_revision == 1
+    assert runner.last_run_progress.validated_revision == 1
+    assert runner.last_run_progress.task_phase == "VALIDATED"
+
+
+def test_multiple_revision_corrections_keep_fixed_runner_upper_bound() -> None:
+    first_write = AgentToolCall(
+        id="call_write_1",
+        name="write_file",
+        arguments={"text": "first change"},
+    )
+    second_write = AgentToolCall(
+        id="call_write_2",
+        name="write_file",
+        arguments={"text": "second change"},
+    )
+    follow_up_calls = [
+        AgentToolCall(
+            id=f"call_read_{index}",
+            name="fake_tool",
+            arguments={"text": f"follow-up-{index}"},
+        )
+        for index in range(1, 3)
+    ]
+    llm_client = RecordingLLMClient(
+        responses=[
+            AgentModelResponse(tool_calls=[first_write], stop_reason="tool_calls"),
+            AgentModelResponse(content="first premature answer"),
+            AgentModelResponse(tool_calls=[second_write], stop_reason="tool_calls"),
+            AgentModelResponse(content="second premature answer"),
+            AgentModelResponse(
+                tool_calls=[follow_up_calls[0]],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(
+                tool_calls=[follow_up_calls[1]],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(content="unexpected unbounded turn"),
+        ],
+        plain_responses=["checkpoint"],
+    )
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools([FakeTool(), FakeWriteTool()]),
+        tool_batch_handler=_successful_batch,
+        max_turns=4,
+        convergence_remaining_turns=None,
+        convergence_prompt=None,
+    )
+
+    response = _run_response(runner, "make two revisions")
+
+    assert response.stop_reason == "max_turns"
+    assert len(llm_client.seen_conversations) == 6
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.completion_correction_revision == 2
+    assert runner.last_run_progress.mutation_revision == 2
+    assert runner.last_run_progress.validated_revision == 0
 
 
 def test_execute_tool_batch_runs_adjacent_safe_tools_concurrently_in_order() -> None:
@@ -646,6 +984,204 @@ def test_runner_rejects_incomplete_custom_tool_batch() -> None:
 
     with pytest.raises(ToolBatchContractError, match="exactly one ordered result"):
         _run_response(runner, "use control")
+
+
+def test_convergence_policy_filters_each_call_and_preserves_batch_order() -> None:
+    calls = [
+        AgentToolCall(
+            id="read",
+            name="fake_tool",
+            arguments={"text": "more evidence"},
+        ),
+        AgentToolCall(
+            id="write",
+            name="write_file",
+            arguments={"text": "minimal edit"},
+        ),
+        AgentToolCall(
+            id="validate",
+            name="run_validation",
+            arguments={"text": "targeted test"},
+        ),
+    ]
+    registry = ToolRegistry.from_tools(
+        [FakeTool(), FakeWriteTool(), FakeValidationTool()]
+    )
+    executed: list[str] = []
+
+    def recording_batch(registry, tool_calls):
+        executed.extend(call.id for call in tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    batch = _execute_tool_batch_with_policy(
+        registry,
+        calls,
+        tool_policy="block_investigate",
+        handler=recording_batch,
+    )
+
+    assert executed == ["write", "validate"]
+    assert [execution.tool_call.id for execution in batch.executions] == [
+        "read",
+        "write",
+        "validate",
+    ]
+    assert [execution.result.ok for execution in batch.executions] == [
+        False,
+        True,
+        True,
+    ]
+    assert batch.executions[0].result.metadata["reason"] == (
+        "runtime_policy_blocked_investigation"
+    )
+
+
+def test_convergence_policy_classifies_run_command_arguments_per_call() -> None:
+    commands = [
+        ("rg", ["rg", "needle", "."]),
+        ("pytest", ["pytest", "-q"]),
+        ("cp", ["cp", "source.py", "target.py"]),
+        ("neutral", ["python", "script.py"]),
+    ]
+    calls = [
+        AgentToolCall(
+            id=call_id,
+            name="run_command",
+            arguments={"command": command},
+        )
+        for call_id, command in commands
+    ]
+    registry = ToolRegistry.from_tools([FakeRunCommandTool()])
+    executed: list[str] = []
+
+    def recording_batch(registry, tool_calls):
+        executed.extend(call.id for call in tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    batch = _execute_tool_batch_with_policy(
+        registry,
+        calls,
+        tool_policy="block_investigate",
+        handler=recording_batch,
+    )
+
+    assert executed == ["pytest", "cp", "neutral"]
+    assert [execution.tool_call.id for execution in batch.executions] == [
+        "rg",
+        "pytest",
+        "cp",
+        "neutral",
+    ]
+    assert batch.executions[0].result.ok is False
+    assert all(execution.result.ok for execution in batch.executions[1:])
+
+
+def test_convergence_policy_blocks_investigative_delegates_per_call() -> None:
+    calls = [
+        AgentToolCall(
+            id=role,
+            name="delegate_task",
+            arguments={"role": role, "objective": f"Run {role}"},
+        )
+        for role in ("explorer", "reviewer", "tester")
+    ]
+    registry = ToolRegistry.from_tools([FakeControlTool()])
+    executed: list[str] = []
+
+    def recording_batch(registry, tool_calls):
+        executed.extend(call.id for call in tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    batch = _execute_tool_batch_with_policy(
+        registry,
+        calls,
+        tool_policy="block_investigate",
+        handler=recording_batch,
+    )
+    progress = RunProgress(readiness_mode="ready_action")
+    _observe_tool_turn_progress(
+        progress,
+        turn_number=1,
+        registry=registry,
+        batch=batch,
+    )
+
+    assert executed == ["tester"]
+    assert [execution.tool_call.id for execution in batch.executions] == [
+        "explorer",
+        "reviewer",
+        "tester",
+    ]
+    assert [execution.result.ok for execution in batch.executions] == [
+        False,
+        False,
+        True,
+    ]
+    assert all(
+        execution.result.metadata.get("reason")
+        == "runtime_policy_blocked_investigation"
+        for execution in batch.executions[:2]
+    )
+    assert progress.ready_action_turn_count == 1
+    assert progress.validated_revision == 0
+
+
+def test_open_policy_keeps_all_delegate_roles_unchanged() -> None:
+    calls = [
+        AgentToolCall(
+            id=role,
+            name="delegate_task",
+            arguments={"role": role, "objective": f"Run {role}"},
+        )
+        for role in ("explorer", "reviewer", "tester")
+    ]
+    registry = ToolRegistry.from_tools([FakeControlTool()])
+    executed: list[str] = []
+
+    def recording_batch(registry, tool_calls):
+        executed.extend(call.id for call in tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    batch = _execute_tool_batch_with_policy(
+        registry,
+        calls,
+        tool_policy="open",
+        handler=recording_batch,
+    )
+
+    assert executed == ["explorer", "reviewer", "tester"]
+    assert all(execution.result.ok for execution in batch.executions)
+
+
+def test_convergence_policy_blocks_explorer_but_executes_same_batch_write() -> None:
+    calls = [
+        AgentToolCall(
+            id="explorer",
+            name="delegate_task",
+            arguments={"role": "explorer", "objective": "Inspect"},
+        ),
+        AgentToolCall(
+            id="write",
+            name="write_file",
+            arguments={"text": "minimal edit"},
+        ),
+    ]
+    registry = ToolRegistry.from_tools([FakeControlTool(), FakeWriteTool()])
+    executed: list[str] = []
+
+    def recording_batch(registry, tool_calls):
+        executed.extend(call.id for call in tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    batch = _execute_tool_batch_with_policy(
+        registry,
+        calls,
+        tool_policy="block_investigate",
+        handler=recording_batch,
+    )
+
+    assert executed == ["write"]
+    assert [execution.result.ok for execution in batch.executions] == [False, True]
 
 
 def test_runner_passes_tool_schemas_to_llm() -> None:
@@ -1014,7 +1550,7 @@ def test_runner_keeps_normal_tools_after_eight_readonly_turns() -> None:
     ]
     assert any(
         message["role"] == "system"
-        and "已连续进行较长时间的调查" in str(message["content"])
+        and "已经进行了较长调查" in str(message["content"])
         for message in llm_client.seen_conversations[8]
     )
     assert runner.last_run_progress is not None
@@ -1110,7 +1646,7 @@ def test_runner_soft_convergence_enters_bounded_action_window() -> None:
                 tool_calls=[
                     AgentToolCall(
                         id="call_soft_0",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe"},
                     )
                 ],
@@ -1120,7 +1656,7 @@ def test_runner_soft_convergence_enters_bounded_action_window() -> None:
                 tool_calls=[
                     AgentToolCall(
                         id="call_soft_1",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe again"},
                     )
                 ],
@@ -1177,7 +1713,7 @@ def test_runner_soft_convergence_enters_bounded_action_window() -> None:
 
     _run_response(runner, "inspect, prepare, and edit")
 
-    action_tool_names = ["write_file", "run_validation"]
+    action_tool_names = ["write_file", "run_validation", "delegate_task"]
     for seen_tools in llm_client.seen_tools[
         DEFAULT_READONLY_TURN_LIMIT + DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT :
         DEFAULT_READONLY_TURN_LIMIT
@@ -1202,7 +1738,7 @@ def test_runner_action_window_rejects_read_before_edit() -> None:
                 tool_calls=[
                     AgentToolCall(
                         id="call_soft_0",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe"},
                     )
                 ],
@@ -1212,7 +1748,7 @@ def test_runner_action_window_rejects_read_before_edit() -> None:
                 tool_calls=[
                     AgentToolCall(
                         id="call_soft_1",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe again"},
                     )
                 ],
@@ -1270,16 +1806,113 @@ def test_runner_action_window_rejects_read_before_edit() -> None:
 
     assert executed_names == (
         ["fake_tool"] * DEFAULT_READONLY_TURN_LIMIT
-        + ["delegate_task"] * DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT
+        + ["fake_tool"] * DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT
         + ["write_file", "run_validation"]
     )
     assert [schema["name"] for schema in llm_client.seen_tools[10]] == [
         "write_file",
         "run_validation",
+        "delegate_task",
     ]
     assert runner.last_run_progress is not None
     assert runner.last_run_progress.readiness_mode == "open"
     assert runner.last_run_progress.ready_investigation_turn_count == 1
+
+
+def test_runner_action_window_allows_artifact_rehydration_before_edit() -> None:
+    responses = _readonly_responses()
+    responses.extend(
+        [
+            AgentModelResponse(
+                tool_calls=[
+                    AgentToolCall(
+                        id="call_soft_0",
+                        name="fake_tool",
+                        arguments={"text": "observe"},
+                    )
+                ],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(
+                tool_calls=[
+                    AgentToolCall(
+                        id="call_soft_1",
+                        name="fake_tool",
+                        arguments={"text": "observe again"},
+                    )
+                ],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(
+                tool_calls=[
+                    AgentToolCall(
+                        id="call_artifact",
+                        name="read_artifact",
+                        arguments={"text": "recover existing evidence"},
+                    )
+                ],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(
+                tool_calls=[
+                    AgentToolCall(
+                        id="call_write",
+                        name="write_file",
+                        arguments={"text": "minimal edit"},
+                    )
+                ],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(
+                tool_calls=[
+                    AgentToolCall(
+                        id="call_validation",
+                        name="run_validation",
+                        arguments={"text": "targeted validation"},
+                    )
+                ],
+                stop_reason="tool_calls",
+            ),
+            AgentModelResponse(content="done"),
+        ]
+    )
+    executed_names: list[str] = []
+
+    def recording_batch(registry, tool_calls):
+        executed_names.extend(call.name for call in tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    llm_client = RecordingLLMClient(responses=responses)
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools(
+            [
+                FakeTool(),
+                FakeArtifactReadTool(),
+                FakeWriteTool(),
+                FakeValidationTool(),
+                FakeControlTool(),
+            ]
+        ),
+        tool_batch_handler=recording_batch,
+    )
+
+    _run_response(runner, "inspect, recover saved evidence, and edit")
+
+    assert [schema["name"] for schema in llm_client.seen_tools[10]] == [
+        "read_artifact",
+        "write_file",
+        "run_validation",
+        "delegate_task",
+    ]
+    assert executed_names == (
+        ["fake_tool"] * DEFAULT_READONLY_TURN_LIMIT
+        + ["fake_tool"] * DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT
+        + ["read_artifact", "write_file", "run_validation"]
+    )
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.rehydration_turn_count == 1
+    assert runner.last_run_progress.ready_investigation_turn_count == 0
 
 
 def test_runner_soft_convergence_with_read_only_registry_can_answer() -> None:
@@ -1328,7 +1961,7 @@ def test_runner_action_window_rejects_read_and_replans() -> None:
                 tool_calls=[
                     AgentToolCall(
                         id="call_soft_0",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe"},
                     )
                 ],
@@ -1338,7 +1971,7 @@ def test_runner_action_window_rejects_read_and_replans() -> None:
                 tool_calls=[
                     AgentToolCall(
                         id="call_soft_1",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe again"},
                     )
                 ],
@@ -1376,14 +2009,15 @@ def test_runner_action_window_rejects_read_and_replans() -> None:
 
     assert executed_names == (
         ["fake_tool"] * DEFAULT_READONLY_TURN_LIMIT
-        + ["delegate_task"] * DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT
+        + ["fake_tool"] * DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT
     )
     assert runner.last_run_progress is not None
     assert runner.last_run_progress.readiness_mode == "open"
     tool_results = [
         message
         for message in runner.conversation.get_messages()
-        if message.role == "tool" and "active readiness tool view" in message.content
+        if message.role == "tool"
+        and "Runtime convergence policy" in message.content
     ]
     assert len(tool_results) == 1
 
@@ -1397,7 +2031,7 @@ def test_runner_stream_uses_same_hybrid_readiness_path() -> None:
                     type="tool_call",
                     tool_call=AgentToolCall(
                         id="call_soft_0",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe"},
                     ),
                 )
@@ -1407,7 +2041,7 @@ def test_runner_stream_uses_same_hybrid_readiness_path() -> None:
                     type="tool_call",
                     tool_call=AgentToolCall(
                         id="call_soft_1",
-                        name="delegate_task",
+                        name="fake_tool",
                         arguments={"text": "observe again"},
                     ),
                 )
@@ -1453,11 +2087,11 @@ def test_runner_stream_uses_same_hybrid_readiness_path() -> None:
     assert runner.last_run_progress.task_phase_history == [
         "INVESTIGATE",
         "VERIFY",
-        "DONE",
     ]
     assert any(
         message["role"] == "system"
-        and "阶段=VERIFY" in str(message["content"])
+        and "target_phase: VERIFY" in str(message["content"])
+        and "reason: task_phase_verify" in str(message["content"])
         for message in llm_client.seen_conversations[11]
     )
 
@@ -1556,7 +2190,7 @@ def test_runner_counts_inspect_run_command_as_investigation() -> None:
                 AgentToolCall(
                     id="call_git_diff",
                     name="run_command",
-                    arguments={"text": "git diff"},
+                    arguments={"text": "git diff", "command": ["git", "diff"]},
                 )
             ],
             stop_reason="tool_calls",
@@ -1607,7 +2241,7 @@ def test_runner_counts_inspect_run_command_as_investigation() -> None:
     assert runner.last_run_progress.readiness_mode == "open"
 
 
-def test_runner_records_act_verify_failure_repair_and_done_loop() -> None:
+def test_runner_records_act_verify_failure_repair_and_validated_loop() -> None:
     responses = [
         AgentModelResponse(
             tool_calls=[
@@ -1700,13 +2334,13 @@ def test_runner_records_act_verify_failure_repair_and_done_loop() -> None:
 
     assert response == AgentModelResponse(content="done")
     assert runner.last_run_progress is not None
-    assert runner.last_run_progress.task_phase == "DONE"
+    assert runner.last_run_progress.task_phase == "VALIDATED"
     assert runner.last_run_progress.task_phase_history == [
         "INVESTIGATE",
         "VERIFY",
         "ACT",
         "VERIFY",
-        "DONE",
+        "VALIDATED",
     ]
     assert runner.last_run_progress.last_verification_succeeded is True
     phase_prompts = [
@@ -1715,7 +2349,7 @@ def test_runner_records_act_verify_failure_repair_and_done_loop() -> None:
                 str(message["content"])
                 for message in conversation
                 if message["role"] == "system"
-                and "阶段=" in str(message["content"])
+                and "reason: task_phase_" in str(message["content"])
             ),
             "",
         )
@@ -1723,12 +2357,12 @@ def test_runner_records_act_verify_failure_repair_and_done_loop() -> None:
     ]
     assert phase_prompts[0] == ""
     assert phase_prompts[1] == ""
-    assert "阶段=VERIFY" in phase_prompts[2]
-    assert "阶段=ACT" in phase_prompts[3]
-    assert "阶段=VERIFY" in phase_prompts[4]
-    assert "阶段=DONE" in phase_prompts[5]
+    assert "target_phase: VERIFY" in phase_prompts[2]
+    assert "target_phase: ACT" in phase_prompts[3]
+    assert "target_phase: VERIFY" in phase_prompts[4]
+    assert "target_phase: VALIDATED" in phase_prompts[5]
     assert not any(
-        message.role == "system" and "阶段=" in message.content
+        message.role == "system" and "Current state:" in message.content
         for message in runner.conversation.get_messages()
     )
 
@@ -1760,9 +2394,70 @@ def test_runner_stream_requests_replan_before_repeated_call_hard_stop() -> None:
     third_turn = [event for event in events if event.type == "turn"][2]
     assert "重复了相同的工具调用" in third_turn.content
     assert any(
-        message["role"] == "system" and "不要再次执行相同工具调用" in str(message["content"])
+        message["role"] == "system"
+        and "不要重复相同的失败动作" in str(message["content"])
         for message in llm_client.seen_conversations[2]
     )
+
+
+def test_runner_incorporates_replan_into_active_act_directive() -> None:
+    calls = [
+        AgentToolCall(id="call-write", name="write_file", arguments={"text": "edit"}),
+        AgentToolCall(
+            id="call-verify",
+            name="run_validation",
+            arguments={"text": "test"},
+        ),
+        AgentToolCall(id="call-read-1", name="fake_tool", arguments={"text": "same"}),
+        AgentToolCall(id="call-read-2", name="fake_tool", arguments={"text": "same"}),
+    ]
+    llm_client = RecordingLLMClient(
+        responses=[],
+        stream_events=[
+            *([AgentEvent(type="tool_call", tool_call=call)] for call in calls),
+            [AgentEvent(type="text_delta", content="candidate")],
+            [AgentEvent(type="text_delta", content="done")],
+        ],
+    )
+
+    def failed_validation_batch(registry, tool_calls):
+        return ToolBatchExecution(
+            executions=tuple(
+                ToolCallExecution(
+                    tool_call=tool_call,
+                    result=(
+                        ToolResult.failure(
+                            "validation failed",
+                            metadata={"exit_code": 1, "timed_out": False},
+                        )
+                        if tool_call.name == "run_validation"
+                        else ToolResult.success(f"completed {tool_call.name}")
+                    ),
+                )
+                for tool_call in tool_calls
+            )
+        )
+
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools(
+            [FakeTool(), FakeWriteTool(), FakeValidationTool()]
+        ),
+        tool_batch_handler=failed_validation_batch,
+    )
+
+    list(runner.run("edit and verify"))
+
+    act_directives = [
+        str(message["content"])
+        for message in llm_client.seen_conversations[4]
+        if message["role"] == "system" and "Current state:" in str(message["content"])
+    ]
+    assert len(act_directives) == 1
+    assert "target_phase: ACT" in act_directives[0]
+    assert "reason: task_phase_act_with_replan" in act_directives[0]
+    assert "模型重复了相同的工具调用" in act_directives[0]
+    assert "不要重复相同的失败动作" in act_directives[0]
 
 
 def test_runner_stream_replans_after_three_turns_without_new_tool_evidence() -> None:
@@ -1804,9 +2499,73 @@ def test_runner_stream_replans_after_three_turns_without_new_tool_evidence() -> 
     fifth_turn = [event for event in events if event.type == "turn"][4]
     assert "连续多轮没有新增工具证据" in fifth_turn.content
     assert any(
-        message["role"] == "system" and "选择一个能产生新证据的动作" in str(message["content"])
+        message["role"] == "system"
+        and "一个能够产生新信息的直接动作" in str(message["content"])
+        and "形成结论并结束" in str(message["content"])
         for message in llm_client.seen_conversations[4]
     )
+
+
+def test_runner_routes_resource_stagnation_through_single_replan_guidance(
+    tmp_path,
+) -> None:
+    workspace = Workspace(tmp_path)
+    (tmp_path / "query.py").write_text(
+        "\n".join(f"line {index}" for index in range(1, 20)),
+        encoding="utf-8",
+    )
+    (tmp_path / "other.py").write_text("other\n", encoding="utf-8")
+    (tmp_path / "third.py").write_text("third\n", encoding="utf-8")
+    paths = [
+        "query.py",
+        "other.py",
+        "query.py",
+        "query.py",
+        "third.py",
+        "query.py",
+        "query.py",
+    ]
+    responses = [
+        AgentModelResponse(
+            tool_calls=[
+                AgentToolCall(
+                    id=f"call_{index}",
+                    name="read_file",
+                    arguments={
+                        "path": path,
+                        "start_line": index + 1 if path == "query.py" else 1,
+                        "max_lines": 1,
+                    },
+                )
+            ],
+            stop_reason="tool_calls",
+        )
+        for index, path in enumerate(paths)
+    ]
+    responses.append(AgentModelResponse(content="replanned conclusion"))
+    llm_client = RecordingLLMClient(responses=responses)
+    runner = AgentRunner(
+        llm_client=llm_client,
+        tool_registry=ToolRegistry.from_tools([ReadFileTool(workspace)]),
+    )
+
+    response = _run_response(runner, "inspect the implementation")
+
+    assert response.content == "replanned conclusion"
+    runtime_messages = [
+        message
+        for message in llm_client.seen_conversations[7]
+        if message["role"] == "system"
+        and "Current state:" in str(message["content"])
+    ]
+    assert len(runtime_messages) == 1
+    assert "query.py" in str(runtime_messages[0]["content"])
+    assert [schema["name"] for schema in llm_client.seen_tools[7]] == [
+        "read_file"
+    ]
+    assert runner.last_run_progress is not None
+    assert runner.last_run_progress.last_stagnant_resource == "file:query.py"
+    assert list(runner.last_run_progress.recent_investigation_resources) == []
 
 
 def test_runner_stream_continues_from_persisted_max_turns_checkpoint() -> None:
@@ -1894,7 +2653,7 @@ def test_runner_streams_final_answer_text_and_stop_event() -> None:
         AgentEvent(
             type="progress",
             progress=AgentProgressSnapshot(
-                task_phase="DONE",
+                task_phase="INVESTIGATE",
                 transition_reason="final_answer",
             ),
         ),
@@ -1906,7 +2665,7 @@ def test_runner_streams_final_answer_text_and_stop_event() -> None:
     ]
 
 
-def test_runner_stream_intercepts_unverified_completion_only_once() -> None:
+def test_runner_stream_intercepts_unverified_completion_once_for_revision() -> None:
     write_call = AgentToolCall(
         id="call_write",
         name="write_file",
@@ -1948,7 +2707,7 @@ def test_runner_stream_intercepts_unverified_completion_only_once() -> None:
         for event in events
     )
     assert runner.last_run_progress is not None
-    assert runner.last_run_progress.completion_correction_used is True
+    assert runner.last_run_progress.completion_correction_revision == 1
     assert runner.conversation.get_messages()[-1] == Message(
         role="assistant",
         content="incomplete",
@@ -2062,7 +2821,7 @@ def test_runner_streams_tool_call_tool_result_and_second_model_answer() -> None:
             type="progress",
             progress=AgentProgressSnapshot(
                 task_phase="INVESTIGATE",
-                behaviors=("investigate",),
+                effects=("investigate",),
                 transition_reason="tool_turn_observed",
             ),
         ),
@@ -2072,7 +2831,7 @@ def test_runner_streams_tool_call_tool_result_and_second_model_answer() -> None:
         AgentEvent(
             type="progress",
             progress=AgentProgressSnapshot(
-                task_phase="DONE",
+                task_phase="INVESTIGATE",
                 transition_reason="final_answer",
             ),
         ),
@@ -2271,7 +3030,7 @@ def test_runner_stream_honors_custom_tool_batch_stop_response() -> None:
         type="progress",
         progress=AgentProgressSnapshot(
             task_phase="INVESTIGATE",
-            behaviors=("investigate",),
+            effects=("investigate",),
             transition_reason="tool_turn_observed",
         ),
     )
@@ -2715,6 +3474,11 @@ class FakeTool(BaseTool[FakeArgs]):
             content=f"fake result: {args.text}",
             metadata={"text": args.text},
         )
+
+
+class FakeArtifactReadTool(FakeTool):
+    name = "read_artifact"
+    description = "Recover an already externalized result."
 
 
 class FakeWriteTool(BaseTool[FakeArgs]):

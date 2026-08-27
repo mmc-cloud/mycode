@@ -13,6 +13,7 @@ from mycode.agent import (
     AgentWarning,
 )
 from mycode.artifacts import (
+    EXTERNALIZED_TOOL_RESULT_MARKER,
     ToolResultArtifactStore,
     artifact_externalization_failure_content,
     artifact_failure_reason,
@@ -35,22 +36,25 @@ from mycode.messages import Message
 from mycode.reasoning import ReasoningState
 from mycode.run_progress import (
     COMPLETION_CORRECTION_EXTRA_TURNS,
+    COMPLETION_CORRECTION_PROMPT,
     DEFAULT_MAX_TURNS,
     DEFAULT_READONLY_TURN_LIMIT,
     DEFAULT_STAGNANT_TURN_LIMIT,
     MAIN_CONVERGENCE_PROMPT,
     MAIN_CONVERGENCE_REMAINING_TURNS,
     MAX_TURNS_FINALIZATION_PROMPT,
-    ReadinessMode,
     RunProgress,
-    ToolBehaviorObservation,
-    classify_tool_behavior,
+    ToolPolicy,
+    ToolObservation,
+    blocks_investigation_for_policy,
+    decide_completion_request,
+    observe_tool_result,
     normalize_run_checkpoint,
+    resolve_runtime_decision,
     resume_guidance,
     tool_result_evidence,
-    turn_guidance,
 )
-from mycode.tools import ToolRegistry, ToolResult
+from mycode.tools import ToolRegistry, ToolResult, Workspace
 
 
 DEFAULT_REPEATED_TOOL_CALL_LIMIT = 3
@@ -78,11 +82,6 @@ class ToolCallExecution:
 class ToolBatchExecution:
     executions: tuple[ToolCallExecution, ...]
     stop_response: AgentModelResponse | None = None
-
-
-@dataclass(frozen=True)
-class _ReadinessToolTurn:
-    batch_override: ToolBatchExecution | None = None
 
 
 ToolBatchHandler = Callable[
@@ -293,6 +292,11 @@ class AgentRunner:
         init=False,
         repr=False,
     )
+    _ephemeral_tool_result_groups: list[dict[str, str]] = field(
+        default_factory=list,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.max_turns < 1:
@@ -331,6 +335,8 @@ class AgentRunner:
 
             previous_tool_call_signature: str | None = None
             repeated_tool_call_count = 0
+            completion_correction_guidance_pending = False
+            completion_extension_remaining = 0
             progress = RunProgress(
                 stagnant_turn_limit=self.stagnant_turn_limit,
                 readonly_turn_limit=self.readonly_turn_limit,
@@ -354,46 +360,54 @@ class AgentRunner:
             for turn_index in range(
                 self.max_turns + COMPLETION_CORRECTION_EXTRA_TURNS
             ):
-                if turn_index >= self.max_turns and not progress.completion_correction_used:
+                if (
+                    turn_index >= self.max_turns
+                    and completion_extension_remaining == 0
+                ):
                     break
+                if completion_extension_remaining > 0:
+                    completion_extension_remaining -= 1
                 content_parts: list[str] = []
                 reasoning_parts: list[str] = []
                 reasoning_state: ReasoningState = "absent"
                 tool_calls: list[AgentToolCall] = []
                 deferred_visible_events: list[AgentEvent] = []
                 defer_completion_candidate = (
-                    self.tool_registry.get("run_validation") is not None
-                    and progress.needs_completion_correction
+                    decide_completion_request(progress) == "correct"
                 )
-                readiness_mode = progress.readiness_mode
-                tools = _tool_schemas_for_readiness_mode(
-                    self.tool_registry,
-                    readiness_mode,
-                )
-                readiness_guidance, readiness_notice = (
-                    progress.readiness_guidance_for_turn(turn_index + 1)
-                )
-                guidance, guidance_notice = turn_guidance(
+                readiness_notice = progress.take_readiness_notice(turn_index + 1)
+                pending_replan_reason = progress.pending_replan_reason
+                decision = resolve_runtime_decision(
+                    progress=progress,
                     turn_index=turn_index,
                     max_turns=self.max_turns,
                     convergence_remaining_turns=self.convergence_remaining_turns,
                     convergence_prompt=self.convergence_prompt,
-                    task_phase_guidance=progress.task_phase_guidance_for_turn(),
-                    readiness_guidance=readiness_guidance,
                     readiness_notice=readiness_notice,
                     resume_guidance=continuation_guidance,
-                    replan_reason=progress.take_replan_reason(),
                     completion_correction_guidance=(
-                        progress.take_completion_correction_guidance()
+                        COMPLETION_CORRECTION_PROMPT
+                        if completion_correction_guidance_pending
+                        else None
                     ),
+                )
+                completion_correction_guidance_pending = False
+                if pending_replan_reason is not None and decision.guidance:
+                    progress.take_replan_reason()
+                tools = _tool_schemas_for_policy(
+                    self.tool_registry,
+                    decision.tool_policy,
                 )
                 yield AgentEvent(
                     type="turn",
-                    content=guidance_notice,
+                    content=decision.notice,
                     turn_number=turn_index + 1,
                     max_turns=self.max_turns,
                 )
-                model_context = self._model_context(tools, guidance=guidance)
+                model_context = self._model_context(
+                    tools,
+                    guidance=decision.guidance,
+                )
                 for warning in self._drain_artifact_warnings():
                     yield AgentEvent(type="artifact_warning", content=warning.content)
 
@@ -475,10 +489,12 @@ class AgentRunner:
                 self._observe_token_usage(model_context)
                 content = "".join(content_parts)
                 if not tool_calls:
-                    if (
-                        self.tool_registry.get("run_validation") is not None
-                        and progress.intercept_unverified_completion_once()
-                    ):
+                    if decide_completion_request(progress) == "correct":
+                        progress.record_completion_correction()
+                        completion_extension_remaining = (
+                            COMPLETION_CORRECTION_EXTRA_TURNS
+                        )
+                        completion_correction_guidance_pending = True
                         yield _progress_event(progress)
                         continue
                     yield from deferred_visible_events
@@ -490,35 +506,26 @@ class AgentRunner:
 
                 yield from deferred_visible_events
 
-                readiness_turn = _prepare_readiness_tool_turn(
-                    progress,
-                    registry=self.tool_registry,
-                    readiness_mode=readiness_mode,
-                    tool_calls=tool_calls,
+                repeated_response = _check_repeated_tool_calls(
+                    tool_calls,
+                    previous_tool_call_signature=previous_tool_call_signature,
+                    repeated_tool_call_count=repeated_tool_call_count,
+                    repeated_tool_call_limit=self.repeated_tool_call_limit,
                 )
-                batch_override = readiness_turn.batch_override
-
-                if batch_override is None:
-                    repeated_response = _check_repeated_tool_calls(
-                        tool_calls,
-                        previous_tool_call_signature=previous_tool_call_signature,
-                        repeated_tool_call_count=repeated_tool_call_count,
-                        repeated_tool_call_limit=self.repeated_tool_call_limit,
+                if repeated_response.stop_response is not None:
+                    yield AgentEvent(
+                        type="stop",
+                        content=repeated_response.stop_response.content,
+                        stop_reason=repeated_response.stop_response.stop_reason,
                     )
-                    if repeated_response.stop_response is not None:
-                        yield AgentEvent(
-                            type="stop",
-                            content=repeated_response.stop_response.content,
-                            stop_reason=repeated_response.stop_response.stop_reason,
-                        )
-                        return
+                    return
 
-                    previous_tool_call_signature = (
-                        repeated_response.previous_tool_call_signature
-                    )
-                    repeated_tool_call_count = repeated_response.repeated_tool_call_count
-                    if repeated_tool_call_count >= 2:
-                        progress.request_replan("模型重复了相同的工具调用")
+                previous_tool_call_signature = (
+                    repeated_response.previous_tool_call_signature
+                )
+                repeated_tool_call_count = repeated_response.repeated_tool_call_count
+                if repeated_tool_call_count >= 2:
+                    progress.request_replan("模型重复了相同的工具调用")
 
                 self.conversation.add_assistant_tool_calls(
                     content=content,
@@ -527,20 +534,21 @@ class AgentRunner:
                     reasoning_state=reasoning_state,
                 )
 
-                batch = (
-                    batch_override
-                    if batch_override is not None
-                    else self.tool_batch_handler(self.tool_registry, tool_calls)
+                batch = _execute_tool_batch_with_policy(
+                    self.tool_registry,
+                    tool_calls,
+                    tool_policy=decision.tool_policy,
+                    handler=self.tool_batch_handler,
                 )
                 _validate_tool_batch(tool_calls, batch)
                 progress.observe_evidence(_batch_evidence(batch))
-                if batch_override is None:
-                    _observe_tool_turn_progress(
-                        progress,
-                        turn_number=turn_index + 1,
-                        registry=self.tool_registry,
-                        batch=batch,
-                    )
+                _observe_tool_turn_progress(
+                    progress,
+                    turn_number=turn_index + 1,
+                    registry=self.tool_registry,
+                    batch=batch,
+                )
+                self._begin_ephemeral_tool_result_group()
                 for execution in batch.executions:
                     yield AgentEvent(type="tool_result", tool_result=execution.result)
                     persisted_content = self._tool_result_content(execution)
@@ -667,7 +675,8 @@ class AgentRunner:
     ) -> ModelContext:
         memory_recall = self.last_memory_recall
         canonical_conversation = self._artifact_context_conversation()
-        context_conversation = canonical_conversation
+        context_conversation = self._model_view_conversation(canonical_conversation)
+        ephemeral_results_visible = context_conversation is not canonical_conversation
         compact_stats = None
         if self.compactor is not None:
             prepared = self.compactor.prepare(
@@ -695,10 +704,9 @@ class AgentRunner:
                 None if memory_recall is None else memory_recall.stats
             ),
         )
-        if (
-            context.estimate.over_budget
-            and compact_stats is not None
-            and compact_stats.boundary_id is not None
+        if context.estimate.over_budget and (
+            ephemeral_results_visible
+            or (compact_stats is not None and compact_stats.boundary_id is not None)
         ):
             canonical_fallback = build_model_context(
                 canonical_conversation,
@@ -714,11 +722,15 @@ class AgentRunner:
             )
             if not canonical_fallback.estimate.over_budget:
                 context = canonical_fallback
-                compact_stats = replace(
-                    compact_stats,
-                    status="canonical_fallback",
-                    summary_visible=False,
-                )
+                if ephemeral_results_visible:
+                    self._ephemeral_tool_result_groups.clear()
+                    ephemeral_results_visible = False
+                if compact_stats is not None and compact_stats.boundary_id is not None:
+                    compact_stats = replace(
+                        compact_stats,
+                        status="canonical_fallback",
+                        summary_visible=False,
+                    )
         if compact_stats is not None:
             context = replace(context, compact_stats=compact_stats)
         if guidance:
@@ -729,8 +741,64 @@ class AgentRunner:
                 tools=tools,
                 token_estimator=self.token_estimator,
             )
+            if context.estimate.over_budget and ephemeral_results_visible:
+                canonical_fallback = build_model_context(
+                    canonical_conversation,
+                    self.context_budget,
+                    tools=tools,
+                    token_estimator=self.token_estimator,
+                    memory_message=(
+                        None if memory_recall is None else memory_recall.message
+                    ),
+                    memory_stats=(
+                        None if memory_recall is None else memory_recall.stats
+                    ),
+                )
+                canonical_fallback = _add_model_guidance(
+                    canonical_fallback,
+                    guidance=guidance,
+                    budget=self.context_budget,
+                    tools=tools,
+                    token_estimator=self.token_estimator,
+                )
+                if not canonical_fallback.estimate.over_budget:
+                    context = canonical_fallback
+                    self._ephemeral_tool_result_groups.clear()
         self.last_model_context = context
         return context
+
+    def _model_view_conversation(
+        self,
+        canonical_conversation: Conversation,
+    ) -> Conversation:
+        if not self._ephemeral_tool_result_groups:
+            return canonical_conversation
+
+        ephemeral_contents = {
+            tool_call_id: content
+            for group in self._ephemeral_tool_result_groups
+            for tool_call_id, content in group.items()
+        }
+        if not ephemeral_contents:
+            return canonical_conversation
+
+        messages: list[Message] = []
+        restored = False
+        for message in canonical_conversation.get_messages():
+            content = (
+                ephemeral_contents.get(message.tool_call_id)
+                if message.role == "tool" and message.tool_call_id is not None
+                else None
+            )
+            if content is None:
+                messages.append(message)
+                continue
+            messages.append(replace(message, content=content))
+            restored = True
+
+        if not restored:
+            return canonical_conversation
+        return Conversation.from_messages(messages)
 
     def _artifact_context_conversation(self) -> Conversation:
         if self.tool_result_artifact_store is None:
@@ -771,7 +839,22 @@ class AgentRunner:
                 original_content=content,
                 reason=reason,
             )
+        if (
+            externalized != content
+            and EXTERNALIZED_TOOL_RESULT_MARKER in externalized
+        ):
+            if self._ephemeral_tool_result_groups:
+                self._ephemeral_tool_result_groups[-1][execution.tool_call.id] = content
         return externalized
+
+    def _begin_ephemeral_tool_result_group(self) -> None:
+        groups_to_keep = self.context_budget.recent_tool_result_groups_to_keep
+        if groups_to_keep == 0:
+            self._ephemeral_tool_result_groups.clear()
+            return
+
+        self._ephemeral_tool_result_groups.append({})
+        del self._ephemeral_tool_result_groups[:-groups_to_keep]
 
     def _historical_artifact_failure_content(
         self,
@@ -924,10 +1007,12 @@ def _progress_event(progress: RunProgress) -> AgentEvent:
         type="progress",
         progress=AgentProgressSnapshot(
             task_phase=progress.task_phase,
-            behaviors=tuple(sorted(progress.last_tool_behaviors)),
+            effects=tuple(sorted(progress.last_tool_effects)),
             transition_reason=progress.last_progress_reason,
             ready_investigation_turn_count=progress.ready_investigation_turn_count,
-            done_extra_tool_turn_count=progress.done_extra_tool_turn_count,
+            post_validation_tool_turn_count=(
+                progress.post_validation_tool_turn_count
+            ),
         ),
     )
 
@@ -998,20 +1083,21 @@ def _batch_evidence(batch: ToolBatchExecution) -> set[str]:
     }
 
 
-def _tool_schemas_for_readiness_mode(
+def _tool_schemas_for_policy(
     registry: ToolRegistry,
-    readiness_mode: ReadinessMode,
+    tool_policy: ToolPolicy,
 ) -> list[dict[str, object]]:
-    if readiness_mode in {"open", "soft_convergence"}:
+    if tool_policy == "open":
         return registry.get_schemas()
 
     schemas: list[dict[str, object]] = []
     for tool in registry.list_tools():
         capability = tool.get_permission_profile().capability
-        if readiness_mode == "ready_action" and capability not in {
-            "write",
-            "command",
-        }:
+        if blocks_investigation_for_policy(
+            tool_name=tool.name,
+            capability=capability,
+            arguments={},
+        ):
             continue
         schemas.append(tool.get_schema())
     return schemas
@@ -1037,60 +1123,66 @@ def _observable_tool_call(
     return replace(tool_call, arguments=arguments)
 
 
-def _prepare_readiness_tool_turn(
-    progress: RunProgress,
-    *,
+def _execute_tool_batch_with_policy(
     registry: ToolRegistry,
-    readiness_mode: ReadinessMode,
-    tool_calls: list[AgentToolCall],
-) -> _ReadinessToolTurn:
-    if readiness_mode == "open":
-        return _ReadinessToolTurn()
-
-    allowed_names = {
-        str(schema["name"])
-        for schema in _tool_schemas_for_readiness_mode(registry, readiness_mode)
-    }
-    if all(tool_call.name in allowed_names for tool_call in tool_calls):
-        return _ReadinessToolTurn()
-
-    if readiness_mode != "soft_convergence":
-        progress.observe_restricted_tool_turn(
-            attempted_investigation=any(
-                (tool := registry.get(tool_call.name)) is not None
-                and tool.get_permission_profile().capability == "read"
-                for tool_call in tool_calls
-            )
-        )
-    return _ReadinessToolTurn(
-        batch_override=_rejected_tool_batch(
-            tool_calls,
-            error="Tool call is not available in the active readiness tool view.",
-            reason="readiness_tool_not_allowed",
-        )
-    )
-
-
-def _rejected_tool_batch(
     tool_calls: list[AgentToolCall],
     *,
-    error: str,
-    reason: str,
+    tool_policy: ToolPolicy,
+    handler: ToolBatchHandler,
 ) -> ToolBatchExecution:
-    return ToolBatchExecution(
-        executions=tuple(
+    if tool_policy == "open":
+        return handler(registry, tool_calls)
+
+    executable_calls, overflow_executions = partition_tool_calls_by_limit(tool_calls)
+    allowed_calls: list[AgentToolCall] = []
+    blocked_indexes: set[int] = set()
+    for index, tool_call in enumerate(executable_calls):
+        tool = registry.get(tool_call.name)
+        blocked_investigation = blocks_investigation_for_policy(
+            tool_name=tool_call.name,
+            capability=(
+                tool.get_permission_profile().capability
+                if tool is not None
+                else None
+            ),
+            arguments=tool_call.arguments,
+        )
+        if blocked_investigation:
+            blocked_indexes.add(index)
+        else:
+            allowed_calls.append(tool_call)
+
+    allowed_batch = (
+        handler(registry, allowed_calls)
+        if allowed_calls
+        else ToolBatchExecution(executions=())
+    )
+    _validate_tool_batch(allowed_calls, allowed_batch)
+    allowed_executions = iter(allowed_batch.executions)
+    executions: list[ToolCallExecution] = []
+    for index, tool_call in enumerate(executable_calls):
+        if index not in blocked_indexes:
+            executions.append(next(allowed_executions))
+            continue
+        executions.append(
             ToolCallExecution(
                 tool_call=tool_call,
                 result=ToolResult.failure(
-                    error=error,
+                    error=(
+                        "Runtime convergence policy temporarily blocks open-ended "
+                        "investigation. Use existing evidence to act, validate, "
+                        "rehydrate prior results, or finalize."
+                    ),
                     metadata={
                         "tool_name": tool_call.name,
-                        "reason": reason,
+                        "reason": "runtime_policy_blocked_investigation",
                     },
                 ),
             )
-            for tool_call in tool_calls
         )
+    return ToolBatchExecution(
+        executions=(*executions, *overflow_executions),
+        stop_response=allowed_batch.stop_response,
     )
 
 
@@ -1103,32 +1195,33 @@ def _observe_tool_turn_progress(
 ) -> None:
     progress.observe_tool_turn(
         turn_number=turn_number,
-        observations=_batch_tool_behavior_observations(registry, batch),
+        observations=_batch_tool_observations(registry, batch),
     )
 
 
-def _batch_tool_behavior_observations(
+def _batch_tool_observations(
     registry: ToolRegistry,
     batch: ToolBatchExecution,
-) -> tuple[ToolBehaviorObservation, ...]:
-    return tuple(
-        ToolBehaviorObservation(
-            behavior=classify_tool_behavior(
+) -> tuple[ToolObservation, ...]:
+    observations: list[ToolObservation] = []
+    for execution in batch.executions:
+        tool = registry.get(execution.tool_call.name)
+        workspace = None if tool is None else getattr(tool, "workspace", None)
+        observations.append(
+            observe_tool_result(
                 tool_name=execution.tool_call.name,
                 capability=(
                     tool.get_permission_profile().capability
-                    if (tool := registry.get(execution.tool_call.name)) is not None
+                    if tool is not None
                     else None
                 ),
                 arguments=execution.tool_call.arguments,
                 ok=execution.result.ok,
                 metadata=execution.result.metadata,
-            ),
-            succeeded=execution.result.ok,
-            tool_name=execution.tool_call.name,
+                workspace=workspace if isinstance(workspace, Workspace) else None,
+            )
         )
-        for execution in batch.executions
-    )
+    return tuple(observations)
 
 
 def _check_repeated_tool_calls(

@@ -4,6 +4,9 @@ from datetime import UTC, datetime
 import hashlib
 import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from mycode.artifacts import ToolResultArtifactStore
 from uuid import uuid4
 
 from mycode.agent import AgentEvent, AgentModelResponse
@@ -14,6 +17,7 @@ from mycode.llm import LLMClient
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
 from mycode.messages import Message
+from mycode.observability import ObservationSink
 from mycode.permissions import Confirmer, RejectingConfirmer
 from mycode.runner import (
     DEFAULT_REPEATED_TOOL_CALL_LIMIT,
@@ -90,6 +94,7 @@ class SubAgentRuntime:
     memory_store: MemoryStore | None = None
     memory_recall_policy: MemoryRecallPolicy = field(default_factory=MemoryRecallPolicy)
     context_budget: ContextBudget = field(default_factory=ContextBudget)
+    observability_sink: ObservationSink | None = field(default=None, repr=False)
     max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
     convergence_remaining_turns: int | None = (
         DEFAULT_SUBAGENT_CONVERGENCE_REMAINING_TURNS
@@ -180,6 +185,7 @@ class SubAgentRuntime:
         snapshot_metadata: SubAgentSnapshotMetadata | None = None
         runner: AgentRunner | None = None
         batch_handler: SubAgentToolBatchHandler | None = None
+        artifact_directory: TemporaryDirectory | None = None
 
         try:
             tracker.transition("running", "run_started")
@@ -249,6 +255,7 @@ class SubAgentRuntime:
                     )
                 ]
             )
+            artifact_directory = TemporaryDirectory(prefix="mycode-subagent-")
             runner = AgentRunner(
                 llm_client=self.interaction_gate.run(self.llm_client_factory),
                 tool_registry=registry,
@@ -264,6 +271,10 @@ class SubAgentRuntime:
                 readonly_turn_limit=None,
                 finalize_on_max_turns=False,
                 context_budget=self.context_budget,
+                tool_result_artifact_store=ToolResultArtifactStore(
+                    root=Path(artifact_directory.name),
+                    threshold_chars=self.context_budget.tool_result_compression_threshold_chars,
+                ),
                 token_estimator=TokenEstimator(),
                 memory_context_selector=(
                     None
@@ -271,6 +282,9 @@ class SubAgentRuntime:
                     else FrozenMemoryRecallProvider(runtime_snapshot.memory_recall)
                 ),
                 tool_batch_handler=batch_handler,
+                observability_sink=self.observability_sink,
+                observability_scope="subagent",
+                observability_run_id=run_id,
             )
             response = _collect_agent_events(runner.run(_task_message(task)))
             result = _result_from_response(
@@ -293,6 +307,10 @@ class SubAgentRuntime:
                 error=_safe_error(error),
             )
             tracker.transition_once("failed", "runtime_error")
+
+        finally:
+            if artifact_directory is not None:
+                artifact_directory.cleanup()
 
         execution = SubAgentExecution(
             result=result,

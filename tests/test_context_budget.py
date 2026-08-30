@@ -9,6 +9,7 @@ from mycode.context_budget import (
     TokenEstimator,
     TokenUsage,
     build_model_context as _build_model_context,
+    budget_model_context,
     estimate_conversation as _estimate_conversation,
     estimate_message,
     format_model_context_stats,
@@ -809,4 +810,32 @@ def test_build_model_context_rejects_non_system_memory_message() -> None:
             Conversation(),
             context_budget(100),
             memory_message=Message(role="user", content="memory"),
+        )
+
+
+def test_final_budget_omits_only_memory_not_an_equal_system_message() -> None:
+    memory = Message(role="system", content="same text " * 20)
+    guidance = Message(role="system", content=memory.content)
+    latest = Message(role="user", content="current")
+    budget = context_budget(estimate_conversation(
+        Conversation.from_messages([guidance, latest])
+    ).estimated_input_tokens)
+
+    context = budget_model_context(
+        (memory, guidance, latest), budget,
+        token_estimator=UNIT_TOKEN_ESTIMATOR,
+        memory_message=memory, memory_stats=MemoryContextStats(selected_entry_count=1),
+    )
+
+    assert context.messages == (guidance, latest)
+    assert context.messages[0] is guidance
+    assert context.memory_stats.included_entry_count == 0
+    assert not context.estimate.over_budget
+
+
+def test_final_budget_rejects_memory_not_in_assembled_request() -> None:
+    with pytest.raises(ValueError, match="present in the assembled messages"):
+        budget_model_context(
+            (Message(role="user", content="current"),),
+            memory_message=Message(role="system", content="missing memory"),
         )

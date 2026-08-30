@@ -12,7 +12,7 @@ import tempfile
 
 from pydantic import Field, field_validator
 
-from mycode.context_budget import (
+from mycode.tool_result_format import (
     TOOL_RESULT_METADATA_MARKER,
     parse_tool_result_content,
     safe_tool_metadata,
@@ -131,6 +131,31 @@ class ToolResultArtifactStore:
             f"{TOOL_RESULT_METADATA_MARKER}"
             f"{json.dumps(reference_metadata, ensure_ascii=False, sort_keys=True)}"
         )
+
+    def rehydrate(self, *, tool_name: str, tool_call_id: str, content: str) -> str:
+        """Read a validated reference in this store; never trust a model-supplied path."""
+        info = artifact_reference_info(
+            tool_name=tool_name, tool_call_id=tool_call_id, content=content,
+        )
+        if info is None:
+            raise ValueError("Invalid artifact reference.")
+        path, digest, original_chars = info
+        if not path.is_absolute() or path.parent != self.root or path.name != f"{digest}.txt":
+            raise ValueError("Artifact reference is outside this store.")
+        # Check the lexical path before resolving, including junctions in parents.
+        if any(_is_link_or_reparse_point(part) for part in (path, *path.parents)):
+            raise ValueError("Artifact reference traverses a link or reparse point.")
+        if path.resolve(strict=True).parent != self.root or not path.is_file():
+            raise ValueError("Artifact is not a regular file in this store.")
+        if original_chars > MAX_READABLE_ARTIFACT_BYTES:
+            raise _ArtifactTooLargeError("Artifact is too large to rehydrate.")
+        scan = _scan_utf8_artifact(
+            path, offset_chars=0, max_chars=original_chars,
+            max_bytes=MAX_READABLE_ARTIFACT_BYTES,
+        )
+        if scan.digest != digest or scan.total_chars != original_chars:
+            raise ValueError("Artifact integrity check failed.")
+        return scan.selected_content
 
     def externalize_conversation(
         self,
@@ -729,33 +754,32 @@ def _scan_utf8_artifact(
     )
 
 
-def _is_valid_artifact_reference(
-    root: Path,
+def artifact_reference_info(
     *,
     tool_name: str,
     tool_call_id: str,
     content: str,
-) -> bool:
+) -> tuple[Path, str, int] | None:
     body, separator, metadata_text = content.partition(TOOL_RESULT_METADATA_MARKER)
     if (
         separator == ""
         or len(metadata_text) > MAX_ARTIFACT_REFERENCE_METADATA_CHARS
     ):
-        return False
+        return None
     lines = body.splitlines()
     if len(lines) != 6:
-        return False
+        return None
     status, marker, tool_line, path_line, chars_line, digest_line = lines
     if status not in {"OK", "ERROR"} or marker != EXTERNALIZED_TOOL_RESULT_MARKER:
-        return False
+        return None
     if tool_line != f"tool_name: {tool_name}":
-        return False
+        return None
     if not path_line.startswith("artifact_path: "):
-        return False
+        return None
     if not chars_line.startswith("original_chars: "):
-        return False
+        return None
     if not digest_line.startswith("sha256: "):
-        return False
+        return None
 
     artifact_path_text = path_line.removeprefix("artifact_path: ")
     digest = digest_line.removeprefix("sha256: ")
@@ -763,14 +787,14 @@ def _is_valid_artifact_reference(
         original_chars = int(chars_line.removeprefix("original_chars: "))
         metadata = json.loads(metadata_text)
     except (ValueError, json.JSONDecodeError):
-        return False
+        return None
     if (
         original_chars < 0
         or len(digest) != 64
         or any(character not in "0123456789abcdef" for character in digest)
         or not isinstance(metadata, dict)
     ):
-        return False
+        return None
     required_metadata = {
         "artifact_path": artifact_path_text,
         "artifact_sha256": digest,
@@ -780,9 +804,24 @@ def _is_valid_artifact_reference(
         "tool_name": tool_name,
     }
     if any(metadata.get(key) != value for key, value in required_metadata.items()):
-        return False
+        return None
 
-    artifact_path = Path(artifact_path_text)
+    return Path(artifact_path_text), digest, original_chars
+
+
+def _is_valid_artifact_reference(
+    root: Path,
+    *,
+    tool_name: str,
+    tool_call_id: str,
+    content: str,
+) -> bool:
+    info = artifact_reference_info(
+        tool_name=tool_name, tool_call_id=tool_call_id, content=content,
+    )
+    if info is None:
+        return False
+    artifact_path, digest, original_chars = info
     resolved_root = root.resolve(strict=False)
     resolved_path = artifact_path.resolve(strict=False)
     if (

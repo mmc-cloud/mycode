@@ -1,14 +1,14 @@
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from collections.abc import Iterator
 
 from mycode.context_compact import ConversationCompactor
+from mycode.context_builder import ContextBuilder
 from mycode.context_budget import (
     ContextBudget,
     ContextBudgetExceededError,
     ModelContext,
     TokenEstimator,
     TokenUsage,
-    build_model_context,
 )
 from mycode.conversation import Conversation
 from mycode.llm import LLMClient
@@ -62,43 +62,13 @@ class ChatSession:
         self.conversation.add_assistant_message("".join(reply_parts))
 
     def _model_context(self) -> ModelContext:
-        canonical_conversation = self.conversation
-        context_conversation = canonical_conversation
-        compact_stats = None
-        if self.compactor is not None:
-            prepared = self.compactor.prepare(
-                self.conversation,
-                self.context_budget,
-                token_estimator=self.token_estimator,
-            )
-            context_conversation = prepared.conversation
-            compact_stats = prepared.stats
-            self.last_compact_token_usage = prepared.attempt_token_usage
-
-        context = build_model_context(
-            context_conversation,
-            self.context_budget,
+        result = ContextBuilder(
+            budget=self.context_budget,
             token_estimator=self.token_estimator,
-        )
-        if (
-            context.estimate.over_budget
-            and compact_stats is not None
-            and compact_stats.boundary_id is not None
-        ):
-            canonical_fallback = build_model_context(
-                canonical_conversation,
-                self.context_budget,
-                token_estimator=self.token_estimator,
-            )
-            if not canonical_fallback.estimate.over_budget:
-                context = canonical_fallback
-                compact_stats = replace(
-                    compact_stats,
-                    status="canonical_fallback",
-                    summary_visible=False,
-                )
-        if compact_stats is not None:
-            context = replace(context, compact_stats=compact_stats)
+            compactor=self.compactor,
+        ).build(self.conversation)
+        context = result.context
+        self.last_compact_token_usage = result.compact_attempt_token_usage
         self.last_model_context = context
         if context.estimate.over_budget:
             raise ContextBudgetExceededError(context)

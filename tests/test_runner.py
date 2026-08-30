@@ -10,11 +10,13 @@ from mycode.agent import (
     AgentProgressSnapshot,
     AgentToolCall,
 )
-from mycode.context_budget import ContextBudget, TokenUsage
+from mycode.context_budget import (
+    ContextBudget, MemoryContextStats, TokenUsage, estimate_conversation,
+)
 from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
 from mycode.memory import MemoryStore
-from mycode.memory_context import MemoryContextSelector
+from mycode.memory_context import MemoryContextSelector, MemoryRecall
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
 from mycode.runner import (
@@ -31,6 +33,7 @@ from mycode.runner import (
     format_tool_result,
 )
 from mycode.run_progress import (
+    MAX_TURNS_FINALIZATION_PROMPT,
     DEFAULT_READONLY_TURN_LIMIT,
     DEFAULT_SOFT_CONVERGENCE_TURN_LIMIT,
     DEFAULT_READY_ACTION_TURN_LIMIT,
@@ -74,12 +77,14 @@ def _run_response(runner: AgentRunner, user_message: str) -> AgentModelResponse:
 
 
 def test_runner_returns_final_answer_without_tools() -> None:
+    observations: list[dict[str, object]] = []
     llm_client = RecordingLLMClient(
         responses=[AgentModelResponse(content="final answer")]
     )
     runner = AgentRunner(
         llm_client=llm_client,
         tool_registry=ToolRegistry(),
+        observability_sink=observations.append,
     )
 
     response = _run_response(runner, "hello")
@@ -89,9 +94,35 @@ def test_runner_returns_final_answer_without_tools() -> None:
         Message(role="user", content="hello"),
         Message(role="assistant", content="final answer"),
     ]
+    assert [record["event_type"] for record in observations] == [
+        "context_snapshot",
+        "model_response",
+        "completion_decision",
+    ]
+    assert all(record["schema_version"] == 1 for record in observations)
+    model_response = observations[1]
+    assert model_response["empty_response"] is False
+    assert model_response["content_chars"] == len("final answer")
+    completion = observations[2]
+    assert completion["decision"] == "accepted"
+    assert completion["accepted"] is True
+    assert completion["correction"] is False
+    assert completion["rejected"] is False
+    assert completion["validation_state"] == "none"
 
 
-def test_runner_intercepts_unverified_completion_once_for_current_revision() -> None:
+def test_runner_intercepts_unverified_completion_once_for_current_revision(monkeypatch) -> None:
+    import mycode.context_builder as builder_module
+
+    candidates = []
+    observations: list[dict[str, object]] = []
+    real_budget = builder_module.budget_model_context
+
+    def budget(messages, *args, **kwargs):
+        candidates.append(messages)
+        return real_budget(messages, *args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "budget_model_context", budget)
     write_call = AgentToolCall(
         id="call_write",
         name="write_file",
@@ -110,6 +141,7 @@ def test_runner_intercepts_unverified_completion_once_for_current_revision() -> 
             [FakeWriteTool(), FakeValidationTool()]
         ),
         tool_batch_handler=_successful_batch,
+        observability_sink=observations.append,
     )
 
     response = _run_response(runner, "make a change")
@@ -118,6 +150,26 @@ def test_runner_intercepts_unverified_completion_once_for_current_revision() -> 
     assert runner.last_run_progress is not None
     assert runner.last_run_progress.completion_correction_revision == 1
     assert len(llm_client.seen_conversations) == 3
+    assert len(candidates) == 3
+    completion_decisions = [
+        record
+        for record in observations
+        if record["event_type"] == "completion_decision"
+    ]
+    assert [record["decision"] for record in completion_decisions] == [
+        "correction",
+        "accepted",
+    ]
+    assert completion_decisions[0]["mutation_since_validation"] is True
+    assert completion_decisions[0]["validation_state"] == "unvalidated"
+    assert completion_decisions[1]["reason"] == "completion_correction_already_used"
+    assert [
+        [m.content for m in candidate if m.role == "system"]
+        for candidate in candidates
+    ] == [
+        [m["content"] for m in sent if m["role"] == "system"]
+        for sent in llm_client.seen_conversations
+    ]
     correction_messages = [
         str(message["content"])
         for message in llm_client.seen_conversations[2]
@@ -3164,7 +3216,18 @@ def test_runner_streams_model_error_when_streaming_raises() -> None:
     ]
 
 
-def test_runner_stream_stops_after_max_turns() -> None:
+def test_runner_stream_stops_after_max_turns(monkeypatch) -> None:
+    import mycode.context_builder as builder_module
+
+    requests = []
+    real_budget = builder_module.budget_model_context
+
+    def budget(messages, *args, **kwargs):
+        result = real_budget(messages, *args, **kwargs)
+        requests.append((messages, kwargs["tools"], result))
+        return result
+
+    monkeypatch.setattr(builder_module, "budget_model_context", budget)
     first_tool_call = AgentToolCall(
         id="call_123",
         name="fake_tool",
@@ -3193,6 +3256,11 @@ def test_runner_stream_stops_after_max_turns() -> None:
 
     events = list(runner.run("loop"))
 
+    assert len(requests) == 3  # Two tool requests and one independent finalization.
+    assert requests[-1][0][-1].content == MAX_TURNS_FINALIZATION_PROMPT
+    assert requests[-1][1] == []
+    assert runner.last_model_context.messages == requests[-1][2].messages
+    assert runner.last_model_context.estimate == requests[-1][2].estimate
     assert events[-3:] == [
         AgentEvent(type="model_start"),
         AgentEvent(type="text_delta", content="根据现有信息得到阶段性结论。"),
@@ -3381,6 +3449,83 @@ def test_runner_stream_reports_memory_counts_without_memory_content(
     context_event = next(event for event in events if event.type == "context")
     assert "memory=1 injected/1 selected/1 relevant/1 safe" in context_event.content
     assert "private synthetic command" not in context_event.content
+
+
+@pytest.mark.parametrize("omit_memory", [False, True])
+def test_runner_budgets_guidance_and_memory_together(omit_memory, monkeypatch) -> None:
+    import mycode.context_builder as builder_module
+
+    history = Conversation.from_messages([
+        Message(role="system", content="rules"),
+        Message(role="user", content="current"),
+    ])
+    memory = Message(role="system", content="memory " * 100)
+    guidance = ("current runtime guidance " * 20,)
+    registry = ToolRegistry.from_tools([FakeTool()])
+    tools = registry.get_schemas()
+    without_guidance = estimate_conversation(
+        Conversation.from_messages([*history.get_messages(), memory]), tools=tools,
+    ).estimated_input_tokens
+    runner = AgentRunner(
+        llm_client=RecordingLLMClient(responses=[]), tool_registry=registry,
+        conversation=history,
+        context_budget=context_budget(without_guidance if omit_memory else 5000),
+    )
+    runner.last_memory_recall = MemoryRecall(
+        message=memory, entries=(), stats=MemoryContextStats(selected_entry_count=1),
+    )
+    candidates = []
+    real_budget = builder_module.budget_model_context
+
+    def budget(messages, *args, **kwargs):
+        candidates.append(messages)
+        return real_budget(messages, *args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "budget_model_context", budget)
+    context = runner._model_context(tools, guidance=guidance)
+
+    assert len(candidates) == 1
+    assert candidates[0][-2:] == (memory, Message(role="system", content=guidance[0]))
+    assert context.memory_stats.included_entry_count == (0 if omit_memory else 1)
+    assert context.memory_stats.selected_entry_count == 1
+    assert (memory in context.messages) is not omit_memory
+    assert context.messages[-1] == Message(role="user", content="current")
+    assert not context.estimate.over_budget
+    assert len(history.get_messages()) == 2
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_finalization_budgets_complete_request_without_pretrimming(overflow, monkeypatch) -> None:
+    import mycode.context_builder as builder_module
+
+    history = Conversation.from_messages([
+        Message(role="system", content="rules " * (1000 if overflow else 1)),
+        Message(role="user", content="current task request"),
+        Message(role="assistant", content="oversized last message " * 1000),
+    ])
+    client = RecordingLLMClient(responses=[], plain_responses=["checkpoint"])
+    runner = AgentRunner(
+        llm_client=client, tool_registry=ToolRegistry(), conversation=history,
+        context_budget=context_budget(2000),
+    )
+    candidates = []
+    real_budget = builder_module.budget_model_context
+
+    def budget(messages, *args, **kwargs):
+        candidates.append(messages)
+        return real_budget(messages, *args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "budget_model_context", budget)
+    events = list(runner._stream_finalization_after_max_turns())
+
+    assert len(candidates) == 1
+    assert candidates[0][-1].content == MAX_TURNS_FINALIZATION_PROMPT
+    assert candidates[0][-2].content == "oversized last message " * 1000
+    assert runner.last_model_context.estimate.over_budget is overflow
+    assert any(m.content == "current task request" for m in runner.last_model_context.messages)
+    assert len(client.seen_plain_conversations) == (0 if overflow else 1)
+    assert events[-1].stop_reason == "max_turns"
+    assert all(m.content != MAX_TURNS_FINALIZATION_PROMPT for m in history.get_messages())
 
 
 class RecordingLLMClient:

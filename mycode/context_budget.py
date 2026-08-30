@@ -4,6 +4,14 @@ import math
 
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.tool_result_format import (
+    COMPRESSED_TOOL_RESULT_MARKER, TOOL_RESULT_METADATA_MARKER,
+    ParsedToolResultContent, parse_tool_result_content, safe_tool_metadata,
+    _group_non_system_messages, _flatten_groups, _count_compressed_tool_results,
+)
+from mycode.tool_result_retention import (
+    ToolResultRetentionPolicy, RetentionProjection, ToolResultRetentionStats,
+)
 
 
 DEFAULT_CONTEXT_WINDOW_TOKENS = 128000
@@ -16,13 +24,6 @@ DEFAULT_MIXED_TOKENS_PER_CHAR = 0.8
 DEFAULT_NON_ASCII_TOKENS_PER_CHAR = 1.2
 DEFAULT_CALIBRATION_SAFETY_FACTOR = 1.1
 DEFAULT_MAX_CALIBRATION_SAMPLES = 20
-TOOL_RESULT_METADATA_MARKER = "\n\nMETADATA\n"
-COMPRESSED_TOOL_RESULT_MARKER = "[tool result compressed]"
-LARGE_TOOL_METADATA_KEYS = {"stdout", "stderr"}
-MAX_METADATA_STRING_CHARS = 200
-MAX_TOOL_RESULT_PREVIEW_CHARS = 200
-
-
 @dataclass(frozen=True)
 class ContextBudget:
     """Model context budget measured in tokens."""
@@ -187,6 +188,7 @@ class ModelContext:
     compressed_tool_result_count: int = 0
     memory_stats: "MemoryContextStats | None" = None
     compact_stats: "CompactContextStats | None" = None
+    retention_stats: ToolResultRetentionStats | None = None
 
     @property
     def selected_message_count(self) -> int:
@@ -376,30 +378,68 @@ def build_model_context(
     memory_message: Message | None = None,
     memory_stats: MemoryContextStats | None = None,
 ) -> ModelContext:
+    """Convenience entry for budgeting history with optional memory, without Compact."""
+    messages = tuple(conversation.get_messages())
+    if memory_message is not None:
+        messages = (*messages, memory_message)
+    return budget_model_context(
+        messages,
+        budget,
+        tools=tools,
+        token_estimator=token_estimator,
+        memory_message=memory_message,
+        memory_stats=memory_stats,
+    )
+
+
+def budget_model_context(
+    messages: tuple[Message, ...],
+    budget: ContextBudget | None = None,
+    tools: list[dict[str, object]] | None = None,
+    token_estimator: TokenEstimator | None = None,
+    *,
+    memory_message: Message | None = None,
+    memory_stats: MemoryContextStats | None = None,
+    retention_policy: ToolResultRetentionPolicy | None = None,
+    retention_projection: RetentionProjection | None = None,
+) -> ModelContext:
+    """Apply the final budget to an assembled request; never revisit upstream views.
+
+    Optional memory must already be in messages. Agent requests lower tool-group
+    precision, omit memory, then trim history. Calls without a retention projection
+    retain the existing Chat/standalone trimming and memory-omission behavior.
+    """
     active_budget = ContextBudget() if budget is None else budget
     active_estimator = TokenEstimator() if token_estimator is None else token_estimator
-    conversation_messages = tuple(conversation.get_messages())
     if memory_message is not None and memory_message.role != "system":
         raise ValueError("memory_message must use the system role.")
+    if memory_message is not None and not any(
+        message is memory_message for message in messages
+    ):
+        raise ValueError("memory_message must be present in the assembled messages.")
     if memory_message is None and memory_stats is not None:
         if memory_stats.selected_entry_count > 0:
             raise ValueError(
                 "memory_stats cannot report selected entries without a memory_message."
             )
 
-    candidate_messages = conversation_messages
-    if memory_message is not None:
-        candidate_messages = (*conversation_messages, memory_message)
+    if retention_policy is not None:
+        if retention_projection is None:
+            raise ValueError("Retention budget requires the request's projection.")
+        return _budget_retained_context(
+            messages, active_budget, active_estimator, tools,
+            memory_message, memory_stats, retention_policy, retention_projection,
+        )
 
     context = _build_model_context_from_messages(
-        candidate_messages,
+        messages,
         active_budget,
         tools=tools,
         token_estimator=active_estimator,
     )
     if memory_message is not None and context.estimate.over_budget:
         context = _build_model_context_from_messages(
-            conversation_messages,
+            tuple(message for message in messages if message is not memory_message),
             active_budget,
             tools=tools,
             token_estimator=active_estimator,
@@ -412,6 +452,82 @@ def build_model_context(
         )
 
     return replace(context, memory_stats=memory_stats)
+
+
+def _budget_retained_context(
+    original_messages: tuple[Message, ...],
+    budget: ContextBudget,
+    token_estimator: TokenEstimator,
+    tools: list[dict[str, object]] | None,
+    memory_message: Message | None,
+    memory_stats: MemoryContextStats | None,
+    policy: ToolResultRetentionPolicy,
+    projection: RetentionProjection,
+) -> ModelContext:
+    """Only lower precision on this assembled candidate; never repeat projection/Compact."""
+    systems = tuple(m for m in original_messages if m.role == "system")
+    groups = _group_non_system_messages(original_messages)
+    downgraded: set[int] = set()
+
+    def estimate(candidate: list[tuple[Message, ...]]) -> ConversationEstimate:
+        return estimate_conversation(
+            Conversation.from_messages(list(systems + _flatten_groups(candidate))),
+            budget, tools=tools, token_estimator=token_estimator,
+        )
+
+    current = estimate(groups)
+    for candidates in (
+        policy.artifact_candidates(groups, projection),
+        policy.metadata_candidates(groups, projection=projection),
+    ):
+        if not current.over_budget:
+            break
+        for index, replacement in candidates:
+            candidate = list(groups)
+            candidate[index] = replacement
+            next_estimate = estimate(candidate)
+            # Lower precision must also lower cost (small refs can exceed Full).
+            if next_estimate.estimated_input_tokens >= current.estimated_input_tokens:
+                continue
+            groups[index] = replacement
+            downgraded.add(id(replacement[0]))
+            current = next_estimate
+            if not current.over_budget:
+                break
+
+    if current.over_budget and memory_message is not None:
+        systems = tuple(m for m in systems if m is not memory_message)
+        if memory_stats is not None:
+            memory_stats = memory_stats.with_included_entries(0)
+        current = estimate(groups)
+    elif memory_stats is not None:
+        memory_stats = memory_stats.with_included_entries(memory_stats.selected_entry_count)
+
+    # Keep current user intent as well as the latest protocol group. System,
+    # Compact summary and runtime guidance remain protected in `systems`.
+    protected = {id(groups[-1][0])} if groups else set()
+    # Request-only user prompts (e.g. max-turn finalization) must not replace
+    # the canonical task request as the protected current user intent.
+    for message in reversed(projection.conversation.get_messages()):
+        if message.role == "user":
+            protected.add(id(message))
+            break
+    for group in reversed(groups):
+        if group[0].role == "user":
+            protected.add(id(group[0]))
+            break
+    while current.over_budget:
+        removable = next((i for i, g in enumerate(groups) if id(g[0]) not in protected), None)
+        if removable is None:
+            break
+        del groups[removable]
+        current = estimate(groups)
+    messages = systems + _flatten_groups(groups)
+    return ModelContext(
+        messages=messages, estimate=current, original_message_count=len(original_messages),
+        compressed_tool_result_count=_count_compressed_tool_results(messages),
+        memory_stats=memory_stats, retention_stats=policy.stats(groups, projection, downgraded),
+    )
 
 
 def _build_model_context_from_messages(
@@ -439,10 +555,9 @@ def _build_model_context_from_messages(
             original_message_count=len(original_messages),
         )
 
-    non_system_groups = _compress_old_tool_results(
-        non_system_groups,
-        budget,
-    )
+    policy = ToolResultRetentionPolicy(budget)
+    for index, group in policy.metadata_candidates(non_system_groups, include_recent=False):
+        non_system_groups[index] = group
     compressed_messages = system_messages + _flatten_groups(non_system_groups)
     compressed_estimate = estimate_conversation(
         Conversation.from_messages(list(compressed_messages)),
@@ -502,6 +617,10 @@ def model_context_needs_notice(context: ModelContext) -> bool:
     )
     return (
         context.trimmed
+        or (context.retention_stats is not None and (
+            context.retention_stats.budget_downgraded_groups > 0
+            or context.retention_stats.rehydration_failures > 0
+        ))
         or context.compressed_tool_result_count > 0
         or (
             context.compact_stats is not None
@@ -513,7 +632,6 @@ def model_context_needs_notice(context: ModelContext) -> bool:
                     "cooldown",
                     "circuit_open",
                     "invalid_boundary",
-                    "canonical_fallback",
                 }
             )
         )
@@ -543,25 +661,17 @@ def format_model_context_stats(
     )
     if context.compact_stats is not None:
         compact = context.compact_stats
-        if compact.boundary_id is not None:
-            compact_label = (
-                "compact"
-                if compact.summary_visible
-                else "compact_boundary"
-            )
+        if compact.boundary_id is not None and compact.summary_visible:
             summary += (
-                f", {compact_label}={compact.compacted_message_count} messages/"
+                f", compact={compact.compacted_message_count} messages/"
                 f"{compact.covered_turn_count} turns"
                 f"@{compact.boundary_id[:8]}"
             )
-            if not compact.summary_visible:
-                summary += ", compact_summary_visible=false"
         if compact.status in {
             "failed",
             "cooldown",
             "circuit_open",
             "invalid_boundary",
-            "canonical_fallback",
         }:
             summary += (
                 f", compact_status={compact.status}, "
@@ -588,6 +698,14 @@ def format_model_context_stats(
             summary += f", memory_budget_omitted={memory.budget_omitted_count}"
         if memory.issue_count > 0:
             summary += f", memory_warnings={memory.issue_count}"
+    if context.retention_stats is not None:
+        retention = context.retention_stats
+        summary += (
+            f", tool_groups={retention.full_groups} full/"
+            f"{retention.artifact_groups} artifact/{retention.metadata_groups} metadata"
+            f", downgraded={retention.budget_downgraded_groups}"
+            f", rehydration_failures={retention.rehydration_failures}"
+        )
     if previous_prompt_tokens is not None:
         summary += f", previous_actual_input={previous_prompt_tokens:,} tokens"
     if not model_context_needs_notice(context):
@@ -632,208 +750,3 @@ def _percentile(values: list[float], percentile: float) -> float:
     ordered = sorted(values)
     index = max(0, math.ceil(len(ordered) * percentile) - 1)
     return ordered[index]
-
-
-def _group_non_system_messages(
-    messages: tuple[Message, ...],
-) -> list[tuple[Message, ...]]:
-    groups: list[tuple[Message, ...]] = []
-    index = 0
-    while index < len(messages):
-        message = messages[index]
-        if message.role in {"system", "tool"}:
-            index += 1
-            continue
-
-        if message.role == "assistant" and message.tool_calls:
-            expected_tool_call_ids = [
-                tool_call.id for tool_call in message.tool_calls
-            ]
-            tool_results: list[Message] = []
-            next_index = index + 1
-            while (
-                next_index < len(messages)
-                and messages[next_index].role == "tool"
-            ):
-                tool_results.append(messages[next_index])
-                next_index += 1
-
-            result_ids = [message.tool_call_id for message in tool_results]
-            chain_is_complete = (
-                len(expected_tool_call_ids) == len(set(expected_tool_call_ids))
-                and len(result_ids) == len(expected_tool_call_ids)
-                and len(result_ids) == len(set(result_ids))
-                and set(result_ids) == set(expected_tool_call_ids)
-            )
-            if chain_is_complete:
-                groups.append((message, *tool_results))
-
-            index = next_index
-            continue
-
-        groups.append((message,))
-        index += 1
-
-    return groups
-
-
-def _flatten_groups(groups: list[tuple[Message, ...]]) -> tuple[Message, ...]:
-    return tuple(message for group in groups for message in group)
-
-
-def _compress_old_tool_results(
-    groups: list[tuple[Message, ...]],
-    budget: ContextBudget,
-) -> list[tuple[Message, ...]]:
-    tool_group_indexes = [
-        index for index, group in enumerate(groups) if _group_has_tool_result(group)
-    ]
-    keep_indexes = set(tool_group_indexes[-budget.recent_tool_result_groups_to_keep :])
-    if budget.recent_tool_result_groups_to_keep == 0:
-        keep_indexes = set()
-
-    compressed_groups: list[tuple[Message, ...]] = []
-    for index, group in enumerate(groups):
-        if index in keep_indexes:
-            compressed_groups.append(group)
-            continue
-
-        tool_names_by_id = _tool_names_by_id(group)
-        compressed_groups.append(
-            tuple(
-                _compress_tool_result(message, budget, tool_names_by_id)
-                for message in group
-            )
-        )
-
-    return compressed_groups
-
-
-def _group_has_tool_result(group: tuple[Message, ...]) -> bool:
-    return any(message.role == "tool" for message in group)
-
-
-def _tool_names_by_id(group: tuple[Message, ...]) -> dict[str, str]:
-    tool_names: dict[str, str] = {}
-    for message in group:
-        if message.role != "assistant":
-            continue
-
-        for tool_call in message.tool_calls:
-            tool_names[tool_call.id] = tool_call.name
-
-    return tool_names
-
-
-def _compress_tool_result(
-    message: Message,
-    budget: ContextBudget,
-    tool_names_by_id: dict[str, str],
-) -> Message:
-    if message.role != "tool":
-        return message
-
-    if len(message.content) <= budget.tool_result_compression_threshold_chars:
-        return message
-
-    parsed = parse_tool_result_content(message.content)
-    tool_name = tool_names_by_id.get(message.tool_call_id or "", "unknown")
-    metadata = safe_tool_metadata(parsed.metadata)
-    if parsed.result_preview:
-        preview_key = "error_preview" if parsed.status == "ERROR" else "result_preview"
-        metadata[preview_key] = parsed.result_preview
-    metadata.update(
-        {
-            "context_compressed": True,
-            "original_chars": len(message.content),
-            "tool_name": tool_name,
-            "tool_call_id": message.tool_call_id,
-        }
-    )
-    compressed_content = (
-        f"{parsed.status}\n"
-        f"{COMPRESSED_TOOL_RESULT_MARKER}\n"
-        f"tool_name: {tool_name}\n"
-        f"original_chars: {len(message.content)}\n"
-        f"{TOOL_RESULT_METADATA_MARKER}"
-        f"{json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str)}"
-    )
-
-    return Message(
-        role="tool",
-        content=compressed_content,
-        tool_call_id=message.tool_call_id,
-    )
-
-
-@dataclass(frozen=True)
-class ParsedToolResultContent:
-    status: str
-    metadata: dict[str, object]
-    result_preview: str
-
-
-def parse_tool_result_content(content: str) -> ParsedToolResultContent:
-    body, _separator, metadata_text = content.partition(TOOL_RESULT_METADATA_MARKER)
-    body_lines = body.splitlines()
-    first_line = body_lines[0] if body_lines else "UNKNOWN"
-    status = first_line if first_line in {"OK", "ERROR"} else "UNKNOWN"
-    result_body = "\n".join(body_lines[1:]) if status != "UNKNOWN" else body
-    result_preview = _truncate_tool_result_preview(result_body.strip())
-
-    try:
-        metadata = json.loads(metadata_text) if metadata_text else {}
-    except json.JSONDecodeError:
-        metadata = {}
-
-    if not isinstance(metadata, dict):
-        metadata = {}
-
-    return ParsedToolResultContent(
-        status=status,
-        metadata=metadata,
-        result_preview=result_preview,
-    )
-
-
-def _truncate_tool_result_preview(content: str) -> str:
-    if len(content) <= MAX_TOOL_RESULT_PREVIEW_CHARS:
-        return content
-
-    return f"{content[:MAX_TOOL_RESULT_PREVIEW_CHARS]}..."
-
-
-def safe_tool_metadata(metadata: dict[str, object]) -> dict[str, object]:
-    safe_metadata: dict[str, object] = {}
-    for key, value in metadata.items():
-        if key in LARGE_TOOL_METADATA_KEYS:
-            safe_metadata[f"{key}_omitted"] = True
-            continue
-
-        safe_metadata[key] = _safe_metadata_value(value)
-
-    return safe_metadata
-
-
-def _safe_metadata_value(value: object) -> object:
-    if isinstance(value, str) and len(value) > MAX_METADATA_STRING_CHARS:
-        return f"{value[:MAX_METADATA_STRING_CHARS]}..."
-
-    if isinstance(value, list):
-        return [_safe_metadata_value(item) for item in value[:20]]
-
-    if isinstance(value, dict):
-        return {
-            str(key): _safe_metadata_value(item)
-            for key, item in list(value.items())[:20]
-        }
-
-    return value
-
-
-def _count_compressed_tool_results(messages: tuple[Message, ...]) -> int:
-    return sum(
-        1
-        for message in messages
-        if message.role == "tool" and COMPRESSED_TOOL_RESULT_MARKER in message.content
-    )

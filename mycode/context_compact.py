@@ -17,6 +17,7 @@ from mycode.context_budget import (
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.observability import ObservationSink, emit_observation
 
 
 DEFAULT_COMPACT_TRIGGER_RATIO = 0.8
@@ -152,6 +153,9 @@ class ConversationCompactor:
     policy: CompactPolicy = CompactPolicy()
     state: CompactState = CompactState()
     on_state_changed: Callable[[CompactState], None] | None = None
+    observability_sink: ObservationSink | None = None
+    observability_scope: str = "compact"
+    observability_run_id: str | None = None
 
     def prepare(
         self,
@@ -161,6 +165,7 @@ class ConversationCompactor:
         token_estimator: TokenEstimator,
         tools: list[dict[str, object]] | None = None,
         memory_message: Message | None = None,
+        observability_turn: int | None = None,
     ) -> PreparedCompactContext:
         non_system_messages = _non_system_messages(conversation)
         message_count = len(non_system_messages)
@@ -228,6 +233,8 @@ class ConversationCompactor:
             )
 
         attempt_usage: TokenUsage | None = None
+        model_call_started = False
+        model_observation_emitted = False
         try:
             prompt = _summary_prompt(boundary, candidate.messages_to_summarize)
             prompt_estimate = estimate_conversation(
@@ -240,8 +247,14 @@ class ConversationCompactor:
                     "Compact summary input exceeds the configured model input budget."
                 )
 
+            model_call_started = True
             response = self.llm_client.complete(prompt)
             attempt_usage = _last_token_usage(self.llm_client)
+            self._emit_model_response(
+                response.content,
+                turn=observability_turn,
+            )
+            model_observation_emitted = True
             if response.role != "assistant":
                 raise ValueError("Compact summary response must use assistant role.")
             summary = _parse_compact_summary(response.content)
@@ -281,6 +294,12 @@ class ConversationCompactor:
             next_state = CompactState(boundary=new_boundary)
             self._commit_state(next_state)
         except Exception as error:
+            if model_call_started and not model_observation_emitted:
+                self._emit_model_response(
+                    "",
+                    turn=observability_turn,
+                    fallback_error_type=type(error).__name__,
+                )
             self._record_failure(
                 reason=_safe_failure_reason(error),
                 message_count=message_count,
@@ -299,6 +318,59 @@ class ConversationCompactor:
             status="compacted",
             message_count=message_count,
             attempt_token_usage=attempt_usage,
+        )
+
+    def _emit_model_response(
+        self,
+        content: str,
+        *,
+        turn: int | None,
+        fallback_error_type: str | None = None,
+    ) -> None:
+        observation = getattr(self.llm_client, "last_model_response", None)
+        if not isinstance(observation, dict):
+            usage = _last_token_usage(self.llm_client)
+            observation = {
+                "model": getattr(self.llm_client, "model", None),
+                "request_id": None,
+                "provider_request_id": None,
+                "finish_reason": None,
+                "stop_reason": None,
+                "content_chars": len(content),
+                "content_non_whitespace_chars": sum(
+                    not character.isspace() for character in content
+                ),
+                "tool_call_count": 0,
+                "tool_names": [],
+                "reasoning_field_present": False,
+                "reasoning_chars": getattr(
+                    self.llm_client,
+                    "last_reasoning_char_count",
+                    0,
+                ),
+                "prompt_tokens": None if usage is None else usage.prompt_tokens,
+                "completion_tokens": (
+                    None if usage is None else usage.completion_tokens
+                ),
+                "total_tokens": None if usage is None else usage.total_tokens,
+                "latency_ms": None,
+                "first_token_latency_ms": None,
+                "stream_chunk_count": None,
+                "retry_count": None,
+                "error_type": fallback_error_type,
+                "http_status": None,
+                "empty_response": not content.strip(),
+            }
+        emit_observation(
+            self.observability_sink,
+            "model_response",
+            {
+                "run_scope": self.observability_scope,
+                "run_id": self.observability_run_id,
+                "turn": turn,
+                "call_kind": "compact_summary",
+                **observation,
+            },
         )
 
     def _prepared_view(

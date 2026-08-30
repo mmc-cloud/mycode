@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field, replace
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator, Iterator, Sequence
 import asyncio
 import json
 
@@ -13,19 +13,20 @@ from mycode.agent import (
     AgentWarning,
 )
 from mycode.artifacts import (
-    EXTERNALIZED_TOOL_RESULT_MARKER,
     ToolResultArtifactStore,
     artifact_externalization_failure_content,
     artifact_failure_reason,
+    artifact_reference_info,
 )
 from mycode.context_compact import ConversationCompactor
+from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
+from mycode.context_builder import ContextBuilder
 from mycode.error_handling import format_model_error
 from mycode.context_budget import (
     ContextBudget,
     ModelContext,
     TokenEstimator,
     TokenUsage,
-    build_model_context,
     format_model_context_stats,
     model_context_needs_notice,
 )
@@ -33,6 +34,11 @@ from mycode.conversation import Conversation
 from mycode.llm import LLMClient
 from mycode.memory_context import MemoryRecall, MemoryRecallProvider
 from mycode.messages import Message
+from mycode.observability import (
+    CompletionDecisionValue,
+    ObservationSink,
+    emit_observation,
+)
 from mycode.reasoning import ReasoningState
 from mycode.run_progress import (
     COMPLETION_CORRECTION_EXTRA_TURNS,
@@ -284,15 +290,13 @@ class AgentRunner:
     tool_batch_handler: ToolBatchHandler = execute_tool_batch
     compactor: ConversationCompactor | None = None
     tool_result_artifact_store: ToolResultArtifactStore | None = None
+    observability_sink: ObservationSink | None = field(default=None, repr=False)
+    observability_scope: str = "main"
+    observability_run_id: str | None = None
     last_artifact_error: str | None = field(default=None, init=False)
     artifact_failure_count: int = field(default=0, init=False)
     last_run_progress: RunProgress | None = field(default=None, init=False)
     _pending_artifact_warnings: list[AgentWarning] = field(
-        default_factory=list,
-        init=False,
-        repr=False,
-    )
-    _ephemeral_tool_result_groups: list[dict[str, str]] = field(
         default_factory=list,
         init=False,
         repr=False,
@@ -325,6 +329,7 @@ class AgentRunner:
             raise ValueError("convergence_prompt must not be blank.")
 
     def run(self, user_message: str) -> Iterator[AgentEvent]:
+        pending_full_group: TurnLocalFullGroup | None = None
         self._pending_artifact_warnings.clear()
         try:
             self.run_token_usage = None
@@ -352,6 +357,8 @@ class AgentRunner:
                     str | None,
                     bool,
                     str | None,
+                    int,
+                    int,
                     int,
                 ]
                 | None
@@ -404,10 +411,15 @@ class AgentRunner:
                     turn_number=turn_index + 1,
                     max_turns=self.max_turns,
                 )
-                model_context = self._model_context(
-                    tools,
-                    guidance=decision.guidance,
-                )
+                try:
+                    model_context = self._model_context(
+                        tools,
+                        guidance=decision.guidance,
+                        turn_local_full_group=pending_full_group,
+                        observability_turn=turn_index + 1,
+                    )
+                finally:
+                    pending_full_group = None
                 for warning in self._drain_artifact_warnings():
                     yield AgentEvent(type="artifact_warning", content=warning.content)
 
@@ -422,6 +434,12 @@ class AgentRunner:
                         previous_token_usage=self.last_token_usage,
                     )
                     reported_context_state = context_state
+
+                self._emit_context_snapshot(
+                    model_context,
+                    turn=turn_index + 1,
+                    call_kind="agent_tools",
+                )
 
                 if model_context.estimate.over_budget:
                     yield AgentEvent(
@@ -472,10 +490,23 @@ class AgentRunner:
 
                         if event.type == "error":
                             self._observe_token_usage(model_context)
+                            self._emit_model_response(
+                                turn=turn_index + 1,
+                                call_kind="agent_tools",
+                                content="".join(content_parts),
+                                tool_calls=tool_calls,
+                            )
                             yield event
                             yield AgentEvent(type="stop", stop_reason="model_error")
                             return
                 except Exception as error:
+                    self._emit_model_response(
+                        turn=turn_index + 1,
+                        call_kind="agent_tools",
+                        content="".join(content_parts),
+                        tool_calls=tool_calls,
+                        fallback_error_type=type(error).__name__,
+                    )
                     yield AgentEvent(
                         type="error",
                         error=format_model_error(
@@ -488,8 +519,26 @@ class AgentRunner:
 
                 self._observe_token_usage(model_context)
                 content = "".join(content_parts)
+                self._emit_model_response(
+                    turn=turn_index + 1,
+                    call_kind="agent_tools",
+                    content=content,
+                    tool_calls=tool_calls,
+                )
                 if not tool_calls:
-                    if decide_completion_request(progress) == "correct":
+                    completion_request = decide_completion_request(progress)
+                    completion_decision: CompletionDecisionValue = (
+                        "correction"
+                        if completion_request == "correct"
+                        else "accepted"
+                    )
+                    self._emit_completion_decision(
+                        progress,
+                        turn=turn_index + 1,
+                        content=content,
+                        decision=completion_decision,
+                    )
+                    if completion_request == "correct":
                         progress.record_completion_correction()
                         completion_extension_remaining = (
                             COMPLETION_CORRECTION_EXTRA_TURNS
@@ -548,30 +597,28 @@ class AgentRunner:
                     registry=self.tool_registry,
                     batch=batch,
                 )
-                self._begin_ephemeral_tool_result_group()
-                for execution in batch.executions:
-                    yield AgentEvent(type="tool_result", tool_result=execution.result)
-                    persisted_content = self._tool_result_content(execution)
-                    for warning in self._drain_artifact_warnings():
-                        yield AgentEvent(type="artifact_warning", content=warning.content)
-                    self.conversation.add_tool_result_message(
-                        tool_call_id=execution.tool_call.id,
-                        content=persisted_content,
-                    )
+                pending_full_group = yield from self._persist_tool_results(batch)
                 yield _progress_event(progress)
                 if batch.stop_response is not None:
+                    pending_full_group = None
                     yield AgentEvent(
                         type="stop",
                         content=batch.stop_response.content,
                         stop_reason=batch.stop_response.stop_reason,
                     )
                     return
+                del batch
 
             progress.observe_turn_limit()
             yield _progress_event(progress)
             if self.finalize_on_max_turns:
-                yield from self._stream_finalization_after_max_turns()
+                finalization_events = self._stream_finalization_after_max_turns(
+                    turn_local_full_group=pending_full_group,
+                )
+                pending_full_group = None
+                yield from finalization_events
                 return
+            pending_full_group = None
             yield AgentEvent(
                 type="stop",
                 content="Agent stopped because it reached the maximum number of turns.",
@@ -579,10 +626,18 @@ class AgentRunner:
             )
 
         finally:
+            pending_full_group = None
             self._pending_artifact_warnings.clear()
 
-    def _stream_finalization_after_max_turns(self) -> Iterator[AgentEvent]:
-        finalization, model_context = self._max_turns_finalization_context()
+    def _stream_finalization_after_max_turns(
+        self, *, turn_local_full_group: TurnLocalFullGroup | None = None,
+    ) -> Iterator[AgentEvent]:
+        try:
+            finalization, model_context = self._max_turns_finalization_context(
+                turn_local_full_group=turn_local_full_group,
+            )
+        finally:
+            turn_local_full_group = None
         if finalization is None:
             yield AgentEvent(
                 type="stop",
@@ -595,6 +650,11 @@ class AgentRunner:
             return
 
         content_parts: list[str] = []
+        self._emit_context_snapshot(
+            model_context,
+            turn=self.max_turns + 1,
+            call_kind="max_turns_finalization",
+        )
         yield AgentEvent(type="model_start")
         try:
             for chunk in self.llm_client.stream_complete(finalization):
@@ -603,6 +663,13 @@ class AgentRunner:
                 content_parts.append(chunk)
                 yield AgentEvent(type="text_delta", content=chunk)
         except Exception as error:
+            self._emit_model_response(
+                turn=self.max_turns + 1,
+                call_kind="max_turns_finalization",
+                content="".join(content_parts),
+                tool_calls=(),
+                fallback_error_type=type(error).__name__,
+            )
             yield AgentEvent(
                 type="error",
                 error=format_model_error(
@@ -621,6 +688,12 @@ class AgentRunner:
             return
 
         self._observe_token_usage(model_context)
+        self._emit_model_response(
+            turn=self.max_turns + 1,
+            call_kind="max_turns_finalization",
+            content="".join(content_parts),
+            tool_calls=(),
+        )
         content = "".join(content_parts).strip()
         if content == "":
             yield AgentEvent(
@@ -645,20 +718,15 @@ class AgentRunner:
         )
 
     def _max_turns_finalization_context(
-        self,
+        self, *, turn_local_full_group: TurnLocalFullGroup | None = None,
     ) -> tuple[Conversation | None, ModelContext]:
-        model_context = self._model_context([])
-        if model_context.estimate.over_budget:
-            return None, model_context
-        finalization_candidate = Conversation.from_messages(
-            list(model_context.messages)
-        )
-        finalization_candidate.add_user_message(MAX_TURNS_FINALIZATION_PROMPT)
-        finalization_context = build_model_context(
-            finalization_candidate,
-            self.context_budget,
-            tools=[],
-            token_estimator=self.token_estimator,
+        finalization_context = self._model_context(
+            [],
+            turn_local_full_group=turn_local_full_group,
+            observability_turn=self.max_turns + 1,
+            request_messages=(
+                Message(role="user", content=MAX_TURNS_FINALIZATION_PROMPT),
+            ),
         )
         if finalization_context.estimate.over_budget:
             return None, finalization_context
@@ -672,152 +740,74 @@ class AgentRunner:
         tools: list[dict[str, object]],
         *,
         guidance: tuple[str, ...] = (),
+        request_messages: tuple[Message, ...] = (),
+        turn_local_full_group: TurnLocalFullGroup | None = None,
+        observability_turn: int | None = None,
     ) -> ModelContext:
         memory_recall = self.last_memory_recall
-        canonical_conversation = self._artifact_context_conversation()
-        context_conversation = self._model_view_conversation(canonical_conversation)
-        ephemeral_results_visible = context_conversation is not canonical_conversation
-        compact_stats = None
-        if self.compactor is not None:
-            prepared = self.compactor.prepare(
-                context_conversation,
-                self.context_budget,
-                tools=tools,
-                token_estimator=self.token_estimator,
-                memory_message=(
-                    None if memory_recall is None else memory_recall.message
-                ),
-            )
-            context_conversation = prepared.conversation
-            compact_stats = prepared.stats
-            self._accumulate_run_token_usage(prepared.attempt_token_usage)
-
-        context = build_model_context(
-            context_conversation,
-            self.context_budget,
-            tools=tools,
+        result = ContextBuilder(
+            budget=self.context_budget,
             token_estimator=self.token_estimator,
-            memory_message=(
-                None if memory_recall is None else memory_recall.message
+            compactor=self.compactor,
+            retention_policy=ToolResultRetentionPolicy(
+                self.context_budget, self.tool_result_artifact_store,
+                self._historical_artifact_failure_content,
             ),
-            memory_stats=(
-                None if memory_recall is None else memory_recall.stats
-            ),
+        ).build(
+            self.conversation,
+            tools=tools,
+            memory_message=None if memory_recall is None else memory_recall.message,
+            memory_stats=None if memory_recall is None else memory_recall.stats,
+            guidance=guidance,
+            request_messages=request_messages,
+            turn_local_full_group=turn_local_full_group,
+            observability_turn=observability_turn,
         )
-        if context.estimate.over_budget and (
-            ephemeral_results_visible
-            or (compact_stats is not None and compact_stats.boundary_id is not None)
-        ):
-            canonical_fallback = build_model_context(
-                canonical_conversation,
-                self.context_budget,
-                tools=tools,
-                token_estimator=self.token_estimator,
-                memory_message=(
-                    None if memory_recall is None else memory_recall.message
-                ),
-                memory_stats=(
-                    None if memory_recall is None else memory_recall.stats
-                ),
+        self._accumulate_run_token_usage(result.compact_attempt_token_usage)
+        self.last_model_context = result.context
+        return result.context
+
+    def _persist_tool_results(
+        self, batch: ToolBatchExecution,
+    ) -> Generator[AgentEvent, None, TurnLocalFullGroup | None]:
+        """Persist immediately, handing off only this batch's successfully stored Fulls."""
+        assistant = self.conversation.get_messages()[-1]
+        results: dict[str, tuple[str, str]] = {}
+        externalized_count = 0
+        for execution in batch.executions:
+            yield AgentEvent(type="tool_result", tool_result=execution.result)
+            content = format_tool_result(execution.result)
+            persisted_content = self._tool_result_content(execution, content=content)
+            for warning in self._drain_artifact_warnings():
+                yield AgentEvent(type="artifact_warning", content=warning.content)
+            self.conversation.add_tool_result_message(
+                tool_call_id=execution.tool_call.id,
+                content=persisted_content,
             )
-            if not canonical_fallback.estimate.over_budget:
-                context = canonical_fallback
-                if ephemeral_results_visible:
-                    self._ephemeral_tool_result_groups.clear()
-                    ephemeral_results_visible = False
-                if compact_stats is not None and compact_stats.boundary_id is not None:
-                    compact_stats = replace(
-                        compact_stats,
-                        status="canonical_fallback",
-                        summary_visible=False,
-                    )
-        if compact_stats is not None:
-            context = replace(context, compact_stats=compact_stats)
-        if guidance:
-            context = _add_model_guidance(
-                context,
-                guidance=guidance,
-                budget=self.context_budget,
-                tools=tools,
-                token_estimator=self.token_estimator,
+            artifact_reference = (
+                artifact_reference_info(
+                    tool_name=execution.tool_call.name,
+                    tool_call_id=execution.tool_call.id,
+                    content=persisted_content,
+                ) is not None
             )
-            if context.estimate.over_budget and ephemeral_results_visible:
-                canonical_fallback = build_model_context(
-                    canonical_conversation,
-                    self.context_budget,
-                    tools=tools,
-                    token_estimator=self.token_estimator,
-                    memory_message=(
-                        None if memory_recall is None else memory_recall.message
-                    ),
-                    memory_stats=(
-                        None if memory_recall is None else memory_recall.stats
-                    ),
-                )
-                canonical_fallback = _add_model_guidance(
-                    canonical_fallback,
-                    guidance=guidance,
-                    budget=self.context_budget,
-                    tools=tools,
-                    token_estimator=self.token_estimator,
-                )
-                if not canonical_fallback.estimate.over_budget:
-                    context = canonical_fallback
-                    self._ephemeral_tool_result_groups.clear()
-        self.last_model_context = context
-        return context
+            if persisted_content != content and artifact_reference:
+                externalized_count += 1
+            if (
+                self.context_budget.recent_tool_result_groups_to_keep > 0
+                and persisted_content != content
+                and artifact_reference
+            ):
+                results[execution.tool_call.id] = (persisted_content, content)
+        if not results and externalized_count == 0:
+            return None
+        return TurnLocalFullGroup(
+            assistant,
+            results,
+            externalized_count=externalized_count,
+        )
 
-    def _model_view_conversation(
-        self,
-        canonical_conversation: Conversation,
-    ) -> Conversation:
-        if not self._ephemeral_tool_result_groups:
-            return canonical_conversation
-
-        ephemeral_contents = {
-            tool_call_id: content
-            for group in self._ephemeral_tool_result_groups
-            for tool_call_id, content in group.items()
-        }
-        if not ephemeral_contents:
-            return canonical_conversation
-
-        messages: list[Message] = []
-        restored = False
-        for message in canonical_conversation.get_messages():
-            content = (
-                ephemeral_contents.get(message.tool_call_id)
-                if message.role == "tool" and message.tool_call_id is not None
-                else None
-            )
-            if content is None:
-                messages.append(message)
-                continue
-            messages.append(replace(message, content=content))
-            restored = True
-
-        if not restored:
-            return canonical_conversation
-        return Conversation.from_messages(messages)
-
-    def _artifact_context_conversation(self) -> Conversation:
-        if self.tool_result_artifact_store is None:
-            return self.conversation
-        try:
-            return self.tool_result_artifact_store.externalize_conversation(
-                self.conversation,
-                on_failure=self._historical_artifact_failure_content,
-            )
-        except Exception as error:
-            reason = self._record_artifact_failure(
-                error,
-                phase="history_projection",
-                tool_name="unknown",
-            )
-            return self._redact_oversized_tool_results(reason)
-
-    def _tool_result_content(self, execution: ToolCallExecution) -> str:
-        content = format_tool_result(execution.result)
+    def _tool_result_content(self, execution: ToolCallExecution, *, content: str) -> str:
         store = self.tool_result_artifact_store
         if store is None:
             return content
@@ -839,22 +829,7 @@ class AgentRunner:
                 original_content=content,
                 reason=reason,
             )
-        if (
-            externalized != content
-            and EXTERNALIZED_TOOL_RESULT_MARKER in externalized
-        ):
-            if self._ephemeral_tool_result_groups:
-                self._ephemeral_tool_result_groups[-1][execution.tool_call.id] = content
         return externalized
-
-    def _begin_ephemeral_tool_result_group(self) -> None:
-        groups_to_keep = self.context_budget.recent_tool_result_groups_to_keep
-        if groups_to_keep == 0:
-            self._ephemeral_tool_result_groups.clear()
-            return
-
-        self._ephemeral_tool_result_groups.append({})
-        del self._ephemeral_tool_result_groups[:-groups_to_keep]
 
     def _historical_artifact_failure_content(
         self,
@@ -903,38 +878,6 @@ class AgentRunner:
         self._pending_artifact_warnings.clear()
         return warnings
 
-    def _redact_oversized_tool_results(self, reason: str) -> Conversation:
-        store = self.tool_result_artifact_store
-        if store is None:
-            return self.conversation
-        tool_names: dict[str, str] = {}
-        messages = []
-        for message in self.conversation.get_messages():
-            if message.role == "assistant":
-                for tool_call in message.tool_calls:
-                    tool_names[tool_call.id] = tool_call.name
-            if (
-                message.role != "tool"
-                or message.tool_call_id is None
-                or len(message.content) <= store.threshold_chars
-            ):
-                messages.append(message)
-                continue
-            tool_name = tool_names.get(message.tool_call_id, "unknown")
-            messages.append(
-                Message(
-                    role="tool",
-                    content=artifact_externalization_failure_content(
-                        tool_name=tool_name,
-                        tool_call_id=message.tool_call_id,
-                        original_content=message.content,
-                        reason=reason,
-                    ),
-                    tool_call_id=message.tool_call_id,
-                )
-            )
-        return Conversation.from_messages(messages)
-
     def _recall_memory(self, user_message: str) -> None:
         if self.memory_context_selector is None:
             self.last_memory_recall = None
@@ -951,6 +894,169 @@ class AgentRunner:
         )
         self._accumulate_run_token_usage(usage)
         self.token_estimator.observe(context.estimate, usage)
+
+    def _emit_model_response(
+        self,
+        *,
+        turn: int | None,
+        call_kind: str,
+        content: str,
+        tool_calls: Sequence[AgentToolCall],
+        fallback_error_type: str | None = None,
+    ) -> None:
+        observation = getattr(self.llm_client, "last_model_response", None)
+        if not isinstance(observation, dict):
+            usage = getattr(self.llm_client, "last_token_usage", None)
+            observation = {
+                "model": getattr(self.llm_client, "model", None),
+                "request_id": None,
+                "provider_request_id": None,
+                "finish_reason": None,
+                "stop_reason": None,
+                "content_chars": len(content),
+                "content_non_whitespace_chars": sum(
+                    not character.isspace() for character in content
+                ),
+                "tool_call_count": len(tool_calls),
+                "tool_names": [call.name for call in tool_calls],
+                "reasoning_field_present": False,
+                "reasoning_chars": getattr(
+                    self.llm_client,
+                    "last_reasoning_char_count",
+                    0,
+                ),
+                "prompt_tokens": None if usage is None else usage.prompt_tokens,
+                "completion_tokens": (
+                    None if usage is None else usage.completion_tokens
+                ),
+                "total_tokens": None if usage is None else usage.total_tokens,
+                "latency_ms": None,
+                "first_token_latency_ms": None,
+                "stream_chunk_count": None,
+                "retry_count": None,
+                "error_type": fallback_error_type,
+                "http_status": None,
+                "empty_response": not content.strip() and not tool_calls,
+            }
+        emit_observation(
+            self.observability_sink,
+            "model_response",
+            {
+                "run_scope": self.observability_scope,
+                "run_id": self.observability_run_id,
+                "turn": turn,
+                "call_kind": call_kind,
+                **observation,
+            },
+        )
+
+    def _emit_completion_decision(
+        self,
+        progress: RunProgress,
+        *,
+        turn: int,
+        content: str,
+        decision: CompletionDecisionValue,
+    ) -> None:
+        if decision == "correction":
+            reason = "unvalidated_mutation"
+        elif progress.has_unvalidated_mutation:
+            reason = "completion_correction_already_used"
+        else:
+            reason = "no_tool_calls"
+        if progress.mutation_revision == 0:
+            validation_state = "none"
+        elif progress.validated_revision == progress.mutation_revision:
+            validation_state = "current"
+        else:
+            validation_state = "unvalidated"
+        emit_observation(
+            self.observability_sink,
+            "completion_decision",
+            {
+                "run_scope": self.observability_scope,
+                "run_id": self.observability_run_id,
+                "turn": turn,
+                "decision": decision,
+                "accepted": decision == "accepted",
+                "correction": decision == "correction",
+                "rejected": decision == "rejected",
+                "reason": reason,
+                "phase": progress.task_phase,
+                "content_chars": len(content),
+                "content_non_whitespace_chars": sum(
+                    not character.isspace() for character in content
+                ),
+                "tool_call_count": 0,
+                "mutation_since_validation": progress.has_unvalidated_mutation,
+                "mutation_revision": progress.mutation_revision,
+                "validated_revision": progress.validated_revision,
+                "validation_state": validation_state,
+            },
+        )
+
+    def _emit_context_snapshot(
+        self,
+        context: ModelContext,
+        *,
+        turn: int | None,
+        call_kind: str,
+    ) -> None:
+        compact = context.compact_stats
+        retention = context.retention_stats
+        emit_observation(
+            self.observability_sink,
+            "context_snapshot",
+            {
+                "run_scope": self.observability_scope,
+                "run_id": self.observability_run_id,
+                "turn": turn,
+                "call_kind": call_kind,
+                "estimated_input_tokens": context.estimate.estimated_input_tokens,
+                "max_input_tokens": context.estimate.max_input_tokens,
+                "selected_message_count": context.selected_message_count,
+                "source_message_count": context.source_message_count,
+                "over_budget": context.estimate.over_budget,
+                "turn_local_full_hit": (
+                    0 if retention is None else retention.turn_local_full_groups
+                ),
+                "artifact_rehydrate_count": (
+                    0 if retention is None else retention.artifact_rehydrate_count
+                ),
+                "artifact_externalized_count": (
+                    0 if retention is None else retention.artifact_externalized_count
+                ),
+                "compact_triggered": (
+                    compact is not None and compact.status == "compacted"
+                ),
+                "compact_status": None if compact is None else compact.status,
+                "retention": {
+                    "full_groups": 0 if retention is None else retention.full_groups,
+                    "turn_local_full_groups": (
+                        0 if retention is None else retention.turn_local_full_groups
+                    ),
+                    "artifact_rehydrated_groups": (
+                        0
+                        if retention is None
+                        else retention.artifact_rehydrated_groups
+                    ),
+                    "artifact_groups": (
+                        0 if retention is None else retention.artifact_groups
+                    ),
+                    "metadata_groups": (
+                        0 if retention is None else retention.metadata_groups
+                    ),
+                    "budget_downgraded_groups": (
+                        0
+                        if retention is None
+                        else retention.budget_downgraded_groups
+                    ),
+                    "rehydration_failures": (
+                        0 if retention is None else retention.rehydration_failures
+                    ),
+                },
+            },
+        )
 
     def _accumulate_run_token_usage(self, usage: TokenUsage | None) -> None:
         if usage is None:
@@ -1019,7 +1125,7 @@ def _progress_event(progress: RunProgress) -> AgentEvent:
 
 def _context_state(
     context: ModelContext,
-) -> tuple[int, int, bool, int, int, str | None, bool, str | None, int]:
+) -> tuple[int, int, bool, int, int, str | None, bool, str | None, int, int, int]:
     memory = context.memory_stats
     compact = context.compact_stats
     return (
@@ -1032,6 +1138,8 @@ def _context_state(
         False if compact is None else compact.summary_visible,
         None if compact is None else compact.status,
         0 if compact is None else compact.consecutive_failure_count,
+        0 if context.retention_stats is None else context.retention_stats.budget_downgraded_groups,
+        0 if context.retention_stats is None else context.retention_stats.rehydration_failures,
     )
 
 
@@ -1040,34 +1148,6 @@ def _context_overflow_message(context: ModelContext) -> str:
         "Model request was not sent because the estimated input context exceeds "
         f"the configured budget ({context.estimate.estimated_input_tokens}/"
         f"{context.estimate.max_input_tokens} tokens)."
-    )
-
-
-def _add_model_guidance(
-    context: ModelContext,
-    *,
-    guidance: tuple[str, ...],
-    budget: ContextBudget,
-    tools: list[dict[str, object]],
-    token_estimator: TokenEstimator,
-) -> ModelContext:
-    guided_conversation = Conversation.from_messages(
-        [
-            *context.messages,
-            Message(role="system", content="\n\n".join(guidance)),
-        ]
-    )
-    guided_context = build_model_context(
-        guided_conversation,
-        budget,
-        tools=tools,
-        token_estimator=token_estimator,
-    )
-    return replace(
-        guided_context,
-        original_message_count=context.original_message_count + 1,
-        memory_stats=context.memory_stats,
-        compact_stats=context.compact_stats,
     )
 
 

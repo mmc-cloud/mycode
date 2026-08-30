@@ -359,7 +359,9 @@ def test_runner_persists_artifact_reference_instead_of_large_tool_body(
 
 def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_resume(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    rehydrates = _record_rehydrates(monkeypatch)
     project = ProjectIdentity.from_workspace(tmp_path)
     session_store = SessionStore(tmp_path / "state.sqlite3")
     session = session_store.create_session(project, session_id="artifact-contract")
@@ -407,6 +409,7 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
 
     list(runner.run("produce two large results"))
 
+    assert rehydrates == []
     canonical = session_store.load_conversation(project, session.id)
     canonical_tool_messages = [
         message for message in canonical.get_messages() if message.role == "tool"
@@ -497,12 +500,15 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
 
     resume_events = list(resumed_runner.run("continue from persisted evidence"))
 
+    assert rehydrates == ["call-large-2"]
     resume_first_context = resume_client.seen_conversations[0].get_messages()
     resumed_old_result = next(
         message
         for message in resume_first_context
         if message.tool_call_id == "call-large-1"
     )
+    resumed_latest = next(m for m in resume_first_context if m.tool_call_id == "call-large-2")
+    assert resumed_latest.content == artifact_contents[1]
     assert EXTERNALIZED_TOOL_RESULT_MARKER in resumed_old_result.content
     assert "sensitive body " * 20 not in resumed_old_result.content
     recovered = next(
@@ -514,9 +520,11 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
     assert recovered.content == artifact_contents[0]
 
 
-def test_runner_keeps_two_ephemeral_tool_result_groups_without_changing_canonical(
+def test_runner_keeps_two_recent_tool_result_groups_without_changing_canonical(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    rehydrates = _record_rehydrates(monkeypatch)
     calls = [
         AgentToolCall(
             id=call_id,
@@ -570,15 +578,21 @@ def test_runner_keeps_two_ephemeral_tool_result_groups_without_changing_canonica
         assert EXTERNALIZED_TOOL_RESULT_MARKER not in third_next_turn[call_id].content
         assert "sensitive body " * 20 in third_next_turn[call_id].content
 
-    assert [set(group) for group in runner._ephemeral_tool_result_groups] == [
-        {"call-middle-a", "call-middle-b"},
-        {"call-latest"},
-    ]
+    assert not hasattr(runner, "_ephemeral_tool_result_groups")
+    assert runner.last_model_context.retention_stats.full_groups == 2
+    assert runner.last_model_context.retention_stats.artifact_groups == 1
+    assert runner.last_model_context.retention_stats.turn_local_full_groups == 1
+    assert runner.last_model_context.retention_stats.artifact_rehydrated_groups == 1
+    assert runner.last_model_context.retention_stats.artifact_rehydrate_count == 2
+    assert runner.last_model_context.retention_stats.artifact_externalized_count == 1
+    assert rehydrates == ["call-old", "call-middle-a", "call-middle-b"]
 
 
-def test_runner_falls_back_to_artifact_ref_when_latest_body_exceeds_budget(
+def test_runner_downgrades_latest_group_without_reprojecting(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    rehydrates = _record_rehydrates(monkeypatch)
     tool_call = AgentToolCall(
         id="call-huge",
         name="huge_tool",
@@ -606,16 +620,24 @@ def test_runner_falls_back_to_artifact_ref_when_latest_body_exceeds_budget(
         ),
     )
 
-    list(runner.run("produce an oversized result"))
+    events = list(runner.run("produce an oversized result"))
 
-    next_turn_tool_message = next(
-        message
-        for message in client.seen_conversations[1].get_messages()
+    assert events[-1].stop_reason == "final_answer"
+    assert rehydrates == []
+    assert len(client.seen_conversations) == 2
+    assert runner.last_model_context.estimate.over_budget is False
+    latest = next(
+        message for message in runner.last_model_context.messages
         if message.tool_call_id == "call-huge"
     )
-    assert EXTERNALIZED_TOOL_RESULT_MARKER in next_turn_tool_message.content
-    assert "huge body " * 100 not in next_turn_tool_message.content
-    assert runner._ephemeral_tool_result_groups == []
+    assert EXTERNALIZED_TOOL_RESULT_MARKER in latest.content
+    assert runner.last_model_context.retention_stats.budget_downgraded_groups == 1
+    canonical = next(
+        message for message in runner.conversation.get_messages()
+        if message.tool_call_id == "call-huge"
+    )
+    assert EXTERNALIZED_TOOL_RESULT_MARKER in canonical.content
+    assert "huge body " * 100 not in canonical.content
 
 
 def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
@@ -670,6 +692,8 @@ def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
     assert runner.last_artifact_error == "permission_denied"
     assert runner.artifact_failure_count == 1
     assert not (tmp_path / "artifacts").exists()
+    assert all("sensitive body" not in message.content
+               for message in runner.last_model_context.messages)
 
 
 def test_runner_emits_artifact_warning_without_leaking_it(
@@ -862,3 +886,131 @@ class RecordingArtifactLLMClient(FakeLLMClient):
             Conversation.from_messages(conversation.get_messages())
         )
         yield from super().stream_with_tools(conversation, tools)
+
+
+def _record_rehydrates(monkeypatch):
+    calls = []
+    original = ToolResultArtifactStore.rehydrate
+
+    def rehydrate(store, **kwargs):
+        calls.append(kwargs["tool_call_id"])
+        return original(store, **kwargs)
+
+    monkeypatch.setattr(ToolResultArtifactStore, "rehydrate", rehydrate)
+    return calls
+
+
+@pytest.mark.parametrize("finalization", [False, True])
+def test_turn_local_full_is_released_after_next_build(tmp_path, monkeypatch, finalization):
+    import weakref
+    from mycode.context_builder import ContextBuilder
+
+    rehydrates = _record_rehydrates(monkeypatch)
+    handed_off = []
+    real_build = ContextBuilder.build
+
+    def build(builder, conversation, **kwargs):
+        group = kwargs.get("turn_local_full_group")
+        if group is not None:
+            handed_off.append(weakref.ref(group))
+            for reference, full in group.results.values():
+                path = Path(parse_tool_result_content(reference).metadata["artifact_path"])
+                assert path.read_text(encoding="utf-8") == full
+            assert all(EXTERNALIZED_TOOL_RESULT_MARKER in message.content
+                       for message in conversation.get_messages() if message.role == "tool")
+        return real_build(builder, conversation, **kwargs)
+
+    monkeypatch.setattr(ContextBuilder, "build", build)
+    call = AgentToolCall(id="fresh", name="large_tool", arguments={"text": "one"})
+    client = RecordingArtifactLLMClient([
+        AgentModelResponse(tool_calls=[call], stop_reason="tool_calls"),
+        AgentModelResponse(content="done"),
+    ])
+    client.responses = ["checkpoint"]
+    runner = AgentRunner(
+        llm_client=client, tool_registry=ToolRegistry.from_tools([LargeTool()]),
+        tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 50),
+        max_turns=1 if finalization else 3,
+        convergence_remaining_turns=None, convergence_prompt=None,
+    )
+    for event in runner.run("inspect"):
+        if event.type == "model_start" and handed_off:
+            assert handed_off[-1]() is None  # consumed handoff is not retained by Runner
+    assert len(handed_off) == 1
+    assert rehydrates == []
+    assert "sensitive body " * 20 in next(
+        message.content for message in runner.last_model_context.messages
+        if message.role == "tool"
+    )
+    runner._model_context([])
+    assert rehydrates == ["fresh"]  # second build must read the stable artifact
+
+
+def test_new_batch_replaces_unconsumed_turn_local_handoff(tmp_path, monkeypatch):
+    import weakref
+    from mycode.runner import ToolBatchExecution, ToolCallExecution
+
+    rehydrates = _record_rehydrates(monkeypatch)
+    runner = AgentRunner(
+        llm_client=FakeLLMClient(responses=[]), tool_registry=ToolRegistry(),
+        context_budget=ContextBudget(recent_tool_result_groups_to_keep=2),
+        tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 50),
+    )
+    pending = None
+    handoffs = []
+    for call_id in ("old", "new"):
+        call = AgentToolCall(id=call_id, name="large_tool", arguments={})
+        runner.conversation.add_assistant_tool_calls("", [call])
+        batch = ToolBatchExecution(executions=(ToolCallExecution(
+            tool_call=call, result=ToolResult.success(call_id * 1000),
+        ),))
+        events = runner._persist_tool_results(batch)
+        while True:
+            try:
+                next(events)
+            except StopIteration as stop:
+                pending = stop.value
+                break
+        handoffs.append(weakref.ref(pending))
+    assert handoffs[0]() is None
+    assert set(pending.results) == {"new"}
+    context = runner._model_context([], turn_local_full_group=pending)
+    pending = None
+    assert handoffs[1]() is None
+    assert rehydrates == ["old"]
+    assert context.retention_stats.full_groups == 2
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_turn_local_is_cleared_when_run_is_abandoned(tmp_path, monkeypatch, interrupt):
+    call = AgentToolCall(id="abandoned", name="large_tool", arguments={"text": "value"})
+    runner = AgentRunner(
+        llm_client=RecordingArtifactLLMClient([
+            AgentModelResponse(tool_calls=[call], stop_reason="tool_calls"),
+        ]),
+        tool_registry=ToolRegistry.from_tools([LargeTool()]),
+        tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 50),
+    )
+    real_context = runner._model_context
+
+    def fail_next_context(*args, **kwargs):
+        if kwargs.get("turn_local_full_group") is not None:
+            raise RuntimeError("synthetic context failure")
+        return real_context(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_model_context", fail_next_context)
+    events = runner.run("inspect")
+    if interrupt:
+        for event in events:
+            if event.type == "progress" and any(
+                message.role == "tool" for message in runner.conversation.get_messages()
+            ):
+                events.close()
+                break
+    else:
+        with pytest.raises(RuntimeError, match="synthetic context failure"):
+            list(events)
+    assert events.gi_frame is None
+    rehydrates = _record_rehydrates(monkeypatch)
+    real_context([])
+    assert rehydrates == ["abandoned"]

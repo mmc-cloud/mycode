@@ -23,6 +23,7 @@ from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
+from mycode.observability import ObservationSink
 from mycode.llm import OpenAICompatibleLLMClient
 from mycode.permissions import Confirmer
 from mycode.project import ProjectIdentity
@@ -83,6 +84,7 @@ def build_agent_runner(
     memory_store: MemoryStore | None = None,
     subagent_observer: SubAgentObserver | None = None,
     llm_config: LLMConfig | None = None,
+    observability_sink: ObservationSink | None = None,
 ) -> AgentRunner:
     if (artifact_directory is None) != (artifact_write_guard is None):
         raise ValueError(
@@ -116,6 +118,7 @@ def build_agent_runner(
         memory_store=effective_memory_store,
         memory_recall_policy=memory_recall_policy,
         context_budget=context_budget,
+        observability_sink=observability_sink,
     )
     history_messages = (
         [] if conversation_history is None else conversation_history.get_messages()
@@ -181,8 +184,12 @@ def build_agent_runner(
             llm_client=summary_client,
             state=CompactState() if compact_state is None else compact_state,
             on_state_changed=on_compact_state_changed,
+            observability_sink=observability_sink,
+            observability_scope="compact",
         ),
         tool_result_artifact_store=artifact_store,
+        observability_sink=observability_sink,
+        observability_scope="main",
     )
 
 

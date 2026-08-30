@@ -1063,3 +1063,83 @@ class SystemExitingLLM:
     ) -> Iterator[AgentEvent]:
         raise SystemExit(self.exit_code)
         yield
+
+
+def test_subagent_retention_restores_recent_and_isolates_artifact_roots(tmp_path, monkeypatch):
+    from tempfile import TemporaryDirectory
+    from mycode.artifacts import EXTERNALIZED_TOOL_RESULT_MARKER, parse_tool_result_content
+    import mycode.subagents.runtime as module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "a.txt").write_text("first evidence " * 1000, encoding="utf-8")
+    (workspace / "b.txt").write_text("second evidence " * 1000, encoding="utf-8")
+    roots = []
+    rehydrates = []
+    real_rehydrate = module.ToolResultArtifactStore.rehydrate
+
+    def rehydrate(store, **kwargs):
+        rehydrates.append(kwargs["tool_call_id"])
+        return real_rehydrate(store, **kwargs)
+
+    monkeypatch.setattr(module.ToolResultArtifactStore, "rehydrate", rehydrate)
+
+    def temporary_directory(**kwargs):
+        directory = TemporaryDirectory(dir=tmp_path, **kwargs)
+        roots.append(Path(directory.name))
+        return directory
+
+    monkeypatch.setattr(module, "TemporaryDirectory", temporary_directory)
+    for run in range(2):
+        calls = [AgentToolCall(id=f"read-{name}", name="read_file", arguments={"path": name})
+                 for name in ("a.txt", "b.txt")]
+        client = RecordingToolLLM([
+            AgentModelResponse(tool_calls=[calls[0]], stop_reason="tool_calls"),
+            AgentModelResponse(tool_calls=[calls[1]], stop_reason="tool_calls"),
+            _explorer_submission("inspected evidence"),
+        ])
+        runtime = _runtime(workspace, lambda: client, tmp_path=tmp_path,
+                           context_budget=ContextBudget(tool_result_compression_threshold_chars=50))
+        execution = runtime.execute(SubAgentTask(role="explorer", objective="inspect two files"))
+        assert execution.result.status == "completed"
+        first_recent = next(m for m in client.seen_conversations[1] if m.get("tool_call_id") == "read-a.txt")
+        assert "first evidence " * 50 in first_recent["content"]
+        assert EXTERNALIZED_TOOL_RESULT_MARKER not in first_recent["content"]
+        third = {m["tool_call_id"]: m for m in client.seen_conversations[2] if m["role"] == "tool"}
+        old = third["read-a.txt"]["content"]
+        assert EXTERNALIZED_TOOL_RESULT_MARKER in old
+        assert "second evidence " * 50 in third["read-b.txt"]["content"]
+        path = Path(parse_tool_result_content(old).metadata["artifact_path"])
+        assert path.parent == roots[run]
+        assert not roots[run].exists()
+        assert [schema["name"] for schema in client.seen_tools[0]] == ["read_file", "glob", "grep", "submit_result"]
+    assert roots[0] != roots[1]
+    assert rehydrates == []
+
+
+@pytest.mark.parametrize("error", [RuntimeError, KeyboardInterrupt])
+def test_subagent_artifact_directory_is_cleaned_on_failure(tmp_path, monkeypatch, error):
+    from tempfile import TemporaryDirectory
+    import mycode.subagents.runtime as module
+
+    roots = []
+
+    def temporary_directory(**kwargs):
+        directory = TemporaryDirectory(dir=tmp_path, **kwargs)
+        roots.append(Path(directory.name))
+        return directory
+
+    def fail():
+        raise error("stop")
+
+    monkeypatch.setattr(module, "TemporaryDirectory", temporary_directory)
+    client = RecordingToolLLM([], before_first_response=fail)
+    runtime = _runtime(tmp_path, lambda: client, tmp_path=tmp_path)
+    task = SubAgentTask(role="explorer", objective="inspect")
+    if error is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            runtime.execute(task)
+    else:
+        assert runtime.execute(task).result.status == "failed"
+    assert len(roots) == 1
+    assert not roots[0].exists()

@@ -302,6 +302,32 @@ def test_openai_compatible_client_streams_with_tools_text_deltas() -> None:
     ]
 
 
+def test_stream_observation_marks_provider_empty_response() -> None:
+    fake_sdk_client = FakeOpenAIClient(
+        response_content="",
+        stream_chunks=[fake_stream_chunk(finish_reason="stop")],
+    )
+    client = OpenAICompatibleLLMClient(
+        config=LLMConfig(
+            api_key="test-key",
+            base_url="https://example.com",
+            model="test-model",
+        ),
+        _client=fake_sdk_client,
+    )
+
+    assert list(client.stream_with_tools(Conversation(), [fake_tool_schema()])) == []
+
+    observation = client.last_model_response
+    assert observation is not None
+    assert observation["finish_reason"] == "stop"
+    assert observation["content_chars"] == 0
+    assert observation["content_non_whitespace_chars"] == 0
+    assert observation["tool_call_count"] == 0
+    assert observation["stream_chunk_count"] == 1
+    assert observation["empty_response"] is True
+
+
 def test_openai_compatible_client_streams_with_tools_ignores_empty_choice_chunks() -> None:
     fake_sdk_client = FakeOpenAIClient(
         response_content="",
@@ -676,6 +702,8 @@ def fake_stream_chunk(
     content: str = "",
     reasoning_content: object = _REASONING_UNSET,
     tool_calls: list[SimpleNamespace] | None = None,
+    finish_reason: str | None = None,
+    stop_reason: str | None = None,
 ) -> SimpleNamespace:
     delta_values: dict[str, object] = {
         "content": content,
@@ -686,7 +714,9 @@ def fake_stream_chunk(
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                delta=SimpleNamespace(**delta_values)
+                delta=SimpleNamespace(**delta_values),
+                finish_reason=finish_reason,
+                stop_reason=stop_reason,
             )
         ]
     )

@@ -2,13 +2,19 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 import json
 
+import pytest
+
 from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.context_budget import (
     ContextBudget,
+    ContextBudgetExceededError,
+    MemoryContextStats,
     TokenEstimator,
     TokenUsage,
+    estimate_conversation,
     format_model_context_stats,
 )
+from mycode.context_builder import ContextBuilder
 from mycode.context_compact import (
     COMPACT_SUMMARY_MARKER,
     CompactBoundary,
@@ -395,7 +401,7 @@ def test_agent_runner_falls_back_to_deterministic_trim_when_summary_is_invalid()
     assert len(summary_client.seen_conversations) == 1
 
 
-def test_agent_runner_retries_canonical_history_when_active_summary_overflows() -> None:
+def test_agent_runner_preserves_summary_and_stops_when_active_summary_overflows() -> None:
     summary_client = RecordingSummaryClient(
         responses=[summary_json("unused")],
     )
@@ -437,27 +443,22 @@ def test_agent_runner_retries_canonical_history_when_active_summary_overflows() 
 
     events = list(runner.run("latest request"))
 
-    assert [event.content for event in events if event.type == "text_delta"] == ["done"]
-    sent = main_client.seen_conversations[0]
-    assert all(COMPACT_SUMMARY_MARKER not in str(item.get("content")) for item in sent)
-    assert all("old request" not in str(item.get("content")) for item in sent)
-    assert any(item.get("content") == "latest request" for item in sent)
-    assert runner.last_model_context is not None
-    assert runner.last_model_context.estimate.over_budget is False
-    assert runner.last_model_context.compact_stats is not None
-    assert (
-        runner.last_model_context.compact_stats.status
-        == "canonical_fallback"
-    )
-    assert runner.last_model_context.compact_stats.summary_visible is False
-    assert runner.last_model_context.source_message_count == 5
-    context_stats = format_model_context_stats(runner.last_model_context)
-    assert "messages=3/5" in context_stats
-    assert "compact_summary_visible=false" in context_stats
+    assert events[-1].stop_reason == "context_overflow"
+    assert main_client.seen_conversations == []
+    context = runner.last_model_context
+    assert context is not None
+    assert context.estimate.over_budget is True
+    assert context.compact_stats is not None
+    assert context.compact_stats.status == "insufficient_history"
+    assert context.compact_stats.summary_visible is True
+    assert any(COMPACT_SUMMARY_MARKER in message.content for message in context.messages)
+    assert context.source_message_count == 5
+    assert "over_budget=True" in format_model_context_stats(context)
+    assert runner.compactor.state.boundary == boundary
     assert summary_client.seen_conversations == []
 
 
-def test_chat_session_retries_canonical_history_when_active_summary_overflows() -> None:
+def test_chat_session_preserves_summary_and_raises_when_active_summary_overflows() -> None:
     summary_client = RecordingSummaryClient(
         responses=[summary_json("unused")],
     )
@@ -494,22 +495,19 @@ def test_chat_session_retries_canonical_history_when_active_summary_overflows() 
         ),
     )
 
-    reply = session.send_user_message("latest request")
+    with pytest.raises(ContextBudgetExceededError) as error:
+        session.send_user_message("latest request")
 
-    assert reply.content == "chat done"
-    sent = main_client.seen_conversations[0]
-    assert all(COMPACT_SUMMARY_MARKER not in str(item.get("content")) for item in sent)
-    assert all("old request" not in str(item.get("content")) for item in sent)
-    assert any(item.get("content") == "latest request" for item in sent)
-    assert session.last_model_context is not None
-    assert session.last_model_context.estimate.over_budget is False
-    assert session.last_model_context.compact_stats is not None
-    assert (
-        session.last_model_context.compact_stats.status
-        == "canonical_fallback"
-    )
-    assert session.last_model_context.compact_stats.summary_visible is False
-    assert session.last_model_context.source_message_count == 5
+    assert main_client.seen_conversations == []
+    context = session.last_model_context
+    assert context is error.value.context
+    assert context.estimate.over_budget is True
+    assert context.compact_stats is not None
+    assert context.compact_stats.status == "insufficient_history"
+    assert context.compact_stats.summary_visible is True
+    assert any(COMPACT_SUMMARY_MARKER in message.content for message in context.messages)
+    assert context.source_message_count == 5
+    assert session.compactor.state.boundary == boundary
     assert summary_client.seen_conversations == []
 
 
@@ -548,6 +546,183 @@ def test_chat_session_uses_same_compact_summary_plus_recent_tail_model() -> None
         role="assistant",
         content="chat done",
     )
+
+
+@pytest.mark.parametrize("entry", ["agent", "chat", "chat_stream"])
+@pytest.mark.parametrize(
+    "status", ["not_needed", "compacted", "active", "failed", "cooldown", "circuit_open"]
+)
+def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tmp_path) -> None:
+    import mycode.context_builder as builder_module
+
+    summary_client = RecordingSummaryClient(
+        responses=["invalid" if status == "failed" else summary_json("continue")],
+        token_usages=[TokenUsage(prompt_tokens=100, completion_tokens=20, total_tokens=120)],
+    )
+    boundary = CompactBoundary(
+        boundary_id="restored-boundary",
+        covered_message_count=2,
+        covered_turn_count=1,
+        summary=CompactSummary.model_validate_json(summary_json("restored")),
+        source_estimated_tokens=1000,
+        created_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
+    )
+    state = CompactState()
+    if status == "active":
+        state = CompactState(boundary=boundary)
+    elif status in {"cooldown", "circuit_open"}:
+        state = CompactState(
+            boundary=boundary,
+            consecutive_failure_count=1 if status == "cooldown" else 3,
+            retry_after_message_count=100,
+        )
+    compactor = ConversationCompactor(
+        llm_client=summary_client,
+        policy=CompactPolicy(
+            trigger_ratio=1 if status in {"not_needed", "active"} else 0.01,
+            recent_turns_to_keep=2,
+        ),
+        state=state,
+    )
+    stages = []
+    prepared_results = []
+    real_prepare = compactor.prepare
+    real_budget = builder_module.budget_model_context
+
+    def prepare(*args, **kwargs):
+        stages.append("compact")
+        prepared = real_prepare(*args, **kwargs)
+        prepared_results.append(prepared)
+        return prepared
+
+    def budget(*args, **kwargs):
+        stages.append("budget")
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(compactor, "prepare", prepare)
+    monkeypatch.setattr(builder_module, "budget_model_context", budget)
+    history = conversation_with_tool_turn()
+    original = history.get_messages()
+    if entry == "agent":
+        client = RecordingAgentClient(
+            usage=TokenUsage(prompt_tokens=50, completion_tokens=10, total_tokens=60)
+        )
+        from mycode.artifacts import ToolResultArtifactStore
+        owner = AgentRunner(
+            llm_client=client, tool_registry=ToolRegistry(), conversation=history,
+            compactor=compactor, context_budget=context_budget(2000),
+            tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 10),
+        )
+        assert list(owner.run("next"))[-1].stop_reason == "final_answer"
+    else:
+        client = RecordingChatClient()
+        owner = ChatSession(
+            llm_client=client, conversation=history,
+            compactor=compactor, context_budget=context_budget(2000),
+        )
+        if entry == "chat_stream":
+            assert "".join(owner.stream_user_message("next")) == "chat done"
+        else:
+            assert owner.send_user_message("next").content == "chat done"
+
+    context = owner.last_model_context
+    assert stages == ["compact", "budget"]
+    assert context.compact_stats is prepared_results[0].stats
+    assert context.compact_stats.status == status
+    assert context.estimate.estimated_input_tokens <= context.estimate.max_input_tokens
+    assert client.seen_conversations == [
+        Conversation.from_messages(list(context.messages)).to_model_messages()
+    ]
+    has_summary = any(COMPACT_SUMMARY_MARKER in m.content for m in context.messages)
+    assert has_summary == (status in {"compacted", "active", "cooldown", "circuit_open"})
+    assert history.get_messages()[:len(original)] == original
+    assert len(summary_client.seen_conversations) == (1 if status in {"compacted", "failed"} else 0)
+    if entry != "agent":
+        assert owner.last_compact_token_usage == prepared_results[0].attempt_token_usage
+
+
+@pytest.mark.parametrize("omit_memory", [False, True])
+def test_builder_assembles_memory_guidance_and_tools_before_final_budget(
+    omit_memory, monkeypatch,
+) -> None:
+    import mycode.context_builder as builder_module
+
+    history = conversation_with_tool_turn()
+    memory = Message(role="system", content="memory " * (1000 if omit_memory else 1))
+    guidance = ("Keep the current runtime target.", "Use existing evidence.")
+    tools = [{"name": "read_file", "parameters": {"type": "object"}}]
+    compactor = ConversationCompactor(
+        llm_client=RecordingSummaryClient(responses=[summary_json("compact with memory")]),
+        policy=CompactPolicy(trigger_ratio=0.01, recent_turns_to_keep=2),
+    )
+    real_prepare = compactor.prepare
+    real_budget = builder_module.budget_model_context
+    stages = []
+
+    def prepare(conversation, *args, **kwargs):
+        stages.append("compact")
+        assert conversation is history
+        assert kwargs["memory_message"] is memory
+        assert kwargs["tools"] is tools
+        assert not any(guidance[0] in m.content for m in conversation.get_messages())
+        return real_prepare(conversation, *args, **kwargs)
+
+    def budget(messages, *args, **kwargs):
+        stages.append("budget")
+        assert messages[-2] is memory
+        assert messages[-1] == Message(role="system", content="\n\n".join(guidance))
+        assert any(COMPACT_SUMMARY_MARKER in m.content for m in messages)
+        assert kwargs["tools"] is tools
+        return real_budget(messages, *args, **kwargs)
+
+    monkeypatch.setattr(compactor, "prepare", prepare)
+    monkeypatch.setattr(builder_module, "budget_model_context", budget)
+    result = ContextBuilder(context_budget(2000), TokenEstimator(), compactor).build(
+        history, tools=tools, memory_message=memory,
+        memory_stats=MemoryContextStats(selected_entry_count=1), guidance=guidance,
+    )
+    context = result.context
+    assert stages == ["compact", "budget"]
+    assert context.compact_stats.status == "compacted"
+    assert context.compact_stats.summary_visible is True
+    assert any(COMPACT_SUMMARY_MARKER in m.content for m in context.messages)
+    assert context.memory_stats.included_entry_count == (0 if omit_memory else 1)
+    assert (memory in context.messages) is not omit_memory
+    assert any(m.content == "\n\n".join(guidance) for m in context.messages)
+    assert context.estimate.tool_schema_chars > 0
+    assert not context.estimate.over_budget
+
+
+def test_compact_summary_survives_guidance_driven_history_trimming() -> None:
+    history = conversation_with_tool_turn()
+    policy = CompactPolicy(trigger_ratio=0.01, recent_turns_to_keep=2)
+    # Size the test budget using a real summary view, then build with a fresh
+    # compactor so the tested request actually performs successful Compact.
+    preview = ConversationCompactor(
+        RecordingSummaryClient(responses=[summary_json("continue")]), policy,
+    ).prepare(history, context_budget(2000), token_estimator=TokenEstimator())
+    guidance = "runtime guidance " * 300
+    minimal = Conversation.from_messages([
+        preview.conversation.get_messages()[0],
+        Message(role="system", content=guidance),
+        history.get_messages()[-1],
+    ])
+    budget = context_budget(estimate_conversation(minimal).estimated_input_tokens + 10)
+    compactor = ConversationCompactor(
+        RecordingSummaryClient(responses=[summary_json("continue")]), policy,
+    )
+
+    context = ContextBuilder(budget, TokenEstimator(), compactor).build(
+        history, guidance=(guidance,),
+    ).context
+
+    assert context.compact_stats.status == "compacted"
+    assert context.compact_stats.summary_visible is True
+    assert COMPACT_SUMMARY_MARKER in context.messages[0].content
+    assert context.messages[1].content == guidance
+    assert context.messages[-1] == history.get_messages()[-1]
+    assert context.trimmed_message_count > 0
+    assert not context.estimate.over_budget
 
 
 class RecordingSummaryClient:
@@ -599,3 +774,58 @@ class RecordingChatClient:
     def complete(self, conversation: Conversation) -> Message:
         self.seen_conversations.append(conversation.to_model_messages())
         return Message(role="assistant", content="chat done")
+
+    def stream_complete(self, conversation: Conversation) -> Iterator[str]:
+        self.seen_conversations.append(conversation.to_model_messages())
+        yield "chat done"
+
+
+@pytest.mark.parametrize("reuse", [False, True])
+def test_retention_precedes_compact_and_budget_does_not_repeat_it(tmp_path, monkeypatch, reuse):
+    from dataclasses import replace
+    from mycode.artifacts import ToolResultArtifactStore, EXTERNALIZED_TOOL_RESULT_MARKER
+    from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
+
+    store = ToolResultArtifactStore(tmp_path / "a", 50)
+    messages = conversation_with_tool_turn().get_messages()
+    full = "OK\n" + "large evidence " * 4000
+    reference = store.externalize(tool_name="read_file", tool_call_id="call-read", content=full)
+    messages[4] = replace(messages[4], content=reference)
+    history = Conversation.from_messages(messages)
+    handoff = TurnLocalFullGroup(messages[3], {"call-read": (reference, full)})
+    observed_states = []
+    client = RecordingSummaryClient(responses=[summary_json("retention compatibility")])
+    compactor = ConversationCompactor(
+        client, CompactPolicy(trigger_ratio=0.01, recent_turns_to_keep=2),
+        on_state_changed=observed_states.append,
+    )
+    real_prepare = compactor.prepare
+    prepared = []
+
+    def prepare(conversation, *args, **kwargs):
+        assert conversation.get_messages()[4].content == full
+        result = real_prepare(conversation, *args, **kwargs)
+        prepared.append(result)
+        return result
+
+    monkeypatch.setattr(compactor, "prepare", prepare)
+    budget = context_budget(3000)
+    context = ContextBuilder(
+        budget, TokenEstimator(), compactor, ToolResultRetentionPolicy(budget, store),
+    ).build(history, guidance=("protected runtime guidance",),
+            turn_local_full_group=handoff if reuse else None).context
+    assert len(prepared) == len(observed_states) == len(client.seen_conversations) == 1
+    assert context.compact_stats is prepared[0].stats
+    assert context.compact_stats.status == "compacted"
+    assert context.compact_stats.compacted_message_count == 2
+    assert context.compact_stats.covered_turn_count == 1
+    assert compactor.state.boundary == observed_states[0].boundary
+    assert context.compact_stats.summary_visible
+    assert any(COMPACT_SUMMARY_MARKER in m.content for m in context.messages)
+    assert any(m.content == "current request" for m in context.messages)
+    assert any(m.content == "protected runtime guidance" for m in context.messages)
+    assert all(EXTERNALIZED_TOOL_RESULT_MARKER in m.content for m in context.messages if m.role == "tool")
+    assert context.retention_stats.artifact_groups == 1
+    assert context.retention_stats.budget_downgraded_groups == 1
+    assert history.get_messages() == messages
+    assert not context.estimate.over_budget

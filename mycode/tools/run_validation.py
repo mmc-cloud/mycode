@@ -77,6 +77,7 @@ class RunValidationTool(RunCommandTool):
         validation = analyze_validation_command(args.command)
         validation_metadata = {
             "validation_allowed": validation.allowed,
+            "validation_classification": validation.classification,
             "validation_category": validation.category,
             "validation_reason": validation.reason,
         }

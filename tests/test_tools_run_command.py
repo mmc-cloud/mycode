@@ -50,7 +50,9 @@ def test_run_command_normalizes_json_encoded_argv_before_permission(
     )
 
     assert result.ok is True
-    assert result.metadata["stdout"] == "normalized\n"
+    assert result.content.endswith("STDOUT\nnormalized\n")
+    assert "stdout" not in result.metadata
+    assert "stderr" not in result.metadata
     assert result.metadata["command"] == [
         sys.executable,
         "-c",
@@ -201,8 +203,10 @@ def test_run_command_runs_after_confirmation(tmp_path: Path) -> None:
     assert result.content == "Command exited with code 0.\n\nSTDOUT\nhello\n"
     assert result.metadata["exit_code"] == 0
     assert result.metadata["timed_out"] is False
-    assert result.metadata["stdout"] == "hello\n"
-    assert result.metadata["stderr"] == ""
+    assert "stdout" not in result.metadata
+    assert "stderr" not in result.metadata
+    assert result.metadata["stdout_chars"] == 6
+    assert result.metadata["stderr_chars"] == 0
     assert result.metadata["stdout_truncated"] is False
     assert result.metadata["stderr_truncated"] is False
     assert result.metadata["output_capture_complete"] is True
@@ -273,7 +277,8 @@ def test_run_command_closes_stdin_for_non_interactive_commands(
     )
 
     assert result.ok is True
-    assert result.metadata["stdout"] == "eof\n"
+    assert result.content.endswith("STDOUT\neof\n")
+    assert "stdout" not in result.metadata
     assert result.metadata["exit_code"] == 0
 
 
@@ -295,6 +300,43 @@ def test_run_command_times_out(tmp_path: Path) -> None:
     assert result.error == "Command timed out after 0.5 seconds."
     assert result.metadata["timed_out"] is True
     assert result.metadata["exit_code"] is None
+
+
+def test_run_command_timeout_keeps_captured_output_out_of_metadata(
+    tmp_path: Path,
+) -> None:
+    registry = ToolRegistry.from_tools(
+        [RunCommandTool(Workspace(tmp_path))],
+        confirmer=ApprovingConfirmer(),
+    )
+
+    result = registry.run_tool(
+        "run_command",
+        {
+            "command": [
+                sys.executable,
+                "-c",
+                (
+                    "import sys, time; "
+                    "print('before-timeout', flush=True); "
+                    "print('timeout-error', file=sys.stderr, flush=True); "
+                    "time.sleep(5)"
+                ),
+            ],
+            "timeout_seconds": 0.5,
+        },
+    )
+
+    assert result.ok is False
+    assert result.error == (
+        "Command timed out after 0.5 seconds.\n\n"
+        "STDOUT\nbefore-timeout\n\n"
+        "STDERR\ntimeout-error\n"
+    )
+    assert "stdout" not in result.metadata
+    assert "stderr" not in result.metadata
+    assert result.metadata["stdout_chars"] == len("before-timeout\n")
+    assert result.metadata["stderr_chars"] == len("timeout-error\n")
 
 
 def test_run_command_denies_outside_workspace_cwd(tmp_path: Path) -> None:
@@ -376,8 +418,10 @@ def test_run_command_truncates_stdout_and_stderr(tmp_path: Path) -> None:
     )
 
     assert result.ok is True
-    assert result.metadata["stdout"] == "def"
-    assert result.metadata["stderr"] == "xyz"
+    assert "STDOUT\ndef" in result.content
+    assert "STDERR\nxyz" in result.content
+    assert "stdout" not in result.metadata
+    assert "stderr" not in result.metadata
     assert result.metadata["stdout_chars"] == 6
     assert result.metadata["stderr_chars"] == 6
     assert result.metadata["stdout_truncated"] is True
@@ -406,7 +450,7 @@ def test_run_command_uses_streaming_capture_instead_of_subprocess_run(
     )
 
     assert result.ok is True
-    assert result.metadata["stdout"] == "hello\n"
+    assert result.content.endswith("STDOUT\nhello\n")
 
 
 def test_run_command_streaming_capture_keeps_only_output_tail(
@@ -430,8 +474,10 @@ def test_run_command_streaming_capture_keeps_only_output_tail(
     )
 
     assert result.ok is True
-    assert result.metadata["stdout"] == "TAIL"
-    assert result.metadata["stderr"] == "ERR!"
+    assert "STDOUT\nTAIL" in result.content
+    assert "STDERR\nERR!" in result.content
+    assert "stdout" not in result.metadata
+    assert "stderr" not in result.metadata
     assert result.metadata["stdout_chars"] == 50004
     assert result.metadata["stderr_chars"] == 40004
     assert result.metadata["stdout_truncated"] is True
@@ -467,7 +513,7 @@ def test_run_command_cleans_up_grandchild_that_keeps_pipe_open(
     )
 
     assert result.ok is True
-    assert result.metadata["stdout"] == "parent-done\n"
+    assert result.content.endswith("STDOUT\nparent-done\n")
     assert result.metadata["timed_out"] is False
     assert result.metadata["output_capture_complete"] is True
     assert result.metadata["process_tree_cleanup_success"] is True

@@ -25,7 +25,7 @@ from mycode.subagents.contracts import (
 from mycode.subagents.delegate import DelegateTaskTool
 from mycode.subagents.delegation import DelegationToolBatchHandler
 from mycode.subagents.runtime import (
-    DEFAULT_SUBAGENT_CONVERGENCE_REMAINING_TURNS,
+    DEFAULT_SUBAGENT_NEAR_LIMIT_REMAINING_TURNS,
     DEFAULT_SUBAGENT_MAX_TURNS,
     SubAgentRuntime,
     _collect_agent_events,
@@ -160,7 +160,7 @@ def test_collector_preserves_context_overflow_diagnostic() -> None:
     assert response.content == "context window exceeded configured budget"
 
 
-def test_runtime_defaults_to_twenty_turns_and_three_turn_convergence(
+def test_runtime_defaults_to_twenty_turns_and_three_turn_near_limit(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -172,23 +172,15 @@ def test_runtime_defaults_to_twenty_turns_and_three_turn_convergence(
     )
 
     assert DEFAULT_SUBAGENT_MAX_TURNS == 20
-    assert DEFAULT_SUBAGENT_CONVERGENCE_REMAINING_TURNS == 3
+    assert DEFAULT_SUBAGENT_NEAR_LIMIT_REMAINING_TURNS == 3
     assert runtime.max_turns == 20
-    assert runtime.convergence_remaining_turns == 3
+    assert runtime.near_limit_remaining_turns == 3
 
 
-@pytest.mark.parametrize(
-    ("role", "role_guidance"),
-    [
-        ("explorer", "停止扩大搜索范围"),
-        ("tester", "只完成最关键且尚未执行的验证"),
-        ("reviewer", "只保留有证据的高优先级 findings"),
-    ],
-)
-def test_runtime_uses_role_specific_convergence_prompt(
+@pytest.mark.parametrize("role", ["explorer", "tester", "reviewer"])
+def test_runtime_uses_neutral_near_limit_prompt(
     tmp_path: Path,
     role: str,
-    role_guidance: str,
 ) -> None:
     workspace = tmp_path / role
     workspace.mkdir()
@@ -213,7 +205,7 @@ def test_runtime_uses_role_specific_convergence_prompt(
         lambda: client,
         tmp_path=tmp_path,
         max_turns=4,
-        convergence_remaining_turns=3,
+        near_limit_remaining_turns=3,
     )
 
     runtime.execute(SubAgentTask(role=role, objective="Inspect the file."))
@@ -221,11 +213,13 @@ def test_runtime_uses_role_specific_convergence_prompt(
     second_context = client.seen_conversations[1]
     assert any(
         message["role"] == "system"
-        and role_guidance in str(message["content"])
-        and "submit_result" in str(message["content"])
+        and "重新评估剩余工作" in str(message["content"])
+        and "submit_result" not in str(message["content"])
         for message in second_context
     )
-    assert "实施最小修改和关键验证" not in str(second_context)
+    assert "停止扩大搜索范围" not in str(second_context)
+    assert "只完成最关键且尚未执行的验证" not in str(second_context)
+    assert "只保留有证据的高优先级 findings" not in str(second_context)
 
 
 def test_real_runtime_runs_all_builtin_roles_in_parallel_with_isolated_context(
@@ -456,7 +450,7 @@ def test_parallel_testers_serialize_confirmation_interaction(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     model_barrier = threading.Barrier(2)
-    command = [sys.executable, "-m", "pytest", "--version"]
+    command = [sys.executable, "-m", "unittest"]
     clients = [
         RecordingToolLLM(
             [
@@ -725,7 +719,7 @@ def test_runtime_distinguishes_max_turns_model_error_repetition_and_overflow(
         lambda: max_turns_client,
         tmp_path=tmp_path,
         max_turns=1,
-        convergence_remaining_turns=None,
+        near_limit_remaining_turns=None,
     ).execute(SubAgentTask(role="explorer", objective="Read the file."))
     assert max_turns.result.stop_reason == "max_turns"
 

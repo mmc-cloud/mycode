@@ -11,8 +11,11 @@ from mycode.artifacts import (
     ARTIFACT_IO_CHUNK_BYTES,
     ARTIFACT_EXTERNALIZATION_FAILURE_MARKER,
     ArtifactCleanupError,
+    DEFAULT_ARTIFACT_READ_CHARS,
     EXTERNALIZED_TOOL_RESULT_MARKER,
+    MAX_ARTIFACT_READ_CHARS,
     MAX_READABLE_ARTIFACT_BYTES,
+    ReadArtifactArgs,
     ReadArtifactTool,
     ToolResultArtifactStore,
     artifact_directory_for_session,
@@ -243,6 +246,21 @@ def test_read_artifact_tool_is_bounded_and_rejects_paths_outside_session_root(
     assert refused.metadata["reason"] == "artifact_path_outside_root"
     assert tampered.ok is False
     assert tampered.metadata["reason"] == "artifact_hash_mismatch"
+
+
+def test_read_artifact_defaults_to_4000_and_clamps_at_8000(tmp_path: Path) -> None:
+    tool = ReadArtifactTool(tmp_path / "artifacts")
+    schema = tool.get_schema()["parameters"]["properties"]["max_chars"]
+
+    assert DEFAULT_ARTIFACT_READ_CHARS == 4000
+    assert MAX_ARTIFACT_READ_CHARS == 8000
+    assert schema["default"] == 4000
+    assert schema["maximum"] == 8000
+    assert ReadArtifactArgs(artifact_path="C:/artifact.txt").max_chars == 4000
+    assert ReadArtifactArgs(
+        artifact_path="C:/artifact.txt",
+        max_chars=9000,
+    ).max_chars == 8000
 
 
 def test_artifact_hashing_and_slice_read_are_streamed(
@@ -931,12 +949,11 @@ def test_turn_local_full_is_released_after_next_build(tmp_path, monkeypatch, fin
         llm_client=client, tool_registry=ToolRegistry.from_tools([LargeTool()]),
         tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 50),
         max_turns=1 if finalization else 3,
-        convergence_remaining_turns=None, convergence_prompt=None,
+        near_limit_remaining_turns=None, near_limit_prompt=None,
     )
-    for event in runner.run("inspect"):
-        if event.type == "model_start" and handed_off:
-            assert handed_off[-1]() is None  # consumed handoff is not retained by Runner
+    list(runner.run("inspect"))
     assert len(handed_off) == 1
+    assert handed_off[-1]() is None  # consumed handoff is not retained after the turn
     assert rehydrates == []
     assert "sensitive body " * 20 in next(
         message.content for message in runner.last_model_context.messages
@@ -944,6 +961,51 @@ def test_turn_local_full_is_released_after_next_build(tmp_path, monkeypatch, fin
     )
     runner._model_context([])
     assert rehydrates == ["fresh"]  # second build must read the stable artifact
+
+
+def test_empty_response_retry_reuses_turn_local_full_only_within_turn(
+    tmp_path, monkeypatch,
+):
+    from mycode.context_builder import ContextBuilder
+
+    seen_groups = []
+    real_build = ContextBuilder.build
+
+    def build(builder, conversation, **kwargs):
+        group = kwargs.get("turn_local_full_group")
+        seen_groups.append(group)
+        if group is not None:
+            assert "fresh" in group.results
+            assert "sensitive body " * 20 in group.results["fresh"][1]
+        return real_build(builder, conversation, **kwargs)
+
+    monkeypatch.setattr(ContextBuilder, "build", build)
+    call = AgentToolCall(
+        id="fresh",
+        name="large_tool",
+        arguments={"text": "one"},
+    )
+    client = RecordingArtifactLLMClient([
+        AgentModelResponse(tool_calls=[call], stop_reason="tool_calls"),
+        AgentModelResponse(content=""),
+        AgentModelResponse(content="recovered final"),
+        AgentModelResponse(content="next final"),
+    ])
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry.from_tools([LargeTool()]),
+        tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 50),
+        near_limit_remaining_turns=None,
+        near_limit_prompt=None,
+    )
+
+    list(runner.run("inspect"))
+    retry_group = seen_groups[1]
+    assert retry_group is not None
+    assert seen_groups[:3] == [None, retry_group, retry_group]
+
+    list(runner.run("next"))
+    assert seen_groups[3] is None
 
 
 def test_new_batch_replaces_unconsumed_turn_local_handoff(tmp_path, monkeypatch):

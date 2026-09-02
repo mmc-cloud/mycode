@@ -9,7 +9,6 @@ from mycode.tools.grep import GrepTool
 from mycode.tools.read_file import ReadFileTool
 from mycode.tools.registry import ToolRegistry
 from mycode.tools.run_command import RunCommandTool
-from mycode.tools.run_validation import RunValidationTool
 from mycode.tools.memory import DeleteMemoryTool, ListMemoriesTool, SaveMemoryTool
 from mycode.tools.workspace import Workspace
 from mycode.tools.write_file import WriteFileTool
@@ -44,7 +43,6 @@ def create_default_tool_registry(
         WriteFileTool(workspace),
         EditFileTool(workspace),
         RunCommandTool(workspace),
-        RunValidationTool(workspace, restrict_to_known_validators=False),
     ]
     if memory_store is not None:
         tools.extend(

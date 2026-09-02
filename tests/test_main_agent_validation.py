@@ -11,20 +11,21 @@ from mycode.tools import Workspace, create_default_tool_registry
 
 
 @pytest.mark.parametrize(
-    ("case", "expected_success"),
+    ("case", "expected_validation"),
     [
-        ("pytest", True),
-        ("django_runner", True),
-        ("project_script", True),
-        ("python_inline", True),
-        ("python_inline_failure", False),
-        ("timeout", None),
+        ("pytest", "pass"),
+        ("pytest_failure", "fail"),
+        ("django_runner", "pass"),
+        ("project_script", "pass"),
+        ("python_inline", "unknown"),
+        ("python_inline_failure", "unknown"),
+        ("timeout", "unknown"),
     ],
 )
-def test_real_main_agent_validation_reaches_run_progress(
+def test_real_main_agent_validation_reaches_runtime_observation(
     tmp_path: Path,
     case: str,
-    expected_success: bool | None,
+    expected_validation: str,
 ) -> None:
     command, timeout_seconds = _prepare_validation_command(tmp_path, case)
     registry = create_default_tool_registry(
@@ -38,7 +39,7 @@ def test_real_main_agent_validation_reaches_run_progress(
                 tool_calls=[
                     AgentToolCall(
                         id=f"call_{case}",
-                        name="run_validation",
+                        name="run_command",
                         arguments={
                             "command": command,
                             "timeout_seconds": timeout_seconds,
@@ -57,9 +58,12 @@ def test_real_main_agent_validation_reaches_run_progress(
     assert [event.content for event in events if event.type == "text_delta"] == [
         "validation recorded"
     ]
-    assert runner.last_run_progress is not None
-    assert runner.last_run_progress.verification_turn_count == 1
-    assert runner.last_run_progress.last_verification_succeeded is expected_success
+    assert runner.last_runtime_state is not None
+    assert runner.last_runtime_state.last_tool_observation is not None
+    assert (
+        runner.last_runtime_state.last_tool_observation.validation
+        == expected_validation
+    )
 
 
 def test_process_start_failure_records_validation_attempt_without_result(
@@ -76,7 +80,7 @@ def test_process_start_failure_records_validation_attempt_without_result(
                 tool_calls=[
                     AgentToolCall(
                         id="call_missing_validator",
-                        name="run_validation",
+                        name="run_command",
                         arguments={"command": ["missing-validator-for-mycode-tests"]},
                     )
                 ],
@@ -89,9 +93,9 @@ def test_process_start_failure_records_validation_attempt_without_result(
 
     list(runner.run("run the relevant validation"))
 
-    assert runner.last_run_progress is not None
-    assert runner.last_run_progress.verification_turn_count == 1
-    assert runner.last_run_progress.last_verification_succeeded is None
+    assert runner.last_runtime_state is not None
+    assert runner.last_runtime_state.last_tool_observation is not None
+    assert runner.last_runtime_state.last_tool_observation.validation == "unknown"
 
 
 def _prepare_validation_command(
@@ -101,6 +105,13 @@ def _prepare_validation_command(
     if case == "pytest":
         (workspace / "test_sample.py").write_text(
             "def test_sample():\n    assert True\n",
+            encoding="utf-8",
+        )
+        return [sys.executable, "-m", "pytest", "-q", "test_sample.py"], 30.0
+
+    if case == "pytest_failure":
+        (workspace / "test_sample.py").write_text(
+            "def test_sample():\n    assert False\n",
             encoding="utf-8",
         )
         return [sys.executable, "-m", "pytest", "-q", "test_sample.py"], 30.0

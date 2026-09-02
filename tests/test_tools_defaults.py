@@ -59,7 +59,6 @@ def test_create_default_tool_registry_registers_read_and_write_tools(
         "write_file",
         "edit_file",
         "run_command",
-        "run_validation",
     ]
 
 
@@ -75,7 +74,6 @@ def test_create_default_tool_registry_exports_all_tool_schemas(
         "write_file",
         "edit_file",
         "run_command",
-        "run_validation",
     ]
 
 
@@ -94,7 +92,6 @@ def test_create_default_tool_registry_registers_expected_risk_profiles(
         ("write_file", "write", "medium"),
         ("edit_file", "write", "medium"),
         ("run_command", "command", "high"),
-        ("run_validation", "command", "high"),
     ]
 
 
@@ -109,7 +106,7 @@ def test_default_registry_only_marks_read_tools_as_concurrency_safe(
     assert registry.is_concurrency_safe("write_file") is False
     assert registry.is_concurrency_safe("edit_file") is False
     assert registry.is_concurrency_safe("run_command") is False
-    assert registry.is_concurrency_safe("run_validation") is False
+    assert registry.get("run_validation") is None
 
 
 def test_create_default_tool_registry_adds_memory_tools_when_store_is_provided(
@@ -184,12 +181,12 @@ def test_default_registry_can_run_project_validation_after_confirmation(
     )
 
     result = registry.run_tool(
-        "run_validation",
-        {"command": [sys.executable, "-c", "raise SystemExit(0)"]},
+        "run_command",
+        {"command": [sys.executable, "-m", "compileall", "-q", "."]},
     )
 
     assert result.ok is True
-    assert result.metadata["command_risk_category"] == "python_inline"
+    assert result.metadata["command_risk_category"] == "python_execution"
     assert result.metadata["confirmation_status"] == "approved"
 
 
@@ -201,7 +198,9 @@ def test_read_only_registry_can_run_read_file(tmp_path: Path) -> None:
     result = registry.run_tool("read_file", {"path": "README.md"})
 
     assert result.ok is True
-    assert result.content == "1 | hello"
+    assert result.content == (
+        "File: README.md\nLines: 1-1 / 1\nHas more: no\n\n1 | hello"
+    )
 
 
 def test_read_only_registry_requires_confirmation_for_sensitive_read_file(
@@ -232,7 +231,7 @@ def test_read_only_registry_reads_env_example_without_confirmation(
     result = registry.run_tool("read_file", {"path": ".env.example"})
 
     assert result.ok is True
-    assert result.content == "1 | OPENAI_API_KEY="
+    assert result.content.endswith("\n\n1 | OPENAI_API_KEY=")
     assert result.metadata["path"] == ".env.example"
 
 
@@ -249,7 +248,7 @@ def test_read_only_registry_reads_sensitive_file_after_confirmation(
     result = registry.run_tool("read_file", {"path": ".env"})
 
     assert result.ok is True
-    assert result.content == "1 | OPENAI_API_KEY=secret"
+    assert result.content.endswith("\n\n1 | OPENAI_API_KEY=secret")
     assert result.metadata["path"] == ".env"
 
 
@@ -266,7 +265,7 @@ def test_read_only_registry_reads_outside_workspace_file_after_confirmation(
     result = registry.run_tool("read_file", {"path": "../outside.txt"})
 
     assert result.ok is True
-    assert result.content == "1 | outside"
+    assert result.content.endswith("\n\n1 | outside")
     assert result.metadata["path"] == file_path.as_posix()
 
 

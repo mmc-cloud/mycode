@@ -11,15 +11,21 @@ def test_read_file_reads_text_file_with_line_numbers(tmp_path: Path) -> None:
     result = tool.run({"path": "sample.py"})
 
     assert result.ok is True
-    assert result.content == "1 | print('hello')\n2 | print('world')"
+    assert result.content == (
+        "File: sample.py\n"
+        "Lines: 1-2 / 2\n"
+        "Has more: no\n\n"
+        "1 | print('hello')\n"
+        "2 | print('world')"
+    )
     assert result.metadata == {
         "path": "sample.py",
         "encoding": "utf-8",
         "start_line": 1,
         "end_line": 2,
-        "max_lines": 200,
         "total_lines": 2,
-        "truncated": False,
+        "has_more": False,
+        "next_start_line": None,
     }
 
 
@@ -31,11 +37,19 @@ def test_read_file_reads_requested_line_window(tmp_path: Path) -> None:
     result = tool.run({"path": "sample.txt", "start_line": 2, "max_lines": 2})
 
     assert result.ok is True
-    assert result.content == "2 | two\n3 | three"
+    assert result.content == (
+        "File: sample.txt\n"
+        "Lines: 2-3 / 4\n"
+        "Has more: yes\n"
+        "Next start line: 4\n\n"
+        "2 | two\n"
+        "3 | three"
+    )
     assert result.metadata["start_line"] == 2
     assert result.metadata["end_line"] == 3
     assert result.metadata["total_lines"] == 4
-    assert result.metadata["truncated"] is True
+    assert result.metadata["has_more"] is True
+    assert result.metadata["next_start_line"] == 4
 
 
 def test_read_file_returns_empty_content_when_start_line_is_past_eof(
@@ -48,11 +62,16 @@ def test_read_file_returns_empty_content_when_start_line_is_past_eof(
     result = tool.run({"path": "sample.txt", "start_line": 10, "max_lines": 2})
 
     assert result.ok is True
-    assert result.content == ""
+    assert result.content == (
+        "File: sample.txt\n"
+        "Lines: none (requested start: 10) / 2\n"
+        "Has more: no"
+    )
     assert result.metadata["start_line"] == 10
     assert result.metadata["end_line"] == 9
     assert result.metadata["total_lines"] == 2
-    assert result.metadata["truncated"] is False
+    assert result.metadata["has_more"] is False
+    assert result.metadata["next_start_line"] is None
 
 
 def test_read_file_supports_gbk_text_file(tmp_path: Path) -> None:
@@ -63,7 +82,7 @@ def test_read_file_supports_gbk_text_file(tmp_path: Path) -> None:
     result = tool.run({"path": "note.txt"})
 
     assert result.ok is True
-    assert result.content == "1 | 你好"
+    assert result.content.endswith("\n\n1 | 你好")
     assert result.metadata["encoding"] == "gbk"
 
 
@@ -75,7 +94,7 @@ def test_read_file_preserves_utf8_chinese_text(tmp_path: Path) -> None:
     result = tool.run({"path": "README.md"})
 
     assert result.ok is True
-    assert result.content == "1 | 这是一个本地运行的项目"
+    assert result.content.endswith("\n\n1 | 这是一个本地运行的项目")
     assert result.metadata["encoding"] == "utf-8"
 
 

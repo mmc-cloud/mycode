@@ -32,14 +32,6 @@ AgentEventType = Literal[
 ]
 
 AgentWarningType = Literal["artifact_externalization"]
-AgentTaskPhase = Literal["INVESTIGATE", "ACT", "VERIFY", "VALIDATED"]
-AgentToolEffect = Literal[
-    "investigate",
-    "rehydrate",
-    "mutate",
-    "validate",
-    "neutral",
-]
 
 
 @dataclass(frozen=True)
@@ -57,11 +49,12 @@ class AgentWarning:
 
 @dataclass(frozen=True)
 class AgentProgressSnapshot:
-    task_phase: AgentTaskPhase
-    effects: tuple[AgentToolEffect, ...] = ()
-    transition_reason: str = "run_started"
-    ready_investigation_turn_count: int = 0
-    post_validation_tool_turn_count: int = 0
+    stagnation_turns: int = 0
+    same_tool_repeat: int = 0
+    same_result_repeat: int = 0
+    resource_repeat: int = 0
+    convergence_guided: bool = False
+    reason: str = "run_started"
 
 
 @dataclass(frozen=True)

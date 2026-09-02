@@ -115,8 +115,6 @@ def build_output_metadata(
     stderr: CapturedOutput,
 ) -> dict[str, object]:
     return {
-        "stdout": stdout.content,
-        "stderr": stderr.content,
         "stdout_chars": stdout.chars,
         "stderr_chars": stderr.chars,
         "stdout_truncated": stdout.truncated,

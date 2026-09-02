@@ -34,31 +34,21 @@ from mycode.conversation import Conversation
 from mycode.llm import LLMClient
 from mycode.memory_context import MemoryRecall, MemoryRecallProvider
 from mycode.messages import Message
-from mycode.observability import (
-    CompletionDecisionValue,
-    ObservationSink,
-    emit_observation,
-)
+from mycode.observability import ObservationSink, emit_observation
 from mycode.reasoning import ReasoningState
 from mycode.run_progress import (
-    COMPLETION_CORRECTION_EXTRA_TURNS,
-    COMPLETION_CORRECTION_PROMPT,
     DEFAULT_MAX_TURNS,
-    DEFAULT_READONLY_TURN_LIMIT,
-    DEFAULT_STAGNANT_TURN_LIMIT,
-    MAIN_CONVERGENCE_PROMPT,
-    MAIN_CONVERGENCE_REMAINING_TURNS,
+    MAIN_NEAR_LIMIT_PROMPT,
+    MAIN_NEAR_LIMIT_REMAINING_TURNS,
     MAX_TURNS_FINALIZATION_PROMPT,
-    RunProgress,
-    ToolPolicy,
-    ToolObservation,
-    blocks_investigation_for_policy,
-    decide_completion_request,
+    PolicyDecision,
+    RuntimeObservation,
+    RuntimePolicy,
+    RuntimeState,
+    decide_runtime_policy,
     observe_tool_result,
     normalize_run_checkpoint,
-    resolve_runtime_decision,
     resume_guidance,
-    tool_result_evidence,
 )
 from mycode.tools import ToolRegistry, ToolResult, Workspace
 
@@ -66,6 +56,13 @@ from mycode.tools import ToolRegistry, ToolResult, Workspace
 DEFAULT_REPEATED_TOOL_CALL_LIMIT = 3
 DEFAULT_MAX_TOOL_CALLS_PER_RESPONSE = 32
 DEFAULT_MAX_CONCURRENT_SAFE_TOOLS = 4
+EMPTY_RESPONSE_RETRY_PROMPT = (
+    "Your previous response contained neither tool calls nor a final answer. "
+    "Continue the task or provide a final response."
+)
+EMPTY_RESPONSE_ERROR = (
+    "模型响应错误（empty_response）：连续两次响应都没有工具调用或非空最终回答。"
+)
 _OBSERVABLE_BOUNDED_READ_FIELDS = {
     "read_artifact": "max_chars",
     "read_file": "max_lines",
@@ -271,11 +268,9 @@ class AgentRunner:
     tool_registry: ToolRegistry
     conversation: Conversation = field(default_factory=Conversation)
     max_turns: int = DEFAULT_MAX_TURNS
-    convergence_remaining_turns: int | None = MAIN_CONVERGENCE_REMAINING_TURNS
-    convergence_prompt: str | None = MAIN_CONVERGENCE_PROMPT
+    near_limit_remaining_turns: int | None = MAIN_NEAR_LIMIT_REMAINING_TURNS
+    near_limit_prompt: str | None = MAIN_NEAR_LIMIT_PROMPT
     repeated_tool_call_limit: int = DEFAULT_REPEATED_TOOL_CALL_LIMIT
-    stagnant_turn_limit: int = DEFAULT_STAGNANT_TURN_LIMIT
-    readonly_turn_limit: int | None = DEFAULT_READONLY_TURN_LIMIT
     finalize_on_max_turns: bool = True
     context_budget: ContextBudget = field(default_factory=ContextBudget)
     token_estimator: TokenEstimator = field(default_factory=TokenEstimator)
@@ -295,7 +290,7 @@ class AgentRunner:
     observability_run_id: str | None = None
     last_artifact_error: str | None = field(default=None, init=False)
     artifact_failure_count: int = field(default=0, init=False)
-    last_run_progress: RunProgress | None = field(default=None, init=False)
+    last_runtime_state: RuntimeState | None = field(default=None, init=False)
     _pending_artifact_warnings: list[AgentWarning] = field(
         default_factory=list,
         init=False,
@@ -307,26 +302,22 @@ class AgentRunner:
             raise ValueError("max_turns must be at least 1.")
         if self.repeated_tool_call_limit < 1:
             raise ValueError("repeated_tool_call_limit must be at least 1.")
-        if self.stagnant_turn_limit < 1:
-            raise ValueError("stagnant_turn_limit must be at least 1.")
-        if self.readonly_turn_limit is not None and self.readonly_turn_limit < 1:
-            raise ValueError("readonly_turn_limit must be at least 1 or None.")
-        if (self.convergence_remaining_turns is None) != (
-            self.convergence_prompt is None
+        if (self.near_limit_remaining_turns is None) != (
+            self.near_limit_prompt is None
         ):
             raise ValueError(
-                "convergence_remaining_turns and convergence_prompt must both be set "
+                "near_limit_remaining_turns and near_limit_prompt must both be set "
                 "or both be None."
             )
-        if self.convergence_remaining_turns is None:
+        if self.near_limit_remaining_turns is None:
             return
-        if not 0 < self.convergence_remaining_turns < self.max_turns:
+        if not 0 < self.near_limit_remaining_turns < self.max_turns:
             raise ValueError(
-                "convergence_remaining_turns must be greater than 0 and less than "
+                "near_limit_remaining_turns must be greater than 0 and less than "
                 "max_turns."
             )
-        if not self.convergence_prompt or not self.convergence_prompt.strip():
-            raise ValueError("convergence_prompt must not be blank.")
+        if not self.near_limit_prompt or not self.near_limit_prompt.strip():
+            raise ValueError("near_limit_prompt must not be blank.")
 
     def run(self, user_message: str) -> Iterator[AgentEvent]:
         pending_full_group: TurnLocalFullGroup | None = None
@@ -340,13 +331,12 @@ class AgentRunner:
 
             previous_tool_call_signature: str | None = None
             repeated_tool_call_count = 0
-            completion_correction_guidance_pending = False
-            completion_extension_remaining = 0
-            progress = RunProgress(
-                stagnant_turn_limit=self.stagnant_turn_limit,
-                readonly_turn_limit=self.readonly_turn_limit,
+            pending_runtime_decision = PolicyDecision(
+                policy=RuntimePolicy.NO_INTERVENTION
             )
-            self.last_run_progress = progress
+            near_limit_guidance_sent = False
+            runtime_state = RuntimeState()
+            self.last_runtime_state = runtime_state
             reported_context_state: (
                 tuple[
                     int,
@@ -364,196 +354,205 @@ class AgentRunner:
                 | None
             ) = None
 
-            for turn_index in range(
-                self.max_turns + COMPLETION_CORRECTION_EXTRA_TURNS
-            ):
+            for turn_index in range(self.max_turns):
+                guidance = pending_runtime_decision.guidance
+                notice = pending_runtime_decision.notice
+                pending_runtime_decision = PolicyDecision(
+                    policy=RuntimePolicy.NO_INTERVENTION
+                )
+                if not guidance and turn_index == 0 and continuation_guidance:
+                    guidance = (continuation_guidance,)
+                    notice = "已载入上次检查点，将直接衔接剩余工作"
+                remaining_turns = self.max_turns - turn_index
                 if (
-                    turn_index >= self.max_turns
-                    and completion_extension_remaining == 0
+                    self.near_limit_remaining_turns is not None
+                    and self.near_limit_prompt is not None
+                    and remaining_turns == self.near_limit_remaining_turns
+                    and not near_limit_guidance_sent
                 ):
-                    break
-                if completion_extension_remaining > 0:
-                    completion_extension_remaining -= 1
-                content_parts: list[str] = []
-                reasoning_parts: list[str] = []
-                reasoning_state: ReasoningState = "absent"
-                tool_calls: list[AgentToolCall] = []
-                deferred_visible_events: list[AgentEvent] = []
-                defer_completion_candidate = (
-                    decide_completion_request(progress) == "correct"
-                )
-                readiness_notice = progress.take_readiness_notice(turn_index + 1)
-                pending_replan_reason = progress.pending_replan_reason
-                decision = resolve_runtime_decision(
-                    progress=progress,
-                    turn_index=turn_index,
-                    max_turns=self.max_turns,
-                    convergence_remaining_turns=self.convergence_remaining_turns,
-                    convergence_prompt=self.convergence_prompt,
-                    readiness_notice=readiness_notice,
-                    resume_guidance=continuation_guidance,
-                    completion_correction_guidance=(
-                        COMPLETION_CORRECTION_PROMPT
-                        if completion_correction_guidance_pending
-                        else None
-                    ),
-                )
-                completion_correction_guidance_pending = False
-                if pending_replan_reason is not None and decision.guidance:
-                    progress.take_replan_reason()
-                tools = _tool_schemas_for_policy(
-                    self.tool_registry,
-                    decision.tool_policy,
-                )
+                    guidance = (*guidance, self.near_limit_prompt)
+                    near_limit_guidance_sent = True
+                    near_limit_notice = (
+                        f"距离运行轮次上限还有 {self.near_limit_remaining_turns} 轮，"
+                        "已发送一次接近上限提醒"
+                    )
+                    notice = (
+                        near_limit_notice
+                        if not notice
+                        else f"{notice}；{near_limit_notice}"
+                    )
+                tools = self.tool_registry.get_schemas()
                 yield AgentEvent(
                     type="turn",
-                    content=decision.notice,
+                    content=notice,
                     turn_number=turn_index + 1,
                     max_turns=self.max_turns,
                 )
-                try:
+                turn_local_full_group = pending_full_group
+                pending_full_group = None
+                for response_attempt in range(2):
+                    content_parts: list[str] = []
+                    reasoning_parts: list[str] = []
+                    reasoning_state: ReasoningState = "absent"
+                    tool_calls: list[AgentToolCall] = []
+                    request_guidance = guidance
+                    if response_attempt == 1:
+                        request_guidance = (
+                            *request_guidance,
+                            EMPTY_RESPONSE_RETRY_PROMPT,
+                        )
                     model_context = self._model_context(
                         tools,
-                        guidance=decision.guidance,
-                        turn_local_full_group=pending_full_group,
+                        guidance=request_guidance,
+                        turn_local_full_group=turn_local_full_group,
                         observability_turn=turn_index + 1,
                     )
-                finally:
-                    pending_full_group = None
-                for warning in self._drain_artifact_warnings():
-                    yield AgentEvent(type="artifact_warning", content=warning.content)
+                    for warning in self._drain_artifact_warnings():
+                        yield AgentEvent(
+                            type="artifact_warning",
+                            content=warning.content,
+                        )
 
-                context_state = _context_state(model_context)
-                should_report_context = reported_context_state is None or (
-                    model_context_needs_notice(model_context)
-                    and context_state != reported_context_state
-                )
-                if should_report_context:
-                    yield _context_event(
+                    context_state = _context_state(model_context)
+                    should_report_context = reported_context_state is None or (
+                        model_context_needs_notice(model_context)
+                        and context_state != reported_context_state
+                    )
+                    if should_report_context:
+                        yield _context_event(
+                            model_context,
+                            previous_token_usage=self.last_token_usage,
+                        )
+                        reported_context_state = context_state
+
+                    self._emit_context_snapshot(
                         model_context,
-                        previous_token_usage=self.last_token_usage,
+                        turn=turn_index + 1,
+                        call_kind="agent_tools",
                     )
-                    reported_context_state = context_state
 
-                self._emit_context_snapshot(
-                    model_context,
-                    turn=turn_index + 1,
-                    call_kind="agent_tools",
-                )
+                    if model_context.estimate.over_budget:
+                        yield AgentEvent(
+                            type="error",
+                            error=_context_overflow_message(model_context),
+                        )
+                        yield AgentEvent(
+                            type="stop",
+                            stop_reason="context_overflow",
+                        )
+                        return
 
-                if model_context.estimate.over_budget:
-                    yield AgentEvent(
-                        type="error",
-                        error=_context_overflow_message(model_context),
-                    )
-                    yield AgentEvent(type="stop", stop_reason="context_overflow")
-                    return
+                    yield AgentEvent(type="model_start")
 
-                yield AgentEvent(type="model_start")
+                    try:
+                        for event in self.llm_client.stream_with_tools(
+                            Conversation.from_messages(
+                                list(model_context.messages)
+                            ),
+                            tools,
+                        ):
+                            if event.type == "reasoning_delta":
+                                reasoning_parts.append(event.reasoning_content)
+                                reasoning_state = "present_nonempty"
+                                continue
 
-                try:
-                    for event in self.llm_client.stream_with_tools(
-                        Conversation.from_messages(list(model_context.messages)),
-                        tools,
-                    ):
-                        if event.type == "reasoning_delta":
-                            reasoning_parts.append(event.reasoning_content)
-                            reasoning_state = "present_nonempty"
-                            continue
+                            if event.type == "reasoning_state":
+                                reasoning_state = event.reasoning_state
+                                continue
 
-                        if event.type == "reasoning_state":
-                            reasoning_state = event.reasoning_state
-                            continue
-
-                        if event.type == "text_delta":
-                            content_parts.append(event.content)
-                            if defer_completion_candidate:
-                                deferred_visible_events.append(event)
-                            else:
+                            if event.type == "text_delta":
+                                content_parts.append(event.content)
                                 yield event
-                            continue
+                                continue
 
-                        if event.type == "tool_call" and event.tool_call is not None:
-                            tool_calls.append(event.tool_call)
-                            observable_event = replace(
-                                event,
-                                tool_call=_observable_tool_call(
-                                    self.tool_registry,
-                                    event.tool_call,
-                                ),
-                            )
-                            if defer_completion_candidate:
-                                deferred_visible_events.append(observable_event)
-                            else:
+                            if (
+                                event.type == "tool_call"
+                                and event.tool_call is not None
+                            ):
+                                tool_calls.append(event.tool_call)
+                                observable_event = replace(
+                                    event,
+                                    tool_call=_observable_tool_call(
+                                        self.tool_registry,
+                                        event.tool_call,
+                                    ),
+                                )
                                 yield observable_event
-                            continue
+                                continue
 
-                        if event.type == "error":
-                            self._observe_token_usage(model_context)
-                            self._emit_model_response(
-                                turn=turn_index + 1,
-                                call_kind="agent_tools",
-                                content="".join(content_parts),
-                                tool_calls=tool_calls,
-                            )
-                            yield event
-                            yield AgentEvent(type="stop", stop_reason="model_error")
-                            return
-                except Exception as error:
+                            if event.type == "error":
+                                self._observe_token_usage(model_context)
+                                self._emit_model_response(
+                                    turn=turn_index + 1,
+                                    call_kind="agent_tools",
+                                    content="".join(content_parts),
+                                    tool_calls=tool_calls,
+                                )
+                                yield event
+                                yield AgentEvent(
+                                    type="stop",
+                                    stop_reason="model_error",
+                                )
+                                return
+                    except Exception as error:
+                        self._emit_model_response(
+                            turn=turn_index + 1,
+                            call_kind="agent_tools",
+                            content="".join(content_parts),
+                            tool_calls=tool_calls,
+                            fallback_error_type=type(error).__name__,
+                        )
+                        yield AgentEvent(
+                            type="error",
+                            error=format_model_error(
+                                error,
+                                operation="模型流式请求失败",
+                            ),
+                        )
+                        yield AgentEvent(
+                            type="stop",
+                            stop_reason="model_error",
+                        )
+                        return
+
+                    self._observe_token_usage(model_context)
+                    content = "".join(content_parts)
+                    empty_response = not tool_calls and not content.strip()
+                    terminal_empty_response = (
+                        empty_response and response_attempt == 1
+                    )
                     self._emit_model_response(
                         turn=turn_index + 1,
                         call_kind="agent_tools",
-                        content="".join(content_parts),
+                        content=content,
                         tool_calls=tool_calls,
-                        fallback_error_type=type(error).__name__,
-                    )
-                    yield AgentEvent(
-                        type="error",
-                        error=format_model_error(
-                            error,
-                            operation="模型流式请求失败",
+                        error_type_override=(
+                            "empty_response"
+                            if terminal_empty_response
+                            else None
                         ),
                     )
-                    yield AgentEvent(type="stop", stop_reason="model_error")
+                    if not empty_response:
+                        break
+                    if response_attempt == 0:
+                        continue
+                    yield AgentEvent(
+                        type="error",
+                        error=EMPTY_RESPONSE_ERROR,
+                    )
+                    yield AgentEvent(
+                        type="stop",
+                        stop_reason="model_error",
+                    )
                     return
 
-                self._observe_token_usage(model_context)
-                content = "".join(content_parts)
-                self._emit_model_response(
-                    turn=turn_index + 1,
-                    call_kind="agent_tools",
-                    content=content,
-                    tool_calls=tool_calls,
-                )
+                turn_local_full_group = None
                 if not tool_calls:
-                    completion_request = decide_completion_request(progress)
-                    completion_decision: CompletionDecisionValue = (
-                        "correction"
-                        if completion_request == "correct"
-                        else "accepted"
-                    )
-                    self._emit_completion_decision(
-                        progress,
-                        turn=turn_index + 1,
-                        content=content,
-                        decision=completion_decision,
-                    )
-                    if completion_request == "correct":
-                        progress.record_completion_correction()
-                        completion_extension_remaining = (
-                            COMPLETION_CORRECTION_EXTRA_TURNS
-                        )
-                        completion_correction_guidance_pending = True
-                        yield _progress_event(progress)
-                        continue
-                    yield from deferred_visible_events
-                    progress.observe_final_answer()
+                    runtime_state.last_reason = "final_answer"
                     self.conversation.add_assistant_message(content)
-                    yield _progress_event(progress)
+                    yield _progress_event(runtime_state)
                     yield AgentEvent(type="stop", stop_reason="final_answer")
                     return
-
-                yield from deferred_visible_events
 
                 repeated_response = _check_repeated_tool_calls(
                     tool_calls,
@@ -573,9 +572,6 @@ class AgentRunner:
                     repeated_response.previous_tool_call_signature
                 )
                 repeated_tool_call_count = repeated_response.repeated_tool_call_count
-                if repeated_tool_call_count >= 2:
-                    progress.request_replan("模型重复了相同的工具调用")
-
                 self.conversation.add_assistant_tool_calls(
                     content=content,
                     tool_calls=tool_calls,
@@ -583,22 +579,16 @@ class AgentRunner:
                     reasoning_state=reasoning_state,
                 )
 
-                batch = _execute_tool_batch_with_policy(
-                    self.tool_registry,
-                    tool_calls,
-                    tool_policy=decision.tool_policy,
-                    handler=self.tool_batch_handler,
-                )
+                batch = self.tool_batch_handler(self.tool_registry, tool_calls)
                 _validate_tool_batch(tool_calls, batch)
-                progress.observe_evidence(_batch_evidence(batch))
                 _observe_tool_turn_progress(
-                    progress,
-                    turn_number=turn_index + 1,
+                    runtime_state,
                     registry=self.tool_registry,
                     batch=batch,
                 )
+                pending_runtime_decision = decide_runtime_policy(runtime_state)
                 pending_full_group = yield from self._persist_tool_results(batch)
-                yield _progress_event(progress)
+                yield _progress_event(runtime_state)
                 if batch.stop_response is not None:
                     pending_full_group = None
                     yield AgentEvent(
@@ -609,8 +599,7 @@ class AgentRunner:
                     return
                 del batch
 
-            progress.observe_turn_limit()
-            yield _progress_event(progress)
+            yield _progress_event(runtime_state)
             if self.finalize_on_max_turns:
                 finalization_events = self._stream_finalization_after_max_turns(
                     turn_local_full_group=pending_full_group,
@@ -903,6 +892,7 @@ class AgentRunner:
         content: str,
         tool_calls: Sequence[AgentToolCall],
         fallback_error_type: str | None = None,
+        error_type_override: str | None = None,
     ) -> None:
         observation = getattr(self.llm_client, "last_model_response", None)
         if not isinstance(observation, dict):
@@ -934,9 +924,14 @@ class AgentRunner:
                 "first_token_latency_ms": None,
                 "stream_chunk_count": None,
                 "retry_count": None,
-                "error_type": fallback_error_type,
+                "error_type": error_type_override or fallback_error_type,
                 "http_status": None,
                 "empty_response": not content.strip() and not tool_calls,
+            }
+        elif error_type_override is not None:
+            observation = {
+                **observation,
+                "error_type": error_type_override,
             }
         emit_observation(
             self.observability_sink,
@@ -947,51 +942,6 @@ class AgentRunner:
                 "turn": turn,
                 "call_kind": call_kind,
                 **observation,
-            },
-        )
-
-    def _emit_completion_decision(
-        self,
-        progress: RunProgress,
-        *,
-        turn: int,
-        content: str,
-        decision: CompletionDecisionValue,
-    ) -> None:
-        if decision == "correction":
-            reason = "unvalidated_mutation"
-        elif progress.has_unvalidated_mutation:
-            reason = "completion_correction_already_used"
-        else:
-            reason = "no_tool_calls"
-        if progress.mutation_revision == 0:
-            validation_state = "none"
-        elif progress.validated_revision == progress.mutation_revision:
-            validation_state = "current"
-        else:
-            validation_state = "unvalidated"
-        emit_observation(
-            self.observability_sink,
-            "completion_decision",
-            {
-                "run_scope": self.observability_scope,
-                "run_id": self.observability_run_id,
-                "turn": turn,
-                "decision": decision,
-                "accepted": decision == "accepted",
-                "correction": decision == "correction",
-                "rejected": decision == "rejected",
-                "reason": reason,
-                "phase": progress.task_phase,
-                "content_chars": len(content),
-                "content_non_whitespace_chars": sum(
-                    not character.isspace() for character in content
-                ),
-                "tool_call_count": 0,
-                "mutation_since_validation": progress.has_unvalidated_mutation,
-                "mutation_revision": progress.mutation_revision,
-                "validated_revision": progress.validated_revision,
-                "validation_state": validation_state,
             },
         )
 
@@ -1108,17 +1058,16 @@ def _context_event(
     )
 
 
-def _progress_event(progress: RunProgress) -> AgentEvent:
+def _progress_event(runtime_state: RuntimeState) -> AgentEvent:
     return AgentEvent(
         type="progress",
         progress=AgentProgressSnapshot(
-            task_phase=progress.task_phase,
-            effects=tuple(sorted(progress.last_tool_effects)),
-            transition_reason=progress.last_progress_reason,
-            ready_investigation_turn_count=progress.ready_investigation_turn_count,
-            post_validation_tool_turn_count=(
-                progress.post_validation_tool_turn_count
-            ),
+            stagnation_turns=runtime_state.stagnation_turns,
+            same_tool_repeat=runtime_state.same_tool_repeat,
+            same_result_repeat=runtime_state.same_result_repeat,
+            resource_repeat=runtime_state.resource_repeat,
+            convergence_guided=runtime_state.convergence_guided,
+            reason=runtime_state.last_reason,
         ),
     )
 
@@ -1151,38 +1100,6 @@ def _context_overflow_message(context: ModelContext) -> str:
     )
 
 
-def _batch_evidence(batch: ToolBatchExecution) -> set[str]:
-    return {
-        tool_result_evidence(
-            tool_name=execution.tool_call.name,
-            ok=execution.result.ok,
-            content=execution.result.content,
-            error=execution.result.error,
-        )
-        for execution in batch.executions
-    }
-
-
-def _tool_schemas_for_policy(
-    registry: ToolRegistry,
-    tool_policy: ToolPolicy,
-) -> list[dict[str, object]]:
-    if tool_policy == "open":
-        return registry.get_schemas()
-
-    schemas: list[dict[str, object]] = []
-    for tool in registry.list_tools():
-        capability = tool.get_permission_profile().capability
-        if blocks_investigation_for_policy(
-            tool_name=tool.name,
-            capability=capability,
-            arguments={},
-        ):
-            continue
-        schemas.append(tool.get_schema())
-    return schemas
-
-
 def _observable_tool_call(
     registry: ToolRegistry,
     tool_call: AgentToolCall,
@@ -1203,87 +1120,22 @@ def _observable_tool_call(
     return replace(tool_call, arguments=arguments)
 
 
-def _execute_tool_batch_with_policy(
-    registry: ToolRegistry,
-    tool_calls: list[AgentToolCall],
-    *,
-    tool_policy: ToolPolicy,
-    handler: ToolBatchHandler,
-) -> ToolBatchExecution:
-    if tool_policy == "open":
-        return handler(registry, tool_calls)
-
-    executable_calls, overflow_executions = partition_tool_calls_by_limit(tool_calls)
-    allowed_calls: list[AgentToolCall] = []
-    blocked_indexes: set[int] = set()
-    for index, tool_call in enumerate(executable_calls):
-        tool = registry.get(tool_call.name)
-        blocked_investigation = blocks_investigation_for_policy(
-            tool_name=tool_call.name,
-            capability=(
-                tool.get_permission_profile().capability
-                if tool is not None
-                else None
-            ),
-            arguments=tool_call.arguments,
-        )
-        if blocked_investigation:
-            blocked_indexes.add(index)
-        else:
-            allowed_calls.append(tool_call)
-
-    allowed_batch = (
-        handler(registry, allowed_calls)
-        if allowed_calls
-        else ToolBatchExecution(executions=())
-    )
-    _validate_tool_batch(allowed_calls, allowed_batch)
-    allowed_executions = iter(allowed_batch.executions)
-    executions: list[ToolCallExecution] = []
-    for index, tool_call in enumerate(executable_calls):
-        if index not in blocked_indexes:
-            executions.append(next(allowed_executions))
-            continue
-        executions.append(
-            ToolCallExecution(
-                tool_call=tool_call,
-                result=ToolResult.failure(
-                    error=(
-                        "Runtime convergence policy temporarily blocks open-ended "
-                        "investigation. Use existing evidence to act, validate, "
-                        "rehydrate prior results, or finalize."
-                    ),
-                    metadata={
-                        "tool_name": tool_call.name,
-                        "reason": "runtime_policy_blocked_investigation",
-                    },
-                ),
-            )
-        )
-    return ToolBatchExecution(
-        executions=(*executions, *overflow_executions),
-        stop_response=allowed_batch.stop_response,
-    )
-
-
 def _observe_tool_turn_progress(
-    progress: RunProgress,
+    runtime_state: RuntimeState,
     *,
-    turn_number: int,
     registry: ToolRegistry,
     batch: ToolBatchExecution,
 ) -> None:
-    progress.observe_tool_turn(
-        turn_number=turn_number,
-        observations=_batch_tool_observations(registry, batch),
+    runtime_state.observe_tool_turn(
+        _batch_tool_observations(registry, batch),
     )
 
 
 def _batch_tool_observations(
     registry: ToolRegistry,
     batch: ToolBatchExecution,
-) -> tuple[ToolObservation, ...]:
-    observations: list[ToolObservation] = []
+) -> tuple[RuntimeObservation, ...]:
+    observations: list[RuntimeObservation] = []
     for execution in batch.executions:
         tool = registry.get(execution.tool_call.name)
         workspace = None if tool is None else getattr(tool, "workspace", None)
@@ -1297,6 +1149,8 @@ def _batch_tool_observations(
                 ),
                 arguments=execution.tool_call.arguments,
                 ok=execution.result.ok,
+                content=execution.result.content,
+                error=execution.result.error,
                 metadata=execution.result.metadata,
                 workspace=workspace if isinstance(workspace, Workspace) else None,
             )

@@ -30,7 +30,7 @@ class AgentProfile:
     purpose: str
     tool_names: tuple[str, ...]
     submission_model: type[BoundedResultArgs]
-    convergence_prompt: str
+    near_limit_prompt: str
     role_rules: tuple[str, ...]
     success_criteria: tuple[str, ...]
 
@@ -39,8 +39,8 @@ class AgentProfile:
             raise ValueError("AgentProfile display_name must not be blank.")
         if not self.purpose.strip():
             raise ValueError("AgentProfile purpose must not be blank.")
-        if not self.convergence_prompt.strip():
-            raise ValueError("AgentProfile convergence_prompt must not be blank.")
+        if not self.near_limit_prompt.strip():
+            raise ValueError("AgentProfile near_limit_prompt must not be blank.")
         if not self.tool_names or self.tool_names[-1] != "submit_result":
             raise ValueError("AgentProfile tool_names must end with submit_result.")
         if len(self.tool_names) != len(set(self.tool_names)):
@@ -69,10 +69,10 @@ EXPLORER_PROFILE = AgentProfile(
     purpose="调查代码、定位相关文件、解释调用链，并返回可核对的证据。",
     tool_names=("read_file", "glob", "grep", "submit_result"),
     submission_model=ExplorerResult,
-    convergence_prompt=(
-        "剩余轮次不多。停止扩大搜索范围；基于已读文件整理最关键的 path、claim、"
-        "evidence 和不确定项，并尽快单独调用 submit_result。为一次结构校验失败保留"
-        "修正轮次；除非缺少提交所必需的唯一证据，不再读取相邻文件。"
+    near_limit_prompt=(
+        "当前接近运行轮次上限。请重新评估剩余工作，并优先使用剩余轮次完成最重要的"
+        "必要步骤。如果无法在剩余轮次内完成任务，请尽量保留已有成果，并明确说明"
+        "未完成部分或阻塞原因。"
     ),
     role_rules=(
         "只调查和读取，不执行命令，不修改文件。",
@@ -92,10 +92,10 @@ TESTER_PROFILE = AgentProfile(
     purpose="执行受限验证、分析真实退出状态，并给出精炼的失败或阻塞说明。",
     tool_names=("read_file", "glob", "grep", "run_validation", "submit_result"),
     submission_model=TesterReport,
-    convergence_prompt=(
-        "剩余轮次不多。只完成最关键且尚未执行的验证，记录真实命令、退出状态和关键"
-        "结果；不要重复运行已确认测试。随后尽快单独调用 submit_result，并为一次结构或"
-        "证据校验失败保留修正轮次。"
+    near_limit_prompt=(
+        "当前接近运行轮次上限。请重新评估剩余工作，并优先使用剩余轮次完成最重要的"
+        "必要步骤。如果无法在剩余轮次内完成任务，请尽量保留已有成果，并明确说明"
+        "未完成部分或阻塞原因。"
     ),
     role_rules=(
         "只使用 run_validation 执行测试、编译或 lint，不请求任意命令执行。",
@@ -115,11 +115,10 @@ REVIEWER_PROFILE = AgentProfile(
     purpose="独立审查代码、设计、安全边界和测试缺口，并给出分级问题。",
     tool_names=("read_file", "glob", "grep", "inspect_changes", "submit_result"),
     submission_model=ReviewerResult,
-    convergence_prompt=(
-        "剩余轮次不多。停止扩大审查范围；只保留有证据的高优先级 findings，核对"
-        " severity、path、problem、evidence、suggestion 和 reviewed_scope。没有问题时"
-        "如实提交空 findings。尽快单独调用 submit_result，并为一次结构校验失败保留"
-        "修正轮次。"
+    near_limit_prompt=(
+        "当前接近运行轮次上限。请重新评估剩余工作，并优先使用剩余轮次完成最重要的"
+        "必要步骤。如果无法在剩余轮次内完成任务，请尽量保留已有成果，并明确说明"
+        "未完成部分或阻塞原因。"
     ),
     role_rules=(
         "只读取代码和检查有界变更，不运行测试，不修改文件。",

@@ -84,11 +84,8 @@ def test_agent_event_can_represent_context_notice() -> None:
 
 def test_agent_event_can_represent_structured_progress_without_tool_payloads() -> None:
     progress = AgentProgressSnapshot(
-        task_phase="VALIDATED",
-        effects=("validate",),
-        transition_reason="validation_succeeded",
-        ready_investigation_turn_count=1,
-        post_validation_tool_turn_count=0,
+        stagnation_turns=2,
+        reason="repetition_observed",
     )
 
     event = AgentEvent(type="progress", progress=progress)

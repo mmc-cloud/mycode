@@ -57,7 +57,7 @@ from mycode.tools.workspace import Workspace
 
 DEFAULT_MAX_VALIDATION_CALLS = 20
 DEFAULT_SUBAGENT_MAX_TURNS = 20
-DEFAULT_SUBAGENT_CONVERGENCE_REMAINING_TURNS = 3
+DEFAULT_SUBAGENT_NEAR_LIMIT_REMAINING_TURNS = 3
 MAX_RUNTIME_ERROR_CHARS = 2000
 
 InstructionLoader = Callable[[Path, Path], InstructionBundle]
@@ -96,8 +96,8 @@ class SubAgentRuntime:
     context_budget: ContextBudget = field(default_factory=ContextBudget)
     observability_sink: ObservationSink | None = field(default=None, repr=False)
     max_turns: int = DEFAULT_SUBAGENT_MAX_TURNS
-    convergence_remaining_turns: int | None = (
-        DEFAULT_SUBAGENT_CONVERGENCE_REMAINING_TURNS
+    near_limit_remaining_turns: int | None = (
+        DEFAULT_SUBAGENT_NEAR_LIMIT_REMAINING_TURNS
     )
     repeated_tool_call_limit: int = DEFAULT_REPEATED_TOOL_CALL_LIMIT
     max_final_payload_chars: int = DEFAULT_MAX_FINAL_PAYLOAD_CHARS
@@ -120,11 +120,11 @@ class SubAgentRuntime:
     def __post_init__(self) -> None:
         if self.max_turns < 1:
             raise ValueError("max_turns must be at least 1.")
-        if self.convergence_remaining_turns is not None and not (
-            0 < self.convergence_remaining_turns < self.max_turns
+        if self.near_limit_remaining_turns is not None and not (
+            0 < self.near_limit_remaining_turns < self.max_turns
         ):
             raise ValueError(
-                "convergence_remaining_turns must be greater than 0 and less than "
+                "near_limit_remaining_turns must be greater than 0 and less than "
                 "max_turns."
             )
         if self.repeated_tool_call_limit < 1:
@@ -261,14 +261,13 @@ class SubAgentRuntime:
                 tool_registry=registry,
                 conversation=conversation,
                 max_turns=self.max_turns,
-                convergence_remaining_turns=self.convergence_remaining_turns,
-                convergence_prompt=(
+                near_limit_remaining_turns=self.near_limit_remaining_turns,
+                near_limit_prompt=(
                     None
-                    if self.convergence_remaining_turns is None
-                    else profile.convergence_prompt
+                    if self.near_limit_remaining_turns is None
+                    else profile.near_limit_prompt
                 ),
                 repeated_tool_call_limit=self.repeated_tool_call_limit,
-                readonly_turn_limit=None,
                 finalize_on_max_turns=False,
                 context_budget=self.context_budget,
                 tool_result_artifact_store=ToolResultArtifactStore(

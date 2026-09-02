@@ -20,11 +20,13 @@ def test_builtin_profiles_define_three_distinct_roles() -> None:
     assert EXPLORER_PROFILE.submission_model.__name__ == "ExplorerResult"
     assert TESTER_PROFILE.submission_model.__name__ == "TesterReport"
     assert REVIEWER_PROFILE.submission_model.__name__ == "ReviewerResult"
-    assert "停止扩大搜索范围" in EXPLORER_PROFILE.convergence_prompt
-    assert "最关键且尚未执行的验证" in TESTER_PROFILE.convergence_prompt
-    assert "高优先级 findings" in REVIEWER_PROFILE.convergence_prompt
+    prompts = {
+        profile.near_limit_prompt for profile in BUILTIN_AGENT_PROFILES.values()
+    }
+    assert len(prompts) == 1
     assert all(
-        "submit_result" in profile.convergence_prompt
+        "重新评估剩余工作" in profile.near_limit_prompt
+        and "submit_result" not in profile.near_limit_prompt
         for profile in BUILTIN_AGENT_PROFILES.values()
     )
 

@@ -166,21 +166,32 @@ class ReadFileTool(BaseTool[ReadFileArgs]):
         start_index = args.start_line - 1
         end_index = min(start_index + args.max_lines, total_lines)
         selected_lines = lines[start_index:end_index]
-        content = _format_numbered_lines(selected_lines, start_line=args.start_line)
         end_line = args.start_line + len(selected_lines) - 1
         if not selected_lines:
             end_line = args.start_line - 1
+        has_more = end_index < total_lines
+        next_start_line = end_line + 1 if has_more else None
+        display_path = _display_path(path, self.workspace.root)
+        content = _format_read_result(
+            path=display_path,
+            selected_lines=selected_lines,
+            start_line=args.start_line,
+            end_line=end_line,
+            total_lines=total_lines,
+            has_more=has_more,
+            next_start_line=next_start_line,
+        )
 
         return ToolResult.success(
             content=content,
             metadata={
-                "path": _display_path(path, self.workspace.root),
+                "path": display_path,
                 "encoding": encoding,
                 "start_line": args.start_line,
                 "end_line": end_line,
-                "max_lines": args.max_lines,
                 "total_lines": total_lines,
-                "truncated": end_index < total_lines,
+                "has_more": has_more,
+                "next_start_line": next_start_line,
             },
         )
 
@@ -190,6 +201,33 @@ def _format_numbered_lines(lines: list[str], *, start_line: int) -> str:
         f"{line_number} | {line}"
         for line_number, line in enumerate(lines, start=start_line)
     )
+
+
+def _format_read_result(
+    *,
+    path: str,
+    selected_lines: list[str],
+    start_line: int,
+    end_line: int,
+    total_lines: int,
+    has_more: bool,
+    next_start_line: int | None,
+) -> str:
+    lines_display = (
+        f"{start_line}-{end_line}"
+        if end_line >= start_line
+        else f"none (requested start: {start_line})"
+    )
+    header = [
+        f"File: {path}",
+        f"Lines: {lines_display} / {total_lines}",
+        f"Has more: {'yes' if has_more else 'no'}",
+    ]
+    if next_start_line is not None:
+        header.append(f"Next start line: {next_start_line}")
+    body = _format_numbered_lines(selected_lines, start_line=start_line)
+    header_text = "\n".join(header)
+    return header_text if not body else f"{header_text}\n\n{body}"
 
 
 def _display_path(path: Path, root: Path) -> str:

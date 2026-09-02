@@ -26,8 +26,9 @@ def test_agent_system_prompt_sets_write_boundaries() -> None:
 def test_agent_system_prompt_sets_command_boundaries() -> None:
     prompt = build_agent_system_prompt()
 
-    assert "优先使用当前 schemas 中的验证专用工具" in prompt
-    assert "适用的命令工具" in prompt
+    assert "测试、编译、lint、build" in prompt
+    assert "使用当前 schemas 中适用的命令工具" in prompt
+    assert "验证专用工具" not in prompt
     assert "非交互命令" in prompt
     assert "必须经过权限确认" in prompt
     assert "不要尝试删除文件" in prompt
@@ -61,13 +62,13 @@ def test_agent_system_prompt_protects_recovery_evidence_before_mutating_tools() 
     assert "不能把“只查看”当成无副作用" in prompt
 
 
-def test_agent_system_prompt_explains_lightweight_task_phase_loop() -> None:
+def test_agent_system_prompt_leaves_action_choice_to_model() -> None:
     prompt = build_agent_system_prompt()
 
-    assert "任务初始处于 INVESTIGATE" in prompt
-    assert "正式修改时进入 ACT" in prompt
-    assert "修改后进入 VERIFY" in prompt
-    assert "成功后进入 VALIDATED" in prompt
+    assert "自主决定调查、修改、验证或结束" in prompt
+    assert "Runtime 不为任务指定阶段或下一步工具" in prompt
+    assert "INVESTIGATE" not in prompt
+    assert "VALIDATED" not in prompt
 
 
 def test_agent_system_prompt_handles_sensitive_write_results() -> None:

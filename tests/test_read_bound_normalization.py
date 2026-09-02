@@ -119,7 +119,9 @@ def test_read_file_uses_normalized_bound_in_permission_and_result(
 
     assert request.arguments["max_lines"] == MAX_LINES_LIMIT
     assert result.ok is True
-    assert result.metadata["max_lines"] == MAX_LINES_LIMIT
+    assert result.metadata["start_line"] == 1
+    assert result.metadata["end_line"] == 2
+    assert result.metadata["has_more"] is False
 
 
 def test_grep_uses_normalized_bound_in_permission_and_result(tmp_path: Path) -> None:

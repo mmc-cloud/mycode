@@ -1,12 +1,10 @@
 """Content-free structured observability for Agent and Harbor runs."""
 
 from collections.abc import Callable, Mapping
-from typing import Literal
 
 
 OBSERVABILITY_SCHEMA_VERSION = 1
 ObservationSink = Callable[[dict[str, object]], None]
-CompletionDecisionValue = Literal["accepted", "correction", "rejected"]
 
 
 def emit_observation(

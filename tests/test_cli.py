@@ -963,11 +963,8 @@ def test_run_agent_loop_debug_outputs_final_stop() -> None:
 
 def test_run_agent_loop_debug_outputs_safe_structured_progress() -> None:
     progress = AgentProgressSnapshot(
-        task_phase="VALIDATED",
-        effects=("validate",),
-        transition_reason="validation_succeeded",
-        ready_investigation_turn_count=1,
-        post_validation_tool_turn_count=0,
+        stagnation_turns=2,
+        reason="repetition_observed",
     )
     runner = FakeRunner(
         event_batches=[
@@ -991,8 +988,9 @@ def test_run_agent_loop_debug_outputs_safe_structured_progress() -> None:
     assert outputs == [
         "输入 /exit 或 /quit 退出。",
         (
-            "progress> phase=VALIDATED effects=validate reason=validation_succeeded "
-            "ready_investigations=1 post_validation_tools=0"
+            "progress> stagnation_turns=2 same_tool_repeat=0 same_result_repeat=0 "
+            "resource_repeat=0 convergence_guided=False "
+            "reason=repetition_observed"
         ),
         "stop> final_answer",
     ]

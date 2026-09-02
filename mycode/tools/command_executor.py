@@ -85,14 +85,13 @@ def execute_command(
         )
         output_capture_complete = finish_output_threads(process, output_threads)
 
-    output = build_output_metadata(
-        stdout=stdout_capture.snapshot(),
-        stderr=stderr_capture.snapshot(),
-    )
+    stdout = stdout_capture.snapshot()
+    stderr = stderr_capture.snapshot()
+    output_metadata = build_output_metadata(stdout=stdout, stderr=stderr)
 
     metadata = {
         **permission_metadata,
-        **output,
+        **output_metadata,
         "exit_code": returncode,
         "timed_out": timed_out,
         "duration_ms": _elapsed_milliseconds(started_at),
@@ -105,15 +104,24 @@ def execute_command(
         metadata["process_tree_cleanup_error"] = process_tree_cleanup.error
 
     if timed_out:
+        timeout_error = f"Command timed out after {args.timeout_seconds:g} seconds."
+        captured_output = _format_captured_output(
+            stdout=stdout.content,
+            stderr=stderr.content,
+        )
         return ToolResult.failure(
-            error=f"Command timed out after {args.timeout_seconds:g} seconds.",
+            error=(
+                timeout_error
+                if captured_output == ""
+                else f"{timeout_error}\n\n{captured_output}"
+            ),
             metadata=metadata,
         )
 
     content = _format_command_result(
         exit_code=returncode,
-        stdout=output["stdout"],
-        stderr=output["stderr"],
+        stdout=stdout.content,
+        stderr=stderr.content,
     )
 
     if returncode != 0:
@@ -136,9 +144,24 @@ def _format_command_result(
     stderr: object,
 ) -> str:
     parts = [f"Command exited with code {exit_code}."]
-    if stdout:
-        parts.extend(["", "STDOUT", str(stdout)])
-    if stderr:
-        parts.extend(["", "STDERR", str(stderr)])
+    captured_output = _format_captured_output(stdout=stdout, stderr=stderr)
+    if captured_output:
+        parts.extend(["", captured_output])
 
     return "\n".join(parts)
+
+
+def _format_captured_output(*, stdout: object, stderr: object) -> str:
+    sections: list[str] = []
+    final_newline = False
+    for label, value in (("STDOUT", stdout), ("STDERR", stderr)):
+        if not value:
+            continue
+        text = str(value)
+        final_newline = text.endswith(("\n", "\r"))
+        sections.append(f"{label}\n{text.rstrip(chr(10) + chr(13))}")
+
+    formatted = "\n\n".join(sections)
+    if formatted and final_newline:
+        return f"{formatted}\n"
+    return formatted

@@ -35,6 +35,7 @@ from mycode.llm import LLMClient
 from mycode.memory_context import MemoryRecall, MemoryRecallProvider
 from mycode.messages import Message
 from mycode.observability import ObservationSink, emit_observation
+from mycode.skills import ActiveSkillState
 from mycode.reasoning import ReasoningState
 from mycode.run_progress import (
     DEFAULT_MAX_TURNS,
@@ -280,6 +281,8 @@ class AgentRunner:
     last_reasoning_char_count: int = field(default=0, init=False)
     instruction_sources: tuple[str, ...] = ()
     instruction_warnings: tuple[str, ...] = ()
+    skill_warnings: tuple[str, ...] = ()
+    active_skill_state: ActiveSkillState | None = None
     memory_context_selector: MemoryRecallProvider | None = None
     last_memory_recall: MemoryRecall | None = field(default=None, init=False)
     tool_batch_handler: ToolBatchHandler = execute_tool_batch
@@ -323,6 +326,8 @@ class AgentRunner:
         pending_full_group: TurnLocalFullGroup | None = None
         self._pending_artifact_warnings.clear()
         try:
+            if self.active_skill_state is not None:
+                self.active_skill_state.clear()
             self.run_token_usage = None
             _start_tool_batch_run(self.tool_batch_handler)
             continuation_guidance = resume_guidance(self.conversation, user_message)
@@ -617,6 +622,8 @@ class AgentRunner:
         finally:
             pending_full_group = None
             self._pending_artifact_warnings.clear()
+            if self.active_skill_state is not None:
+                self.active_skill_state.clear()
 
     def _stream_finalization_after_max_turns(
         self, *, turn_local_full_group: TurnLocalFullGroup | None = None,
@@ -749,6 +756,14 @@ class AgentRunner:
             memory_stats=None if memory_recall is None else memory_recall.stats,
             guidance=guidance,
             request_messages=request_messages,
+            persistent_system_messages=(
+                ()
+                if self.active_skill_state is None
+                else tuple(
+                    Message(role="system", content=content)
+                    for content in self.active_skill_state.to_system_contexts()
+                )
+            ),
             turn_local_full_group=turn_local_full_group,
             observability_turn=observability_turn,
         )
@@ -954,6 +969,11 @@ class AgentRunner:
     ) -> None:
         compact = context.compact_stats
         retention = context.retention_stats
+        active_skill_names = (
+            []
+            if self.active_skill_state is None
+            else [skill.name for skill in self.active_skill_state.get_active()]
+        )
         emit_observation(
             self.observability_sink,
             "context_snapshot",
@@ -967,6 +987,8 @@ class AgentRunner:
                 "selected_message_count": context.selected_message_count,
                 "source_message_count": context.source_message_count,
                 "over_budget": context.estimate.over_budget,
+                "active_skill_count": len(active_skill_names),
+                "active_skill_names": active_skill_names,
                 "turn_local_full_hit": (
                     0 if retention is None else retention.turn_local_full_groups
                 ),

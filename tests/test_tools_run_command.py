@@ -15,9 +15,21 @@ def test_run_command_schema_describes_arguments(tmp_path: Path) -> None:
     schema = RunCommandTool(workspace=Workspace(tmp_path)).get_schema()
 
     assert schema["name"] == "run_command"
+    assert schema["description"] == (
+        "在 workspace 内执行非交互命令。command 使用结构化 argv，命令直接执行，不经过 Shell 解释。"
+    )
     assert schema["parameters"]["properties"]["command"]["type"] == "array"
     assert schema["parameters"]["properties"]["command"]["items"]["type"] == "string"
+    assert schema["parameters"]["properties"]["command"]["description"] == (
+        "要执行的 argv 字符串数组。第一个元素是可执行程序，后续元素是参数。"
+        "不是 Shell 命令字符串，不支持 &&、||、|、>、< 等 Shell 操作符，也不会展开"
+        " *.py 等通配符。需要切换工作目录时使用 cwd，不要执行 cd。例如："
+        "[\"pytest\", \"tests/test_a.py\", \"-q\"]。"
+    )
     assert schema["parameters"]["properties"]["cwd"]["default"] == "."
+    assert schema["parameters"]["properties"]["cwd"]["description"] == (
+        "命令执行时的工作目录，必须位于 workspace 内。需要切换目录时使用该参数，不要执行 cd。"
+    )
     assert schema["parameters"]["properties"]["timeout_seconds"]["default"] == 30.0
     assert schema["parameters"]["properties"]["max_output_chars"]["default"] == 12000
 
@@ -29,6 +41,7 @@ def test_run_command_args_reject_empty_command_part() -> None:
 
     assert result.ok is False
     assert result.error == "Invalid tool arguments"
+    assert "command 必须是 argv 字符串数组" in str(result.metadata["validation_errors"])
 
 
 def test_run_command_normalizes_json_encoded_argv_before_permission(
@@ -128,6 +141,7 @@ def test_run_command_rejects_unstructured_command_strings(
 
     assert result.ok is False
     assert result.error == "Invalid tool arguments"
+    assert "command 必须是 argv 字符串数组" in str(result.metadata["validation_errors"])
 
 
 def test_run_command_rejects_null_byte_after_json_normalization(
@@ -142,6 +156,7 @@ def test_run_command_rejects_null_byte_after_json_normalization(
 
     assert result.ok is False
     assert result.error == "Invalid tool arguments"
+    assert "command 必须是 argv 字符串数组" in str(result.metadata["validation_errors"])
 
 
 def test_run_command_permission_request_targets_display_command(

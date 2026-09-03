@@ -30,6 +30,7 @@ from mycode.project import ProjectIdentity
 from mycode.prompts import build_agent_system_prompt
 from mycode.runner import AgentRunner
 from mycode.run_outcome import AgentRunOutcome
+from mycode.skills import ActiveSkillState, SkillRegistry
 from mycode.session import ChatSession
 from mycode.session_runtime import SessionStartRequest, start_project_session
 from mycode.session_store import (
@@ -49,7 +50,13 @@ from mycode.subagents.observability import (
 )
 from mycode.subagents.persistence import SessionSubAgentObserver
 from mycode.subagents.runtime import SubAgentRuntime
-from mycode.tools import Workspace, create_default_tool_registry
+from mycode.tools import (
+    LoadSkillTool,
+    ReadSkillResourceTool,
+    RunSkillScriptTool,
+    Workspace,
+    create_default_tool_registry,
+)
 
 
 EXIT_COMMANDS = {"/exit", "/quit"}
@@ -97,6 +104,8 @@ def build_agent_runner(
         MemoryStore(project) if memory_store is None else memory_store
     )
     instruction_bundle = load_instruction_bundle(workspace.root)
+    skill_registry = SkillRegistry.discover(workspace.root)
+    active_skill_state = ActiveSkillState()
     config = load_llm_config() if llm_config is None else llm_config
     client = OpenAICompatibleLLMClient(config=config)
     summary_client = OpenAICompatibleLLMClient(
@@ -133,6 +142,7 @@ def build_agent_runner(
                     instruction_bundle.to_prompt_text(),
                     memory_enabled=True,
                     delegation_enabled=True,
+                    skill_catalog=skill_registry.get_catalog(),
                 ),
             ),
             *history_messages,
@@ -157,6 +167,14 @@ def build_agent_runner(
             observer=subagent_observer,
         )
     )
+    if skill_registry.list_skills():
+        extra_tools.extend(
+            [
+                LoadSkillTool(skill_registry, active_skill_state),
+                ReadSkillResourceTool(skill_registry, active_skill_state),
+                RunSkillScriptTool(workspace, skill_registry, active_skill_state),
+            ]
+        )
     tool_registry = create_default_tool_registry(
         workspace,
         confirmer=confirmer,
@@ -175,6 +193,8 @@ def build_agent_runner(
         instruction_warnings=tuple(
             issue.display for issue in instruction_bundle.issues
         ),
+        skill_warnings=tuple(warning.display for warning in skill_registry.warnings),
+        active_skill_state=active_skill_state,
         memory_context_selector=MemoryContextSelector(
             effective_memory_store,
             policy=memory_recall_policy,
@@ -305,6 +325,8 @@ def run_agent_loop(
         output_func(f"instructions> 已加载 {source}")
     for warning in getattr(runner, "instruction_warnings", ()):
         output_func(f"instructions> 警告：{warning}")
+    for warning in getattr(runner, "skill_warnings", ()):
+        output_func(f"skills> 警告：{warning}")
 
     output_func("输入 /exit 或 /quit 退出。")
 

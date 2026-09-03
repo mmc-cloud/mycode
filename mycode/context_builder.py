@@ -38,14 +38,15 @@ class ContextBuilder:
         memory_stats: MemoryContextStats | None = None,
         guidance: tuple[str, ...] = (),
         request_messages: tuple[Message, ...] = (),
+        persistent_system_messages: tuple[Message, ...] = (),
         turn_local_full_group: TurnLocalFullGroup | None = None,
         observability_turn: int | None = None,
     ) -> ContextBuildResult:
         """Project tool retention, Compact, assemble this request, then budget once.
 
-        Request-only guidance/messages are deliberately invisible to Compact's
-        trigger and persisted boundary. An over-budget result is returned to the
-        caller, which must not send it to the model.
+        Persistent system messages are request-scoped but visible to Compact's
+        trigger. Guidance and request messages remain invisible to Compact. An
+        over-budget result is returned to the caller, which must not send it.
         """
         projection = None
         if self.retention_policy is not None:
@@ -53,6 +54,12 @@ class ContextBuilder:
                 conversation, turn_local_full_group=turn_local_full_group,
             )
             conversation = projection.conversation
+        if any(message.role != "system" for message in persistent_system_messages):
+            raise ValueError("persistent_system_messages must use the system role.")
+        if persistent_system_messages:
+            conversation = Conversation.from_messages(
+                [*conversation.get_messages(), *persistent_system_messages]
+            )
         compact_stats = None
         compact_usage = None
         if self.compactor is not None:

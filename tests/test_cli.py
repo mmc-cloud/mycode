@@ -781,11 +781,20 @@ def test_build_agent_runner_injects_loaded_instructions(
     assert runner.instruction_sources == (
         f"project: {instruction_file.resolve()}",
     )
-    assert [schema["name"] for schema in runner.tool_registry.get_schemas()][-4:] == [
+    schema_names = [
+        schema["name"] for schema in runner.tool_registry.get_schemas()
+    ]
+    memory_start = schema_names.index("list_memories")
+    assert schema_names[memory_start : memory_start + 4] == [
         "list_memories",
         "save_memory",
         "delete_memory",
         "delegate_task",
+    ]
+    assert schema_names[-3:] == [
+        "load_skill",
+        "read_skill_resource",
+        "run_skill_script",
     ]
     assert runner.memory_context_selector is not None
     assert runner.memory_context_selector.policy.max_tokens == 321

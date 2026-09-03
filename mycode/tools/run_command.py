@@ -16,11 +16,24 @@ DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_MAX_OUTPUT_CHARS = 12000
 MAX_TIMEOUT_SECONDS = 300.0
 MAX_OUTPUT_CHARS = 200000
+COMMAND_DESCRIPTION = (
+    "要执行的 argv 字符串数组。第一个元素是可执行程序，后续元素是参数。"
+    "不是 Shell 命令字符串，不支持 &&、||、|、>、< 等 Shell 操作符，也不会展开"
+    " *.py 等通配符。需要切换工作目录时使用 cwd，不要执行 cd。例如："
+    "[\"pytest\", \"tests/test_a.py\", \"-q\"]。"
+)
+COMMAND_VALIDATION_ERROR = (
+    "command 必须是 argv 字符串数组，而不是 Shell 命令字符串。请使用 cwd 代替 cd；"
+    "不支持 &&、||、|、>、< 等 Shell 语法。"
+)
+CWD_DESCRIPTION = (
+    "命令执行时的工作目录，必须位于 workspace 内。需要切换目录时使用该参数，不要执行 cd。"
+)
 
 
 class RunCommandArgs(ToolArgs):
-    command: list[str] = Field(min_length=1)
-    cwd: str = Field(default=".", min_length=1)
+    command: list[str] = Field(min_length=1, description=COMMAND_DESCRIPTION)
+    cwd: str = Field(default=".", min_length=1, description=CWD_DESCRIPTION)
     timeout_seconds: float = Field(
         default=DEFAULT_TIMEOUT_SECONDS,
         gt=0,
@@ -38,33 +51,37 @@ class RunCommandArgs(ToolArgs):
         """Accept one common Provider mistake without introducing shell parsing."""
 
         if not isinstance(value, str):
+            if not isinstance(value, (list, tuple)) or not value or any(
+                not isinstance(part, str) for part in value
+            ):
+                raise ValueError(COMMAND_VALIDATION_ERROR)
             return value
         try:
             decoded = json.loads(value)
         except json.JSONDecodeError as error:
-            raise ValueError(
-                "Command must be an array of strings or a JSON-encoded array."
-            ) from error
-        if not isinstance(decoded, list) or any(
+            raise ValueError(COMMAND_VALIDATION_ERROR) from error
+        if not isinstance(decoded, list) or not decoded or any(
             not isinstance(part, str) for part in decoded
         ):
-            raise ValueError("JSON-encoded command must be an array of strings.")
+            raise ValueError(COMMAND_VALIDATION_ERROR)
         return decoded
 
     @field_validator("command")
     @classmethod
     def command_parts_must_not_be_empty(cls, value: list[str]) -> list[str]:
         if any(part == "" for part in value):
-            raise ValueError("Command parts must not be empty.")
+            raise ValueError(COMMAND_VALIDATION_ERROR)
         if any("\x00" in part for part in value):
-            raise ValueError("Command parts must not contain null bytes.")
+            raise ValueError(COMMAND_VALIDATION_ERROR)
 
         return value
 
 
 class RunCommandTool(BaseTool[RunCommandArgs]):
     name = "run_command"
-    description = "Run a non-interactive command in the workspace."
+    description = (
+        "在 workspace 内执行非交互命令。command 使用结构化 argv，命令直接执行，不经过 Shell 解释。"
+    )
     args_model = RunCommandArgs
     capability = "command"
     risk = "high"

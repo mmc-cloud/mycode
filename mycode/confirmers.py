@@ -36,6 +36,11 @@ class TerminalConfirmer:
         self._output_metadata("memory_key", request)
         self._output_metadata("memory_content", request)
         self._output_metadata("memory_path", request)
+        self._output_metadata("skill_name", request)
+        self._output_metadata("skill_source", request)
+        self._output_metadata("script", request)
+        self._output_metadata("arguments", request)
+        self._output_metadata("cwd", request)
         self.output_func(f"reason> {permission_decision.reason}")
         if request.prompt:
             self.output_func(

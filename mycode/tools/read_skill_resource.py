@@ -1,7 +1,7 @@
 from pydantic import Field, field_validator
 
 from mycode.skills import ActiveSkillState, SkillPathError, SkillRegistry
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.bounds import clamp_positive_int_upper_bound
 
 
@@ -28,7 +28,7 @@ class ReadSkillResourceArgs(ToolArgs):
         )
 
 
-class ReadSkillResourceTool(BaseTool[ReadSkillResourceArgs]):
+class ReadSkillResourceTool(PydanticTool[ReadSkillResourceArgs]):
     name = "read_skill_resource"
     description = "从已激活的 Skill 中按边界读取 UTF-8 文本资源。"
     args_model = ReadSkillResourceArgs

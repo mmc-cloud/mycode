@@ -10,7 +10,13 @@ def test_edit_file_schema_describes_arguments(tmp_path: Path) -> None:
     assert schema["name"] == "edit_file"
     assert schema["parameters"]["properties"]["path"]["type"] == "string"
     assert schema["parameters"]["properties"]["old_text"]["type"] == "string"
-    assert schema["parameters"]["properties"]["new_text"] == {"type": "string"}
+    assert schema["parameters"]["properties"]["old_text"]["description"] == (
+        "要替换的原始文本，必须在文件中唯一匹配一次。"
+    )
+    assert schema["parameters"]["properties"]["new_text"]["type"] == "string"
+    assert schema["parameters"]["properties"]["new_text"]["description"] == (
+        "用于替换 old_text 的新文本；可以为空字符串以删除匹配内容。"
+    )
 
 
 def test_edit_file_args_accept_empty_new_text() -> None:

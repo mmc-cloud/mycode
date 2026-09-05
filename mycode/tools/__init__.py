@@ -1,5 +1,8 @@
 from mycode.tools.base import (
     BaseTool,
+    PydanticTool,
+    SyncTool,
+    ToolArgumentValidationError,
     ToolArgs,
     ToolPermissionProfileError,
     ToolResult,
@@ -33,6 +36,9 @@ from mycode.tools.write_file import WriteFileArgs, WriteFileTool
 
 __all__ = [
     "BaseTool",
+    "PydanticTool",
+    "SyncTool",
+    "ToolArgumentValidationError",
     "DuplicateToolError",
     "EditFileArgs",
     "EditFileTool",

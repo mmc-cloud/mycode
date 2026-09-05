@@ -198,9 +198,18 @@ def test_read_file_schema_describes_arguments() -> None:
     schema = ReadFileTool(workspace=Workspace(Path.cwd())).get_schema()
 
     assert schema["name"] == "read_file"
-    assert schema["parameters"]["properties"]["path"] == {"type": "string"}
+    assert schema["parameters"]["properties"]["path"] == {
+        "description": "要读取的 workspace 内文件路径。",
+        "type": "string",
+    }
     assert schema["parameters"]["properties"]["start_line"]["default"] == 1
+    assert schema["parameters"]["properties"]["start_line"]["description"] == (
+        "从第几行开始读取，行号从 1 开始。"
+    )
     assert schema["parameters"]["properties"]["max_lines"]["default"] == 200
+    assert schema["parameters"]["properties"]["max_lines"]["description"] == (
+        "本次最多读取的行数。"
+    )
 
 
 def test_read_file_args_defaults() -> None:

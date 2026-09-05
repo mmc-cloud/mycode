@@ -9,7 +9,7 @@ from mycode.memory import (
     validate_memory_key,
 )
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.permission_metadata import with_permission_metadata
 
 
@@ -47,7 +47,7 @@ class DeleteMemoryArgs(ToolArgs):
         return validate_memory_key(value)
 
 
-class ListMemoriesTool(BaseTool[ListMemoriesArgs]):
+class ListMemoriesTool(PydanticTool[ListMemoriesArgs]):
     name = "list_memories"
     description = "List safe long-term memories for the current user or project."
     args_model = ListMemoriesArgs
@@ -86,7 +86,7 @@ class ListMemoriesTool(BaseTool[ListMemoriesArgs]):
         )
 
 
-class SaveMemoryTool(BaseTool[SaveMemoryArgs]):
+class SaveMemoryTool(PydanticTool[SaveMemoryArgs]):
     name = "save_memory"
     description = (
         "Create or correct one user-level or project-level long-term memory. "
@@ -177,7 +177,7 @@ class SaveMemoryTool(BaseTool[SaveMemoryArgs]):
         )
 
 
-class DeleteMemoryTool(BaseTool[DeleteMemoryArgs]):
+class DeleteMemoryTool(PydanticTool[DeleteMemoryArgs]):
     name = "delete_memory"
     description = "Delete one user-level or project-level long-term memory by key."
     args_model = DeleteMemoryArgs

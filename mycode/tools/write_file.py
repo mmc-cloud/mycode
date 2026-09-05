@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import Field
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.file_mutation import (
     display_path,
     failure_metadata,
@@ -15,11 +15,18 @@ from mycode.tools.workspace import Workspace
 
 
 class WriteFileArgs(ToolArgs):
-    path: str = Field(min_length=1)
-    content: str
+    path: str = Field(
+        min_length=1,
+        description="目标文件路径，必须位于 workspace 内，父目录需要已存在。",
+    )
+    content: str = Field(
+        description=(
+            "要写入文件的完整 UTF-8 文本内容；目标文件已存在时会覆盖原内容。"
+        ),
+    )
 
 
-class WriteFileTool(BaseTool[WriteFileArgs]):
+class WriteFileTool(PydanticTool[WriteFileArgs]):
     name = "write_file"
     description = "Write complete UTF-8 text content to a file."
     args_model = WriteFileArgs

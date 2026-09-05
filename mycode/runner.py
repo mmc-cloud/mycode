@@ -2,11 +2,14 @@ from dataclasses import dataclass, field, replace
 from collections.abc import Callable, Generator, Iterator, Sequence
 import asyncio
 import json
+import random
+from time import sleep
 
 from pydantic import ValidationError
 
 from mycode.agent import (
     AgentEvent,
+    AgentModelRetry,
     AgentModelResponse,
     AgentProgressSnapshot,
     AgentToolCall,
@@ -21,7 +24,7 @@ from mycode.artifacts import (
 from mycode.context_compact import ConversationCompactor
 from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
 from mycode.context_builder import ContextBuilder
-from mycode.error_handling import format_model_error
+from mycode.error_handling import classify_model_error, format_model_error
 from mycode.context_budget import (
     ContextBudget,
     ModelContext,
@@ -51,12 +54,15 @@ from mycode.run_progress import (
     normalize_run_checkpoint,
     resume_guidance,
 )
-from mycode.tools import ToolRegistry, ToolResult, Workspace
+from mycode.tools import ToolArgumentValidationError, ToolRegistry, ToolResult, Workspace
 
 
 DEFAULT_REPEATED_TOOL_CALL_LIMIT = 3
 DEFAULT_MAX_TOOL_CALLS_PER_RESPONSE = 32
 DEFAULT_MAX_CONCURRENT_SAFE_TOOLS = 4
+DEFAULT_MODEL_MAX_RETRIES = 2
+MODEL_RETRY_DELAY_MIN_SECONDS = 3.0
+MODEL_RETRY_DELAY_MAX_SECONDS = 5.0
 EMPTY_RESPONSE_RETRY_PROMPT = (
     "Your previous response contained neither tool calls nor a final answer. "
     "Continue the task or provide a final response."
@@ -135,7 +141,7 @@ async def execute_tool_batch_async(
         )
         concurrent_calls.clear()
         executions.append(
-            _execute_serial_call(
+            await _execute_serial_call(
                 registry,
                 tool_call,
                 serial_executor=serial_executor,
@@ -243,7 +249,7 @@ def _tool_call_limit_failure(
     )
 
 
-def _execute_serial_call(
+async def _execute_serial_call(
     registry: ToolRegistry,
     tool_call: AgentToolCall,
     *,
@@ -251,7 +257,11 @@ def _execute_serial_call(
 ) -> ToolCallExecution:
     try:
         result = (
-            registry.run_tool(tool_call.name, tool_call.arguments)
+            await registry.run_tool_async(
+                tool_call.name,
+                tool_call.arguments,
+                permission_lock=asyncio.Lock(),
+            )
             if serial_executor is None
             else serial_executor(tool_call)
         )
@@ -396,10 +406,6 @@ class AgentRunner:
                 turn_local_full_group = pending_full_group
                 pending_full_group = None
                 for response_attempt in range(2):
-                    content_parts: list[str] = []
-                    reasoning_parts: list[str] = []
-                    reasoning_state: ReasoningState = "absent"
-                    tool_calls: list[AgentToolCall] = []
                     request_guidance = guidance
                     if response_attempt == 1:
                         request_guidance = (
@@ -447,96 +453,154 @@ class AgentRunner:
                         )
                         return
 
-                    yield AgentEvent(type="model_start")
+                    for model_attempt in range(DEFAULT_MODEL_MAX_RETRIES + 1):
+                        content_parts: list[str] = []
+                        reasoning_parts: list[str] = []
+                        reasoning_state: ReasoningState = "absent"
+                        tool_calls: list[AgentToolCall] = []
+                        observable_tool_call_events: list[AgentEvent] = []
+                        yield AgentEvent(type="model_start")
 
-                    try:
-                        for event in self.llm_client.stream_with_tools(
-                            Conversation.from_messages(
-                                list(model_context.messages)
-                            ),
-                            tools,
-                        ):
-                            if event.type == "reasoning_delta":
-                                reasoning_parts.append(event.reasoning_content)
-                                reasoning_state = "present_nonempty"
-                                continue
-
-                            if event.type == "reasoning_state":
-                                reasoning_state = event.reasoning_state
-                                continue
-
-                            if event.type == "text_delta":
-                                content_parts.append(event.content)
-                                yield event
-                                continue
-
-                            if (
-                                event.type == "tool_call"
-                                and event.tool_call is not None
+                        try:
+                            for event in self.llm_client.stream_with_tools(
+                                Conversation.from_messages(
+                                    list(model_context.messages)
+                                ),
+                                tools,
                             ):
-                                tool_calls.append(event.tool_call)
-                                observable_event = replace(
-                                    event,
-                                    tool_call=_observable_tool_call(
-                                        self.tool_registry,
-                                        event.tool_call,
-                                    ),
-                                )
-                                yield observable_event
-                                continue
+                                if event.type == "reasoning_delta":
+                                    reasoning_parts.append(event.reasoning_content)
+                                    reasoning_state = "present_nonempty"
+                                    continue
 
-                            if event.type == "error":
-                                self._observe_token_usage(model_context)
-                                self._emit_model_response(
+                                if event.type == "reasoning_state":
+                                    reasoning_state = event.reasoning_state
+                                    continue
+
+                                if event.type == "text_delta":
+                                    content_parts.append(event.content)
+                                    yield event
+                                    continue
+
+                                if (
+                                    event.type == "tool_call"
+                                    and event.tool_call is not None
+                                ):
+                                    tool_calls.append(event.tool_call)
+                                    observable_tool_call_events.append(
+                                        replace(
+                                            event,
+                                            tool_call=_observable_tool_call(
+                                                self.tool_registry,
+                                                event.tool_call,
+                                            ),
+                                        )
+                                    )
+                                    continue
+
+                                if event.type == "error":
+                                    self._observe_token_usage(model_context)
+                                    self._emit_model_response(
+                                        turn=turn_index + 1,
+                                        call_kind="agent_tools",
+                                        content="".join(content_parts),
+                                        tool_calls=tool_calls,
+                                    )
+                                    yield event
+                                    yield AgentEvent(
+                                        type="stop",
+                                        stop_reason="model_error",
+                                    )
+                                    return
+                        except Exception as error:
+                            self._emit_model_response(
+                                turn=turn_index + 1,
+                                call_kind="agent_tools",
+                                content="".join(content_parts),
+                                tool_calls=tool_calls,
+                                fallback_error_type=type(error).__name__,
+                            )
+                            classified = classify_model_error(error)
+                            if (
+                                classified.retryable is True
+                                and model_attempt < DEFAULT_MODEL_MAX_RETRIES
+                            ):
+                                retry_attempt = model_attempt + 1
+                                delay_seconds = random.uniform(
+                                    MODEL_RETRY_DELAY_MIN_SECONDS,
+                                    MODEL_RETRY_DELAY_MAX_SECONDS,
+                                )
+                                retry = self._model_retry(
                                     turn=turn_index + 1,
                                     call_kind="agent_tools",
-                                    content="".join(content_parts),
-                                    tool_calls=tool_calls,
+                                    attempt=retry_attempt,
+                                    error=error,
+                                    error_code=classified.code,
+                                    delay_seconds=delay_seconds,
+                                    fallback_partial_output_chars=len(
+                                        "".join(content_parts)
+                                    ),
                                 )
-                                yield event
                                 yield AgentEvent(
-                                    type="stop",
-                                    stop_reason="model_error",
+                                    type="model_retry",
+                                    model_retry=retry,
                                 )
-                                return
-                    except Exception as error:
+                                sleep(delay_seconds)
+                                continue
+                            if (
+                                classified.retryable is True
+                                and model_attempt == DEFAULT_MODEL_MAX_RETRIES
+                            ):
+                                self._emit_model_retry_outcome(
+                                    turn=turn_index + 1,
+                                    call_kind="agent_tools",
+                                    outcome="exhausted",
+                                    retries=DEFAULT_MODEL_MAX_RETRIES,
+                                    final_error_type=type(error).__name__,
+                                )
+                            yield AgentEvent(
+                                type="error",
+                                error=format_model_error(
+                                    error,
+                                    operation="模型流式请求失败",
+                                ),
+                            )
+                            yield AgentEvent(
+                                type="stop",
+                                stop_reason="model_error",
+                            )
+                            return
+
+                        self._observe_token_usage(model_context)
+                        content = "".join(content_parts)
+                        terminal_empty_response = (
+                            not tool_calls
+                            and not content.strip()
+                            and response_attempt == 1
+                        )
                         self._emit_model_response(
                             turn=turn_index + 1,
                             call_kind="agent_tools",
-                            content="".join(content_parts),
+                            content=content,
                             tool_calls=tool_calls,
-                            fallback_error_type=type(error).__name__,
-                        )
-                        yield AgentEvent(
-                            type="error",
-                            error=format_model_error(
-                                error,
-                                operation="模型流式请求失败",
+                            error_type_override=(
+                                "empty_response"
+                                if terminal_empty_response
+                                else None
                             ),
                         )
-                        yield AgentEvent(
-                            type="stop",
-                            stop_reason="model_error",
-                        )
-                        return
+                        if model_attempt > 0:
+                            self._emit_model_retry_outcome(
+                                turn=turn_index + 1,
+                                call_kind="agent_tools",
+                                outcome="recovered",
+                                retries=model_attempt,
+                                recovered_on_retry=model_attempt,
+                            )
+                        yield from observable_tool_call_events
+                        break
 
-                    self._observe_token_usage(model_context)
-                    content = "".join(content_parts)
                     empty_response = not tool_calls and not content.strip()
-                    terminal_empty_response = (
-                        empty_response and response_attempt == 1
-                    )
-                    self._emit_model_response(
-                        turn=turn_index + 1,
-                        call_kind="agent_tools",
-                        content=content,
-                        tool_calls=tool_calls,
-                        error_type_override=(
-                            "empty_response"
-                            if terminal_empty_response
-                            else None
-                        ),
-                    )
                     if not empty_response:
                         break
                     if response_attempt == 0:
@@ -645,51 +709,95 @@ class AgentRunner:
             )
             return
 
-        content_parts: list[str] = []
         self._emit_context_snapshot(
             model_context,
             turn=self.max_turns + 1,
             call_kind="max_turns_finalization",
         )
-        yield AgentEvent(type="model_start")
-        try:
-            for chunk in self.llm_client.stream_complete(finalization):
-                if chunk == "":
+        for model_attempt in range(DEFAULT_MODEL_MAX_RETRIES + 1):
+            content_parts: list[str] = []
+            yield AgentEvent(type="model_start")
+            try:
+                for chunk in self.llm_client.stream_complete(finalization):
+                    if chunk == "":
+                        continue
+                    content_parts.append(chunk)
+                    yield AgentEvent(type="text_delta", content=chunk)
+            except Exception as error:
+                self._emit_model_response(
+                    turn=self.max_turns + 1,
+                    call_kind="max_turns_finalization",
+                    content="".join(content_parts),
+                    tool_calls=(),
+                    fallback_error_type=type(error).__name__,
+                )
+                classified = classify_model_error(error)
+                if (
+                    classified.retryable is True
+                    and model_attempt < DEFAULT_MODEL_MAX_RETRIES
+                ):
+                    retry_attempt = model_attempt + 1
+                    delay_seconds = random.uniform(
+                        MODEL_RETRY_DELAY_MIN_SECONDS,
+                        MODEL_RETRY_DELAY_MAX_SECONDS,
+                    )
+                    retry = self._model_retry(
+                        turn=self.max_turns + 1,
+                        call_kind="max_turns_finalization",
+                        attempt=retry_attempt,
+                        error=error,
+                        error_code=classified.code,
+                        delay_seconds=delay_seconds,
+                        fallback_partial_output_chars=len("".join(content_parts)),
+                    )
+                    yield AgentEvent(type="model_retry", model_retry=retry)
+                    sleep(delay_seconds)
                     continue
-                content_parts.append(chunk)
-                yield AgentEvent(type="text_delta", content=chunk)
-        except Exception as error:
+                if (
+                    classified.retryable is True
+                    and model_attempt == DEFAULT_MODEL_MAX_RETRIES
+                ):
+                    self._emit_model_retry_outcome(
+                        turn=self.max_turns + 1,
+                        call_kind="max_turns_finalization",
+                        outcome="exhausted",
+                        retries=DEFAULT_MODEL_MAX_RETRIES,
+                        final_error_type=type(error).__name__,
+                    )
+                yield AgentEvent(
+                    type="error",
+                    error=format_model_error(
+                        error,
+                        operation="最终整理请求失败",
+                    ),
+                )
+                yield AgentEvent(
+                    type="stop",
+                    content=(
+                        f"本轮已达到 {self.max_turns} 轮上限，且未能生成"
+                        "阶段性结果。"
+                    ),
+                    stop_reason="max_turns",
+                )
+                return
+
+            self._observe_token_usage(model_context)
             self._emit_model_response(
                 turn=self.max_turns + 1,
                 call_kind="max_turns_finalization",
                 content="".join(content_parts),
                 tool_calls=(),
-                fallback_error_type=type(error).__name__,
             )
-            yield AgentEvent(
-                type="error",
-                error=format_model_error(
-                    error,
-                    operation="最终整理请求失败",
-                ),
-            )
-            yield AgentEvent(
-                type="stop",
-                content=(
-                    f"本轮已达到 {self.max_turns} 轮上限，且未能生成"
-                    "阶段性结果。"
-                ),
-                stop_reason="max_turns",
-            )
-            return
+            if model_attempt > 0:
+                self._emit_model_retry_outcome(
+                    turn=self.max_turns + 1,
+                    call_kind="max_turns_finalization",
+                    outcome="recovered",
+                    retries=model_attempt,
+                    recovered_on_retry=model_attempt,
+                )
+            break
 
-        self._observe_token_usage(model_context)
-        self._emit_model_response(
-            turn=self.max_turns + 1,
-            call_kind="max_turns_finalization",
-            content="".join(content_parts),
-            tool_calls=(),
-        )
         content = "".join(content_parts).strip()
         if content == "":
             yield AgentEvent(
@@ -898,6 +1006,83 @@ class AgentRunner:
         )
         self._accumulate_run_token_usage(usage)
         self.token_estimator.observe(context.estimate, usage)
+
+    def _model_retry(
+        self,
+        *,
+        turn: int,
+        call_kind: str,
+        attempt: int,
+        error: Exception,
+        error_code: str,
+        delay_seconds: float,
+        fallback_partial_output_chars: int,
+    ) -> AgentModelRetry:
+        model_response = getattr(self.llm_client, "last_model_response", None)
+        stream_chunk_count = None
+        partial_output_chars = fallback_partial_output_chars
+        if isinstance(model_response, dict):
+            stream_chunk_count = model_response.get("stream_chunk_count")
+            observed_chars = model_response.get("content_chars")
+            if isinstance(observed_chars, int):
+                partial_output_chars = observed_chars
+        retry = AgentModelRetry(
+            attempt=attempt,
+            max_retries=DEFAULT_MODEL_MAX_RETRIES,
+            delay_seconds=delay_seconds,
+            error_type=type(error).__name__,
+            error_code=error_code,
+            retryable=True,
+            call_kind=call_kind,
+            stream_started=(
+                isinstance(stream_chunk_count, int) and stream_chunk_count > 0
+            ),
+            partial_output_chars=partial_output_chars,
+        )
+        emit_observation(
+            self.observability_sink,
+            "model_retry",
+            {
+                "run_scope": self.observability_scope,
+                "run_id": self.observability_run_id,
+                "turn": turn,
+                "call_kind": retry.call_kind,
+                "attempt": retry.attempt,
+                "max_retries": retry.max_retries,
+                "error_type": retry.error_type,
+                "error_code": retry.error_code,
+                "retryable": retry.retryable,
+                "delay_seconds": retry.delay_seconds,
+                "stream_started": retry.stream_started,
+                "partial_output_chars": retry.partial_output_chars,
+            },
+        )
+        return retry
+
+    def _emit_model_retry_outcome(
+        self,
+        *,
+        turn: int,
+        call_kind: str,
+        outcome: str,
+        retries: int,
+        recovered_on_retry: int | None = None,
+        final_error_type: str | None = None,
+    ) -> None:
+        emit_observation(
+            self.observability_sink,
+            "model_retry_outcome",
+            {
+                "run_scope": self.observability_scope,
+                "run_id": self.observability_run_id,
+                "turn": turn,
+                "call_kind": call_kind,
+                "outcome": outcome,
+                "retries": retries,
+                "recovered_on_retry": recovered_on_retry,
+                "final_error_type": final_error_type,
+            },
+        )
 
     def _emit_model_response(
         self,
@@ -1135,7 +1320,7 @@ def _observable_tool_call(
         return tool_call
     try:
         args = tool.parse_arguments(tool_call.arguments)
-    except ValidationError:
+    except (ValidationError, ToolArgumentValidationError):
         return tool_call
     arguments = dict(tool_call.arguments)
     arguments[field_name] = args.model_dump()[field_name]

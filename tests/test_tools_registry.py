@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from mycode.permissions import (
@@ -10,6 +12,7 @@ from mycode.permissions import (
 from mycode.tools import (
     BaseTool,
     DuplicateToolError,
+    PydanticTool,
     ToolArgs,
     ToolNotFoundError,
     ToolRegistry,
@@ -125,6 +128,50 @@ def test_run_tool_returns_failure_for_missing_tool() -> None:
     assert result == ToolResult.failure(
         error="Tool not found: missing",
         metadata={"tool_name": "missing"},
+    )
+
+
+def test_run_tool_rejects_async_only_tool_before_permission() -> None:
+    checker = RecordingPermissionChecker(PermissionDecision.allow())
+    registry = ToolRegistry.from_tools(
+        [AsyncOnlyTool()], permission_checker=checker
+    )
+
+    result = registry.run_tool("async_only", {"text": "hello"})
+
+    assert result == ToolResult.failure(
+        error="Tool requires async execution path",
+        metadata={
+            "tool_name": "async_only",
+            "reason": "async_execution_required",
+        },
+    )
+    assert checker.requests == []
+
+
+def test_run_tool_async_executes_sync_and_native_async_tools() -> None:
+    registry = ToolRegistry.from_tools(
+        [FakeTool(name="sync"), AsyncOnlyTool()],
+        permission_checker=RecordingPermissionChecker(
+            PermissionDecision.allow()
+        ),
+    )
+
+    async def run_tools() -> tuple[ToolResult, ToolResult]:
+        permission_lock = asyncio.Lock()
+        sync_result = await registry.run_tool_async(
+            "sync", {"text": "one"}, permission_lock=permission_lock
+        )
+        async_result = await registry.run_tool_async(
+            "async_only",
+            {"text": "two"},
+            permission_lock=permission_lock,
+        )
+        return sync_result, async_result
+
+    assert asyncio.run(run_tools()) == (
+        ToolResult.success("one"),
+        ToolResult.success("two"),
     )
 
 
@@ -262,7 +309,35 @@ class FakeArgs(ToolArgs):
     text: str
 
 
-class FakeTool(BaseTool[FakeArgs]):
+class AsyncOnlyTool(BaseTool[dict[str, object]]):
+    name = "async_only"
+    description = "Native async tool for registry tests."
+    capability = "read"
+    risk = "low"
+
+    @property
+    def input_schema(self) -> dict[str, object]:
+        return {"type": "object"}
+
+    def parse_arguments(
+        self, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        return dict(arguments)
+
+    def arguments_to_dict(
+        self, args: dict[str, object]
+    ) -> dict[str, object]:
+        return dict(args)
+
+    async def run_authorized_async(
+        self,
+        args: dict[str, object],
+        decision: PermissionDecision,
+    ) -> ToolResult:
+        return ToolResult.success(str(args["text"]))
+
+
+class FakeTool(PydanticTool[FakeArgs]):
     args_model = FakeArgs
     capability = "read"
     risk = "low"

@@ -3,7 +3,7 @@ from typing import Generic, TypeVar
 
 from mycode.permissions import ToolRisk
 from mycode.subagents.contracts import BoundedResultArgs, SubAgentRole
-from mycode.tools.base import BaseTool, ToolResult
+from mycode.tools.base import PydanticTool, ToolResult
 
 
 DEFAULT_MAX_SUBMITTED_RESULT_CHARS = 24000
@@ -11,7 +11,7 @@ DEFAULT_MAX_SUBMITTED_RESULT_CHARS = 24000
 ResultArgsT = TypeVar("ResultArgsT", bound=BoundedResultArgs)
 
 
-class SubmitResultTool(BaseTool[ResultArgsT], Generic[ResultArgsT]):
+class SubmitResultTool(PydanticTool[ResultArgsT], Generic[ResultArgsT]):
     name = "submit_result"
     description = "Submit the role-specific structured result and finish the SubAgent run."
     capability = "control"

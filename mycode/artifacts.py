@@ -20,7 +20,7 @@ from mycode.tool_result_format import (
 from mycode.conversation import Conversation
 from mycode.messages import Message
 from mycode.session_lock import SessionLockTimeoutError
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.bounds import clamp_positive_int_upper_bound
 
 
@@ -252,7 +252,7 @@ class ReadArtifactArgs(ToolArgs):
         )
 
 
-class ReadArtifactTool(BaseTool[ReadArtifactArgs]):
+class ReadArtifactTool(PydanticTool[ReadArtifactArgs]):
     name = "read_artifact"
     description = (
         "Read a bounded text slice from a tool-result artifact referenced in "

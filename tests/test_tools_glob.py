@@ -186,7 +186,11 @@ def test_glob_schema_describes_arguments() -> None:
     schema = GlobTool(workspace=Workspace(Path.cwd())).get_schema()
 
     assert schema["name"] == "glob"
+    assert schema["description"] == "按 glob pattern 查找 workspace 内文件。"
     assert schema["parameters"]["properties"]["pattern"]["type"] == "string"
+    assert schema["parameters"]["properties"]["pattern"]["description"] == (
+        "用于匹配 workspace 内文件路径的相对 glob pattern，例如 **/*.py。"
+    )
     assert schema["parameters"]["properties"]["max_results"]["default"] == 100
 
 

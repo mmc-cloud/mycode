@@ -71,6 +71,12 @@ def classify_model_error(error: BaseException) -> UserFacingModelError:
             message="未找到模型服务端点或指定模型，请检查 API 地址和模型名称。",
             retryable=False,
         )
+    if isinstance(error, APIStatusError) and error.status_code == 408:
+        return UserFacingModelError(
+            code="timeout",
+            message="模型服务请求超时（HTTP 408），请稍后重试。",
+            retryable=True,
+        )
     if isinstance(error, APIStatusError) and error.status_code >= 500:
         return UserFacingModelError(
             code="server_error",

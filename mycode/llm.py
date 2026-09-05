@@ -4,6 +4,7 @@ import json
 from time import perf_counter
 from typing import Any, Literal, Protocol
 
+import httpx
 from openai import OpenAI
 
 from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
@@ -12,6 +13,15 @@ from mycode.context_budget import TokenUsage
 from mycode.conversation import Conversation
 from mycode.messages import Message
 from mycode.reasoning import ReasoningState
+
+
+SDK_MAX_RETRIES = 2
+SDK_TIMEOUT = httpx.Timeout(
+    connect=5.0,
+    read=120.0,
+    write=30.0,
+    pool=10.0,
+)
 
 
 class LLMClient(Protocol):
@@ -67,6 +77,8 @@ class OpenAICompatibleLLMClient:
             self._client = OpenAI(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
+                max_retries=SDK_MAX_RETRIES,
+                timeout=SDK_TIMEOUT,
             )
 
     def complete(self, conversation: Conversation) -> Message:

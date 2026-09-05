@@ -23,6 +23,13 @@ from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
+from mycode.mcp import (
+    MCPConfig,
+    MCPConfigError,
+    MCPManager,
+    apply_project_mcp_trust,
+    load_mcp_config_layers,
+)
 from mycode.observability import ObservationSink
 from mycode.llm import OpenAICompatibleLLMClient
 from mycode.permissions import Confirmer
@@ -106,7 +113,11 @@ def build_agent_runner(
     instruction_bundle = load_instruction_bundle(workspace.root)
     skill_registry = SkillRegistry.discover(workspace.root)
     active_skill_state = ActiveSkillState()
-    config = load_llm_config() if llm_config is None else llm_config
+    config = (
+        load_llm_config(workspace_root=workspace.root)
+        if llm_config is None
+        else llm_config
+    )
     client = OpenAICompatibleLLMClient(config=config)
     summary_client = OpenAICompatibleLLMClient(
         config=config,
@@ -365,10 +376,16 @@ def run_agent_command(
     session_request: SessionStartRequest | None = None,
     session_store: SessionStore | None = None,
     llm_config: LLMConfig | None = None,
+    mcp_config: MCPConfig | None = None,
+    observability_sink: ObservationSink | None = None,
 ) -> None:
-    config = load_llm_config() if llm_config is None else llm_config
     workspace = Workspace(Path.cwd() if workspace_path is None else workspace_path)
     project = ProjectIdentity.from_workspace(workspace.root)
+    config = (
+        load_llm_config(workspace_root=workspace.root)
+        if llm_config is None
+        else llm_config
+    )
     try:
         store = SessionStore() if session_store is None else session_store
         active_session = start_project_session(
@@ -387,6 +404,7 @@ def run_agent_command(
     if active_session is None:
         return
 
+    mcp_manager = MCPManager(MCPConfig(), observability_sink=observability_sink)
     try:
         active_session.start_heartbeat()
         confirmer = TerminalConfirmer(
@@ -411,6 +429,38 @@ def run_agent_command(
                 "session> 警告：无效的 Compact 状态已重置；"
                 "已恢复完整历史并进入 Compact 冷却期"
             )
+        try:
+            if mcp_config is None:
+                loaded_mcp_config = load_mcp_config_layers(
+                    workspace_root=workspace.root
+                )
+                effective_mcp_config = apply_project_mcp_trust(
+                    loaded_mcp_config,
+                    project,
+                    input_func=input_func,
+                    output_func=output_func,
+                )
+            else:
+                effective_mcp_config = mcp_config
+        except MCPConfigError as error:
+            output_func("MCP servers:")
+            output_func(f"✗ config      {error}")
+            effective_mcp_config = MCPConfig()
+        mcp_manager = MCPManager(
+            effective_mcp_config,
+            observability_sink=observability_sink,
+        )
+        mcp_manager.start()
+        if mcp_manager.statuses:
+            output_func("MCP servers:")
+            for status in mcp_manager.statuses:
+                if status.status == "connected":
+                    output_func(f"✓ {status.alias:<12} {status.tool_count} tools")
+                else:
+                    output_func(
+                        f"✗ {status.alias:<12} "
+                        f"{status.error_summary or status.error_type or 'unavailable'}"
+                    )
         runner = build_agent_runner(
             workspace_path=workspace.root,
             confirmer=confirmer,
@@ -423,6 +473,8 @@ def run_agent_command(
             subagent_observer=subagent_observer,
             llm_config=config,
         )
+        for tool in mcp_manager.tools:
+            runner.tool_registry.register(tool)
         run_agent_loop(
             runner=runner,
             input_func=input_func,
@@ -448,6 +500,8 @@ def run_agent_command(
         )
     else:
         active_session.close()
+    finally:
+        mcp_manager.close()
 
 
 def _run_agent_turn(

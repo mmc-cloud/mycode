@@ -6,7 +6,7 @@ from pydantic import Field, field_validator
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
 from mycode.skills import ActiveSkillState, SkillPathError, SkillRegistry
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.command_executor import CommandExecutionArgs, execute_command
 from mycode.tools.permission_metadata import with_permission_metadata
 from mycode.tools.run_command import (
@@ -39,7 +39,7 @@ class RunSkillScriptArgs(ToolArgs):
         return value
 
 
-class RunSkillScriptTool(BaseTool[RunSkillScriptArgs]):
+class RunSkillScriptTool(PydanticTool[RunSkillScriptArgs]):
     name = "run_skill_script"
     description = "在当前 workspace 中运行已激活 Skill 的受支持脚本。"
     args_model = RunSkillScriptArgs

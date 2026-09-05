@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import Field, field_validator
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.bounds import clamp_positive_int_upper_bound
 from mycode.tools.ignore import is_sensitive_path
 from mycode.tools.path_permissions import PathPermissionPolicy
@@ -21,13 +21,18 @@ MAX_LINES_LIMIT = 1000
 
 
 class ReadFileArgs(ToolArgs):
-    path: str
-    start_line: int = Field(default=1, ge=1)
+    path: str = Field(description="要读取的 workspace 内文件路径。")
+    start_line: int = Field(
+        default=1,
+        ge=1,
+        description="从第几行开始读取，行号从 1 开始。",
+    )
     max_lines: int = Field(
         default=DEFAULT_MAX_LINES,
         ge=1,
         le=MAX_LINES_LIMIT,
         strict=True,
+        description="本次最多读取的行数。",
     )
 
     @field_validator("max_lines", mode="before")
@@ -39,7 +44,7 @@ class ReadFileArgs(ToolArgs):
         )
 
 
-class ReadFileTool(BaseTool[ReadFileArgs]):
+class ReadFileTool(PydanticTool[ReadFileArgs]):
     name = "read_file"
     description = "Read a text file inside the workspace with line numbers."
     args_model = ReadFileArgs

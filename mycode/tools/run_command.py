@@ -5,7 +5,7 @@ from pathlib import Path
 from pydantic import Field, field_validator
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.command_executor import CommandExecutionArgs, execute_command
 from mycode.tools.command_risk import CommandRiskAnalysis, analyze_command_risk
 from mycode.tools.permission_metadata import with_permission_metadata
@@ -77,7 +77,7 @@ class RunCommandArgs(ToolArgs):
         return value
 
 
-class RunCommandTool(BaseTool[RunCommandArgs]):
+class RunCommandTool(PydanticTool[RunCommandArgs]):
     name = "run_command"
     description = (
         "在 workspace 内执行非交互命令。command 使用结构化 argv，命令直接执行，不经过 Shell 解释。"

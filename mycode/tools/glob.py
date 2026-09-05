@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import Field, field_validator
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.bounds import clamp_positive_int_upper_bound
 from mycode.tools.ignore import is_ignored_path, is_low_relevance_path
 from mycode.tools.path_permissions import PathPermissionPolicy
@@ -20,7 +20,12 @@ MAX_RESULTS_LIMIT = 1000
 
 
 class GlobArgs(ToolArgs):
-    pattern: str = Field(min_length=1)
+    pattern: str = Field(
+        min_length=1,
+        description=(
+            "用于匹配 workspace 内文件路径的相对 glob pattern，例如 **/*.py。"
+        ),
+    )
     max_results: int = Field(
         default=DEFAULT_MAX_RESULTS,
         ge=1,
@@ -37,9 +42,9 @@ class GlobArgs(ToolArgs):
         )
 
 
-class GlobTool(BaseTool[GlobArgs]):
+class GlobTool(PydanticTool[GlobArgs]):
     name = "glob"
-    description = "Find files inside the workspace by glob pattern."
+    description = "按 glob pattern 查找 workspace 内文件。"
     args_model = GlobArgs
     capability = "read"
     risk = "low"

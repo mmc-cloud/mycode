@@ -1,9 +1,10 @@
+import re
 from pathlib import Path
 
 from pydantic import Field, field_validator
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.bounds import clamp_positive_int_upper_bound
 from mycode.tools.ignore import is_ignored_path, is_low_relevance_path
 from mycode.tools.path_permissions import PathPermissionPolicy
@@ -23,8 +24,17 @@ MAX_MATCH_LINE_CHARS = 240
 
 
 class GrepArgs(ToolArgs):
-    query: str = Field(min_length=1)
-    path_pattern: str = Field(default=DEFAULT_PATH_PATTERN, min_length=1)
+    query: str = Field(
+        min_length=1,
+        description="用于匹配文件内容的正则表达式。",
+    )
+    path_pattern: str = Field(
+        default=DEFAULT_PATH_PATTERN,
+        min_length=1,
+        description=(
+            "限定搜索文件范围的 workspace 相对 glob pattern，例如 **/*.py。"
+        ),
+    )
     case_sensitive: bool = False
     max_results: int = Field(
         default=DEFAULT_MAX_RESULTS,
@@ -42,9 +52,9 @@ class GrepArgs(ToolArgs):
         )
 
 
-class GrepTool(BaseTool[GrepArgs]):
+class GrepTool(PydanticTool[GrepArgs]):
     name = "grep"
-    description = "Search text inside workspace files."
+    description = "使用正则表达式搜索 workspace 文件内容。"
     args_model = GrepArgs
     capability = "read"
     risk = "low"
@@ -152,6 +162,15 @@ class GrepTool(BaseTool[GrepArgs]):
                 metadata={"path_pattern": args.path_pattern},
             )
 
+        flags = 0 if args.case_sensitive else re.IGNORECASE
+        try:
+            query_pattern = re.compile(args.query, flags=flags)
+        except re.error as error:
+            return ToolResult.failure(
+                error=f"Invalid regular expression: {error}",
+                metadata={"query": args.query, "reason": str(error)},
+            )
+
         try:
             search_result = _find_search_files(
                 self.workspace,
@@ -187,7 +206,7 @@ class GrepTool(BaseTool[GrepArgs]):
             relative_path = path.relative_to(self.workspace.root).as_posix()
 
             for line_number, line in enumerate(text.splitlines(), start=1):
-                if not _line_matches(line, args.query, args.case_sensitive):
+                if not _line_matches(line, query_pattern):
                     continue
 
                 if len(matches) >= args.max_results:
@@ -290,11 +309,8 @@ def _read_bytes(path: Path) -> bytes | None:
         return None
 
 
-def _line_matches(line: str, query: str, case_sensitive: bool) -> bool:
-    if case_sensitive:
-        return query in line
-
-    return query.casefold() in line.casefold()
+def _line_matches(line: str, query_pattern: re.Pattern[str]) -> bool:
+    return query_pattern.search(line) is not None
 
 
 def _format_match(path: str, line_number: int, line: str) -> str:

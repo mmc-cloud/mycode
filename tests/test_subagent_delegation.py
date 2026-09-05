@@ -27,7 +27,7 @@ from mycode.subagents.limits import (
 )
 from mycode.subagents.tool_batch import SubAgentToolBatchHandler
 from mycode.subagents.runtime import SubAgentExecution
-from mycode.tools import BaseTool, ToolArgs, ToolRegistry, ToolResult
+from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
 from mycode.tools.defaults import create_default_tool_registry
 from mycode.tools.workspace import Workspace
 
@@ -835,7 +835,7 @@ class SideEffectArgs(ToolArgs):
     text: str
 
 
-class RecordingSideEffectTool(BaseTool[SideEffectArgs]):
+class RecordingSideEffectTool(PydanticTool[SideEffectArgs]):
     name = "record_side_effect"
     description = "Record a call for barrier tests."
     args_model = SideEffectArgs
@@ -867,7 +867,7 @@ class SubAgentActivityProbe:
             self.active -= 1
 
 
-class ConcurrentSubAgentTool(BaseTool[SideEffectArgs]):
+class ConcurrentSubAgentTool(PydanticTool[SideEffectArgs]):
     name = "concurrent_subagent_tool"
     description = "Concurrent SubAgent test tool."
     args_model = SideEffectArgs

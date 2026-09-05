@@ -72,6 +72,29 @@ class CliPresenter:
                 self.output(f"artifact> warning: {event.content}")
             return
 
+        if event.type == "model_retry" and event.model_retry is not None:
+            self.flush()
+            retry = event.model_retry
+            if self.mode == "normal":
+                self.output(
+                    "重试> 模型连接异常，"
+                    f"{retry.delay_seconds:.1f} 秒后重试当前模型轮次"
+                    f"（{retry.attempt}/{retry.max_retries}）"
+                )
+            else:
+                self.output(
+                    "model_retry> "
+                    f"call_kind={retry.call_kind} "
+                    f"attempt={retry.attempt}/{retry.max_retries} "
+                    f"error_type={retry.error_type} "
+                    f"error_code={retry.error_code} "
+                    f"retryable={retry.retryable} "
+                    f"delay_seconds={retry.delay_seconds:.1f} "
+                    f"stream_started={retry.stream_started} "
+                    f"partial_output_chars={retry.partial_output_chars}"
+                )
+            return
+
         if event.type == "tool_call" and event.tool_call is not None:
             self._pending_result_tools.append(event.tool_call.name)
             if self.mode == "normal":

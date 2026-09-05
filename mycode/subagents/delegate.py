@@ -4,7 +4,7 @@ from mycode.subagents.contracts import SubAgentTask
 from mycode.subagents.limits import MAX_DELEGATION_DEPTH
 from mycode.subagents.observability import SubAgentObserver
 from mycode.subagents.runtime import SubAgentExecution
-from mycode.tools.base import BaseTool, ToolResult
+from mycode.tools.base import PydanticTool, ToolResult
 
 
 class SubAgentExecutor(Protocol):
@@ -17,7 +17,7 @@ class SubAgentExecutor(Protocol):
         pass
 
 
-class DelegateTaskTool(BaseTool[SubAgentTask]):
+class DelegateTaskTool(PydanticTool[SubAgentTask]):
     name = "delegate_task"
     description = (
         "Delegate one bounded investigation, validation, or review task to an "

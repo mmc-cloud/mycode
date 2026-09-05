@@ -10,9 +10,9 @@ from mycode.config import (
     LLMConfig,
     MissingLLMConfigError,
     _RedactedConfigValues,
+    load_layered_environment,
     load_llm_config,
 )
-
 
 CONFIG_ENVIRONMENT_NAMES = (
     "MYCODE_API_KEY",
@@ -60,6 +60,41 @@ def test_config_value_mapping_repr_is_redacted() -> None:
     assert repr(values) == "<redacted config values>"
 
 
+def test_layered_environment_preserves_priority_and_empty_fallback(tmp_path) -> None:
+    user_env = tmp_path / "user.env"
+    write_env(
+        user_env,
+        "PROCESS_WINS=user",
+        "PROJECT_WINS=user",
+        "USER_FALLBACK=user",
+    )
+    workspace = tmp_path / "workspace"
+    project_env = workspace / ".mycode" / ".env"
+    project_env.parent.mkdir(parents=True)
+    write_env(
+        project_env,
+        "PROCESS_WINS=project",
+        "PROJECT_WINS=project",
+        "USER_FALLBACK=",
+    )
+
+    values = load_layered_environment(
+        user_env,
+        workspace_root=workspace,
+        environ={
+            "PROCESS_WINS": "process",
+            "PROJECT_WINS": "   ",
+            "USER_FALLBACK": "",
+        },
+    )
+
+    assert values == {
+        "PROCESS_WINS": "process",
+        "PROJECT_WINS": "project",
+        "USER_FALLBACK": "user",
+    }
+
+
 def test_llm_config_repr_does_not_include_api_key() -> None:
     config = LLMConfig(
         api_key="synthetic-secret",
@@ -86,6 +121,75 @@ def test_load_llm_config_reads_user_env_file(tmp_path) -> None:
     assert config.model == "test-model"
     assert config.compact_model == "test-model"
     assert config.subagent_model == "test-model"
+
+
+def test_load_llm_config_reads_project_env_without_user_env(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    project_env = workspace / ".mycode" / ".env"
+    project_env.parent.mkdir(parents=True)
+    write_valid_env(project_env)
+
+    config = load_llm_config(
+        tmp_path / "missing-user.env",
+        workspace_root=workspace,
+    )
+
+    assert config.api_key == "test-key"
+    assert config.base_url == "https://example.com/v1"
+    assert config.model == "test-model"
+
+
+def test_project_env_overrides_user_and_falls_back_for_missing_or_empty_values(
+    tmp_path,
+) -> None:
+    user_env = tmp_path / "user.env"
+    write_env(
+        user_env,
+        "MYCODE_API_KEY=user-key",
+        "MYCODE_BASE_URL=https://user.example.com/v1",
+        "MYCODE_MODEL=user-model",
+        "MYCODE_COMPACT_MODEL=user-compact",
+        "MYCODE_SUBAGENT_MODEL=user-subagent",
+        "LLM_CONTEXT_WINDOW_TOKENS=128000",
+        "LLM_RESERVED_OUTPUT_TOKENS=8192",
+        "LLM_CONTEXT_SAFETY_MARGIN_TOKENS=4096",
+        "LLM_MEMORY_CONTEXT_TOKENS=2048",
+        "LLM_STREAM_INCLUDE_USAGE=true",
+        "LLM_THINKING_ENABLED=false",
+    )
+    workspace = tmp_path / "workspace"
+    project_env = workspace / ".mycode" / ".env"
+    project_env.parent.mkdir(parents=True)
+    write_env(
+        project_env,
+        "MYCODE_API_KEY=",
+        "MYCODE_MODEL=project-model",
+        "MYCODE_COMPACT_MODEL=project-compact",
+        "LLM_CONTEXT_WINDOW_TOKENS=256000",
+        "LLM_RESERVED_OUTPUT_TOKENS=16384",
+        "LLM_CONTEXT_SAFETY_MARGIN_TOKENS=8192",
+        "LLM_MEMORY_CONTEXT_TOKENS=1024",
+        "LLM_STREAM_INCLUDE_USAGE=false",
+        "LLM_THINKING_ENABLED=true",
+        "LLM_REASONING_EFFORT=max",
+        "LLM_MAX_OUTPUT_TOKENS=4096",
+    )
+
+    config = load_llm_config(user_env, workspace_root=workspace)
+
+    assert config.api_key == "user-key"
+    assert config.base_url == "https://user.example.com/v1"
+    assert config.model == "project-model"
+    assert config.compact_model == "project-compact"
+    assert config.subagent_model == "user-subagent"
+    assert config.context_window_tokens == 256000
+    assert config.reserved_output_tokens == 16384
+    assert config.context_safety_margin_tokens == 8192
+    assert config.memory_context_tokens == 1024
+    assert config.stream_include_usage is False
+    assert config.thinking_enabled is True
+    assert config.reasoning_effort == "max"
+    assert config.max_output_tokens == 4096
 
 
 def test_load_llm_config_uses_defaults_for_optional_values(tmp_path) -> None:
@@ -289,13 +393,12 @@ def test_load_llm_config_uses_default_user_file_and_ignores_cwd_env(
         "MYCODE_BASE_URL=https://workspace.example.com/v1",
         "MYCODE_MODEL=workspace-model",
     )
-    monkeypatch.chdir(workspace)
     monkeypatch.setattr(
         "mycode.config.default_user_env_file",
         lambda: user_env_file,
     )
 
-    config = load_llm_config()
+    config = load_llm_config(workspace_root=workspace)
 
     assert config.api_key == "user-key"
     assert config.base_url == "https://user.example.com/v1"
@@ -317,8 +420,19 @@ def test_load_llm_config_prefers_process_environment(tmp_path, monkeypatch) -> N
         "MYCODE_COMPACT_MODEL=user-compact",
         "MYCODE_SUBAGENT_MODEL=user-subagent",
     )
+    workspace = tmp_path / "workspace"
+    project_env = workspace / ".mycode" / ".env"
+    project_env.parent.mkdir(parents=True)
+    write_env(
+        project_env,
+        "MYCODE_API_KEY=project-key",
+        "MYCODE_BASE_URL=https://project.example.com/v1",
+        "MYCODE_MODEL=project-model",
+        "MYCODE_COMPACT_MODEL=project-compact",
+        "MYCODE_SUBAGENT_MODEL=project-subagent",
+    )
 
-    config = load_llm_config(env_file)
+    config = load_llm_config(env_file, workspace_root=workspace)
 
     assert config.api_key == "process-key"
     assert config.base_url == "https://process.example.com/v1"

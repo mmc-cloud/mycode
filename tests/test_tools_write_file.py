@@ -13,7 +13,13 @@ def test_write_file_schema_describes_arguments(tmp_path: Path) -> None:
 
     assert schema["name"] == "write_file"
     assert schema["parameters"]["properties"]["path"]["type"] == "string"
-    assert schema["parameters"]["properties"]["content"] == {"type": "string"}
+    assert schema["parameters"]["properties"]["path"]["description"] == (
+        "目标文件路径，必须位于 workspace 内，父目录需要已存在。"
+    )
+    assert schema["parameters"]["properties"]["content"]["type"] == "string"
+    assert schema["parameters"]["properties"]["content"]["description"] == (
+        "要写入文件的完整 UTF-8 文本内容；目标文件已存在时会覆盖原内容。"
+    )
 
 
 def test_write_file_args_accept_empty_content() -> None:

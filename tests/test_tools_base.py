@@ -1,6 +1,16 @@
+import asyncio
+
 import pytest
 
-from mycode.tools import BaseTool, ToolArgs, ToolPermissionProfileError, ToolResult
+from mycode.permissions import PermissionDecision
+from mycode.tools import (
+    BaseTool,
+    PydanticTool,
+    SyncTool,
+    ToolArgs,
+    ToolPermissionProfileError,
+    ToolResult,
+)
 
 
 def test_tool_result_success_sets_content_and_metadata() -> None:
@@ -49,7 +59,36 @@ def test_base_tool_cannot_be_instantiated_directly() -> None:
         BaseTool()
 
 
-def test_base_tool_get_schema_uses_pydantic_args_model() -> None:
+def test_base_tool_does_not_require_sync_run_contract() -> None:
+    tool = AsyncDictTool()
+
+    assert "_run" not in BaseTool.__abstractmethods__
+    result = asyncio.run(
+        tool.run_authorized_async(
+            {"text": "hello"}, PermissionDecision.allow()
+        )
+    )
+    assert result == ToolResult.success("hello")
+
+
+def test_sync_tool_supports_non_pydantic_schema_and_async_adapter() -> None:
+    tool = DictTool()
+
+    assert tool.get_schema()["parameters"] == {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+    }
+    assert tool.run({"text": "hello"}) == ToolResult.success("hello")
+    assert asyncio.run(
+        tool.run_authorized_async(
+            {"text": "hello"}, PermissionDecision.allow()
+        )
+    ) == ToolResult.success("hello")
+    assert not hasattr(tool, "args_model")
+
+
+def test_pydantic_tool_get_schema_uses_pydantic_args_model() -> None:
     tool = FakeTool()
 
     schema = tool.get_schema()
@@ -175,7 +214,65 @@ class FakeArgs(ToolArgs):
     text: str
 
 
-class FakeTool(BaseTool[FakeArgs]):
+class DictTool(SyncTool[dict[str, object]]):
+    name = "dict_tool"
+    description = "Non-Pydantic tool for contract tests."
+    capability = "read"
+    risk = "low"
+
+    @property
+    def input_schema(self) -> dict[str, object]:
+        return {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        }
+
+    def parse_arguments(
+        self, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        if not isinstance(arguments.get("text"), str):
+            raise TypeError("text must be a string")
+        return dict(arguments)
+
+    def arguments_to_dict(
+        self, args: dict[str, object]
+    ) -> dict[str, object]:
+        return dict(args)
+
+    def _run(self, args: dict[str, object]) -> ToolResult:
+        return ToolResult.success(str(args["text"]))
+
+
+class AsyncDictTool(BaseTool[dict[str, object]]):
+    name = "async_dict_tool"
+    description = "Native async tool for contract tests."
+    capability = "read"
+    risk = "low"
+
+    @property
+    def input_schema(self) -> dict[str, object]:
+        return DictTool().input_schema
+
+    def parse_arguments(
+        self, arguments: dict[str, object]
+    ) -> dict[str, object]:
+        return DictTool().parse_arguments(arguments)
+
+    def arguments_to_dict(
+        self, args: dict[str, object]
+    ) -> dict[str, object]:
+        return dict(args)
+
+    async def run_authorized_async(
+        self,
+        args: dict[str, object],
+        decision: PermissionDecision,
+    ) -> ToolResult:
+        return ToolResult.success(str(args["text"]))
+
+
+class FakeTool(PydanticTool[FakeArgs]):
     name = "fake_tool"
     description = "Fake tool for tests."
     args_model = FakeArgs
@@ -193,7 +290,7 @@ class FakeTool(BaseTool[FakeArgs]):
         )
 
 
-class BrokenTool(BaseTool[FakeArgs]):
+class BrokenTool(PydanticTool[FakeArgs]):
     name = "broken_tool"
     description = "Broken tool for tests."
     args_model = FakeArgs
@@ -204,7 +301,7 @@ class BrokenTool(BaseTool[FakeArgs]):
         raise RuntimeError("boom")
 
 
-class MissingCapabilityTool(BaseTool[FakeArgs]):
+class MissingCapabilityTool(PydanticTool[FakeArgs]):
     name = "missing_capability"
     description = "Tool missing capability for tests."
     args_model = FakeArgs
@@ -214,7 +311,7 @@ class MissingCapabilityTool(BaseTool[FakeArgs]):
         return ToolResult.success(args.text)
 
 
-class MissingRiskTool(BaseTool[FakeArgs]):
+class MissingRiskTool(PydanticTool[FakeArgs]):
     name = "missing_risk"
     description = "Tool missing risk for tests."
     args_model = FakeArgs

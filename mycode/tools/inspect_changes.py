@@ -6,7 +6,7 @@ from typing import Literal, Self
 from pydantic import Field, field_validator, model_validator
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.command_executor import CommandExecutionArgs, execute_command
 from mycode.tools.ignore import is_sensitive_path
 from mycode.tools.path_permissions import PathPermissionPolicy
@@ -78,7 +78,7 @@ class InspectChangesArgs(ToolArgs):
         return self
 
 
-class InspectChangesTool(BaseTool[InspectChangesArgs]):
+class InspectChangesTool(PydanticTool[InspectChangesArgs]):
     name = "inspect_changes"
     description = (
         "Inspect Git status or a bounded diff for explicit non-sensitive workspace paths."

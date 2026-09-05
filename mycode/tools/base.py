@@ -1,3 +1,5 @@
+import asyncio
+import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import ClassVar, Generic, TypeVar
@@ -18,11 +20,18 @@ class ToolArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-ArgsT = TypeVar("ArgsT", bound=ToolArgs)
+ArgsT = TypeVar("ArgsT")
+PydanticArgsT = TypeVar("PydanticArgsT", bound=ToolArgs)
 
 
 class ToolPermissionProfileError(ValueError):
     pass
+
+
+class ToolArgumentValidationError(ValueError):
+    def __init__(self, errors: list[dict[str, object]]) -> None:
+        super().__init__("Invalid tool arguments")
+        self.errors = errors
 
 
 @dataclass(frozen=True)
@@ -60,18 +69,23 @@ class ToolResult:
 class BaseTool(ABC, Generic[ArgsT]):
     name: ClassVar[str]
     description: ClassVar[str]
-    args_model: ClassVar[type[ArgsT]]
     capability: ClassVar[ToolCapability]
     risk: ClassVar[ToolRisk]
     # Tools must opt in explicitly. The scheduler also checks capability and
     # risk, so a write/command/control tool cannot become concurrent by mistake.
     concurrency_safe: ClassVar[bool] = False
 
+    @property
+    @abstractmethod
+    def input_schema(self) -> dict[str, object]:
+        """Return the JSON Schema accepted by this tool."""
+        raise NotImplementedError
+
     def get_schema(self) -> dict[str, object]:
         return {
             "name": self.name,
             "description": self.description,
-            "parameters": _remove_schema_titles(self.args_model.model_json_schema()),
+            "parameters": copy.deepcopy(self.input_schema),
         }
 
     def get_permission_profile(self) -> ToolPermissionProfile:
@@ -97,7 +111,7 @@ class BaseTool(ABC, Generic[ArgsT]):
             tool_name=self.name,
             capability=self.capability,
             action=self.name,
-            arguments=args.model_dump(),
+            arguments=self.arguments_to_dict(args),
         )
 
     def check_permission(
@@ -113,16 +127,36 @@ class BaseTool(ABC, Generic[ArgsT]):
 
         return request, decision
 
+    @abstractmethod
     def parse_arguments(self, arguments: dict[str, object]) -> ArgsT:
-        return self.args_model.model_validate(arguments)
+        """Validate raw arguments and return the tool's execution value."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def arguments_to_dict(self, args: ArgsT) -> dict[str, object]:
+        """Serialize validated arguments for the permission request."""
+        raise NotImplementedError
+
+    @abstractmethod
+    async def run_authorized_async(
+        self,
+        args: ArgsT,
+        decision: PermissionDecision,
+    ) -> ToolResult:
+        """Execute validated, authorized arguments through the common path."""
+        raise NotImplementedError
+
+
+class SyncTool(BaseTool[ArgsT], Generic[ArgsT]):
+    """Adapt a synchronous tool implementation to the common async contract."""
 
     def run(self, arguments: dict[str, object]) -> ToolResult:
         try:
             args = self.parse_arguments(arguments)
-        except ValidationError as error:
+        except ToolArgumentValidationError as error:
             return ToolResult.failure(
                 error="Invalid tool arguments",
-                metadata={"validation_errors": error.errors()},
+                metadata={"validation_errors": error.errors},
             )
 
         return self.run_parsed(args)
@@ -130,7 +164,7 @@ class BaseTool(ABC, Generic[ArgsT]):
     def run_parsed(self, args: ArgsT) -> ToolResult:
         try:
             return self._run(args)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - normalize tool boundary failures
             return ToolResult.failure(
                 error=f"Tool execution failed: {error}",
                 metadata={"exception_type": type(error).__name__},
@@ -143,9 +177,35 @@ class BaseTool(ABC, Generic[ArgsT]):
     ) -> ToolResult:
         return self.run_parsed(args)
 
+    async def run_authorized_async(
+        self,
+        args: ArgsT,
+        decision: PermissionDecision,
+    ) -> ToolResult:
+        return await asyncio.to_thread(self.run_authorized, args, decision)
+
     @abstractmethod
     def _run(self, args: ArgsT) -> ToolResult:
         pass
+
+
+class PydanticTool(SyncTool[PydanticArgsT], Generic[PydanticArgsT]):
+    """Base class for tools whose arguments are defined by a Pydantic model."""
+
+    args_model: ClassVar[type[PydanticArgsT]]
+
+    @property
+    def input_schema(self) -> dict[str, object]:
+        return _remove_schema_titles(self.args_model.model_json_schema())
+
+    def parse_arguments(self, arguments: dict[str, object]) -> PydanticArgsT:
+        try:
+            return self.args_model.model_validate(arguments)
+        except ValidationError as error:
+            raise ToolArgumentValidationError(error.errors()) from error
+
+    def arguments_to_dict(self, args: PydanticArgsT) -> dict[str, object]:
+        return args.model_dump()
 
 
 def _remove_schema_titles(value: object) -> object:

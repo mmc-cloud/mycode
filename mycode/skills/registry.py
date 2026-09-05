@@ -1,11 +1,12 @@
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-import re
 from typing import Literal
 
 import yaml
 
+from mycode.config import MYCODE_CONFIG_DIR_NAME
 
 SkillSource = Literal["builtin", "user", "project"]
 _SOURCE_PRIORITY: dict[SkillSource, int] = {
@@ -77,11 +78,14 @@ class SkillRegistry:
             ),
             (
                 "user",
-                Path.home() / ".mycode" / "skills"
+                Path.home() / MYCODE_CONFIG_DIR_NAME / "skills"
                 if user_root is None
                 else user_root,
             ),
-            ("project", Path(workspace_root) / ".mycode" / "skills"),
+            (
+                "project",
+                Path(workspace_root) / MYCODE_CONFIG_DIR_NAME / "skills",
+            ),
         )
         for source, root in roots:
             registry._discover_root(root, source=source)

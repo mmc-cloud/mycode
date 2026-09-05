@@ -3,7 +3,7 @@ from pathlib import Path
 from pydantic import Field
 
 from mycode.permissions import PermissionChecker, PermissionDecision, PermissionRequest
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.file_mutation import (
     display_path,
     failure_metadata,
@@ -50,11 +50,16 @@ class _ReplacementMatch:
 
 class EditFileArgs(ToolArgs):
     path: str = Field(min_length=1)
-    old_text: str = Field(min_length=1)
-    new_text: str
+    old_text: str = Field(
+        min_length=1,
+        description="要替换的原始文本，必须在文件中唯一匹配一次。",
+    )
+    new_text: str = Field(
+        description="用于替换 old_text 的新文本；可以为空字符串以删除匹配内容。",
+    )
 
 
-class EditFileTool(BaseTool[EditFileArgs]):
+class EditFileTool(PydanticTool[EditFileArgs]):
     name = "edit_file"
     description = "Replace one exact text occurrence in an existing text file."
     args_model = EditFileArgs

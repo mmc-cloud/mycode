@@ -2,7 +2,9 @@ from collections.abc import Iterator
 import threading
 import time
 
+import httpx
 import pytest
+from openai import APITimeoutError, BadRequestError
 
 from mycode.agent import (
     AgentEvent,
@@ -22,6 +24,7 @@ from mycode.project import ProjectIdentity
 from mycode.runner import (
     AgentRunner,
     DEFAULT_MAX_CONCURRENT_SAFE_TOOLS,
+    DEFAULT_MODEL_MAX_RETRIES,
     DEFAULT_MAX_TURNS,
     DEFAULT_MAX_TOOL_CALLS_PER_RESPONSE,
     EMPTY_RESPONSE_RETRY_PROMPT,
@@ -34,7 +37,7 @@ from mycode.runner import (
 from mycode.run_progress import MAIN_NEAR_LIMIT_PROMPT, MAX_TURNS_FINALIZATION_PROMPT
 from mycode.permissions import ConfirmationResult, PermissionDecision
 from mycode.tools import (
-    BaseTool,
+    PydanticTool,
     ReadFileTool,
     ToolArgs,
     ToolRegistry,
@@ -1595,6 +1598,265 @@ def test_runner_streams_model_error_when_streaming_raises() -> None:
     ]
 
 
+def test_runner_retries_retryable_model_error_and_recovers(
+    monkeypatch,
+) -> None:
+    import mycode.runner as runner_module
+
+    observations: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    client = ScriptedRetryLLMClient(
+        tool_scripts=[
+            ([], retryable_timeout()),
+            ([AgentEvent(type="text_delta", content="recovered")], None),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.25)
+    monkeypatch.setattr(runner_module, "sleep", sleeps.append)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        observability_sink=observations.append,
+        max_turns=1,
+        near_limit_remaining_turns=None,
+        near_limit_prompt=None,
+    )
+
+    events = list(runner.run("hello"))
+
+    assert events[-1] == AgentEvent(type="stop", stop_reason="final_answer")
+    assert len(client.seen_conversations) == 2
+    assert client.seen_conversations[0] == client.seen_conversations[1]
+    assert sleeps == [4.25]
+    retry_events = [event for event in events if event.type == "model_retry"]
+    assert len(retry_events) == 1
+    assert retry_events[0].model_retry is not None
+    assert retry_events[0].model_retry.attempt == 1
+    assert [event.type for event in events].count("turn") == 1
+    assert runner.conversation.get_messages() == [
+        Message(role="user", content="hello"),
+        Message(role="assistant", content="recovered"),
+    ]
+    retry_observation = next(
+        record for record in observations if record["event_type"] == "model_retry"
+    )
+    assert retry_observation == {
+        "schema_version": 1,
+        "event_type": "model_retry",
+        "run_scope": "main",
+        "run_id": None,
+        "turn": 1,
+        "call_kind": "agent_tools",
+        "attempt": 1,
+        "max_retries": DEFAULT_MODEL_MAX_RETRIES,
+        "error_type": "APITimeoutError",
+        "error_code": "timeout",
+        "retryable": True,
+        "delay_seconds": 4.25,
+        "stream_started": False,
+        "partial_output_chars": 0,
+    }
+    outcome = next(
+        record
+        for record in observations
+        if record["event_type"] == "model_retry_outcome"
+    )
+    assert outcome["outcome"] == "recovered"
+    assert outcome["recovered_on_retry"] == 1
+    assert len(
+        [record for record in observations if record["event_type"] == "model_response"]
+    ) == 2
+
+
+def test_runner_exhausts_three_retryable_model_attempts(monkeypatch) -> None:
+    import mycode.runner as runner_module
+
+    observations: list[dict[str, object]] = []
+    sleeps: list[float] = []
+    client = ScriptedRetryLLMClient(
+        tool_scripts=[
+            ([], retryable_timeout()),
+            ([], retryable_timeout()),
+            ([], retryable_timeout()),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.0)
+    monkeypatch.setattr(runner_module, "sleep", sleeps.append)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        observability_sink=observations.append,
+    )
+
+    events = list(runner.run("hello"))
+
+    assert len(client.seen_conversations) == 3
+    assert sleeps == [4.0, 4.0]
+    assert [event.type for event in events].count("model_retry") == 2
+    assert [event.type for event in events].count("error") == 1
+    assert events[-1] == AgentEvent(type="stop", stop_reason="model_error")
+    assert len(
+        [record for record in observations if record["event_type"] == "model_response"]
+    ) == 3
+    outcome = next(
+        record
+        for record in observations
+        if record["event_type"] == "model_retry_outcome"
+    )
+    assert outcome["outcome"] == "exhausted"
+    assert outcome["retries"] == 2
+    assert outcome["final_error_type"] == "APITimeoutError"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("stream broke"),
+        BadRequestError(
+            "invalid request",
+            response=httpx.Response(
+                400,
+                request=httpx.Request(
+                    "POST", "https://example.com/v1/chat/completions"
+                ),
+            ),
+            body=None,
+        ),
+    ],
+)
+def test_runner_does_not_retry_non_retryable_or_unknown_model_error(
+    error: Exception,
+    monkeypatch,
+) -> None:
+    import mycode.runner as runner_module
+
+    sleeps: list[float] = []
+    client = ScriptedRetryLLMClient(tool_scripts=[([], error)])
+    monkeypatch.setattr(runner_module, "sleep", sleeps.append)
+    runner = AgentRunner(llm_client=client, tool_registry=ToolRegistry())
+
+    events = list(runner.run("hello"))
+
+    assert len(client.seen_conversations) == 1
+    assert sleeps == []
+    assert not any(event.type == "model_retry" for event in events)
+    assert events[-1] == AgentEvent(type="stop", stop_reason="model_error")
+
+
+def test_runner_discards_partial_response_from_failed_attempt(monkeypatch) -> None:
+    import mycode.runner as runner_module
+
+    observations: list[dict[str, object]] = []
+    client = ScriptedRetryLLMClient(
+        tool_scripts=[
+            (
+                [AgentEvent(type="text_delta", content="partial failed text")],
+                retryable_timeout(),
+            ),
+            ([AgentEvent(type="text_delta", content="clean answer")], None),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 3.5)
+    monkeypatch.setattr(runner_module, "sleep", lambda _delay: None)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        observability_sink=observations.append,
+    )
+
+    events = list(runner.run("hello"))
+
+    assert [event.content for event in events if event.type == "text_delta"] == [
+        "partial failed text",
+        "clean answer",
+    ]
+    assert runner.conversation.get_messages() == [
+        Message(role="user", content="hello"),
+        Message(role="assistant", content="clean answer"),
+    ]
+    assert client.seen_conversations[0] == client.seen_conversations[1]
+    retry_observation = next(
+        record for record in observations if record["event_type"] == "model_retry"
+    )
+    assert retry_observation["stream_started"] is True
+    assert retry_observation["partial_output_chars"] == len("partial failed text")
+
+
+def test_runner_never_executes_tool_call_from_failed_attempt(monkeypatch) -> None:
+    import mycode.runner as runner_module
+
+    tool_call = AgentToolCall(
+        id="call_write",
+        name="fake_tool",
+        arguments={"text": "write once"},
+    )
+    executed: list[AgentToolCall] = []
+
+    def record_batch(registry, tool_calls):
+        executed.extend(tool_calls)
+        return _successful_batch(registry, tool_calls)
+
+    client = ScriptedRetryLLMClient(
+        tool_scripts=[
+            ([AgentEvent(type="tool_call", tool_call=tool_call)], retryable_timeout()),
+            ([AgentEvent(type="tool_call", tool_call=tool_call)], None),
+            ([AgentEvent(type="text_delta", content="done")], None),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.0)
+    monkeypatch.setattr(runner_module, "sleep", lambda _delay: None)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry.from_tools([FakeTool()]),
+        tool_batch_handler=record_batch,
+        max_turns=2,
+        near_limit_remaining_turns=None,
+        near_limit_prompt=None,
+    )
+
+    events = list(runner.run("write"))
+
+    assert executed == [tool_call]
+    assert [event.type for event in events].count("tool_call") == 1
+    assert [event.type for event in events].count("turn") == 2
+    assert events[-1] == AgentEvent(type="stop", stop_reason="final_answer")
+
+
+def test_network_retry_is_independent_from_empty_response_retry(monkeypatch) -> None:
+    import mycode.runner as runner_module
+
+    client = ScriptedRetryLLMClient(
+        tool_scripts=[
+            ([], retryable_timeout()),
+            ([], None),
+            ([AgentEvent(type="text_delta", content="final")], None),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.0)
+    monkeypatch.setattr(runner_module, "sleep", lambda _delay: None)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        max_turns=1,
+        near_limit_remaining_turns=None,
+        near_limit_prompt=None,
+    )
+
+    events = list(runner.run("hello"))
+
+    assert [event.type for event in events].count("turn") == 1
+    assert [event.type for event in events].count("model_start") == 3
+    assert client.seen_conversations[0] == client.seen_conversations[1]
+    assert client.seen_conversations[2] != client.seen_conversations[1]
+    retry_system_messages = [
+        message["content"]
+        for message in client.seen_conversations[2]
+        if message["role"] == "system"
+    ]
+    assert EMPTY_RESPONSE_RETRY_PROMPT in retry_system_messages
+    assert events[-1] == AgentEvent(type="stop", stop_reason="final_answer")
+
+
 def test_runner_stream_stops_after_max_turns(monkeypatch) -> None:
     import mycode.context_builder as builder_module
 
@@ -1906,6 +2168,81 @@ def test_finalization_budgets_complete_request_without_pretrimming(overflow, mon
     assert all(m.content != MAX_TURNS_FINALIZATION_PROMPT for m in history.get_messages())
 
 
+def test_max_turns_finalization_retries_and_recovers(monkeypatch) -> None:
+    import mycode.runner as runner_module
+
+    observations: list[dict[str, object]] = []
+    client = ScriptedRetryLLMClient(
+        plain_scripts=[
+            (["partial"], retryable_timeout()),
+            (["checkpoint"], None),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.5)
+    monkeypatch.setattr(runner_module, "sleep", lambda _delay: None)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        observability_sink=observations.append,
+    )
+
+    events = list(runner._stream_finalization_after_max_turns())
+
+    assert [event.content for event in events if event.type == "text_delta"] == [
+        "partial",
+        "checkpoint",
+    ]
+    assert len(client.seen_plain_conversations) == 2
+    assert client.seen_plain_conversations[0] == client.seen_plain_conversations[1]
+    assert events[-1].stop_reason == "max_turns"
+    saved_content = runner.conversation.get_messages()[0].content
+    assert saved_content.endswith("checkpoint")
+    assert "partial" not in saved_content
+    outcome = next(
+        record
+        for record in observations
+        if record["event_type"] == "model_retry_outcome"
+    )
+    assert outcome["call_kind"] == "max_turns_finalization"
+    assert outcome["outcome"] == "recovered"
+    assert outcome["recovered_on_retry"] == 1
+
+
+def test_max_turns_finalization_retry_exhausted(monkeypatch) -> None:
+    import mycode.runner as runner_module
+
+    observations: list[dict[str, object]] = []
+    client = ScriptedRetryLLMClient(
+        plain_scripts=[
+            ([], retryable_timeout()),
+            ([], retryable_timeout()),
+            ([], retryable_timeout()),
+        ]
+    )
+    monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 3.0)
+    monkeypatch.setattr(runner_module, "sleep", lambda _delay: None)
+    runner = AgentRunner(
+        llm_client=client,
+        tool_registry=ToolRegistry(),
+        observability_sink=observations.append,
+    )
+
+    events = list(runner._stream_finalization_after_max_turns())
+
+    assert len(client.seen_plain_conversations) == 3
+    assert [event.type for event in events].count("model_retry") == 2
+    assert [event.type for event in events].count("error") == 1
+    assert events[-1].stop_reason == "max_turns"
+    outcome = next(
+        record
+        for record in observations
+        if record["event_type"] == "model_retry_outcome"
+    )
+    assert outcome["call_kind"] == "max_turns_finalization"
+    assert outcome["outcome"] == "exhausted"
+    assert outcome["retries"] == 2
+
+
 class RecordingLLMClient:
     def __init__(
         self,
@@ -1981,11 +2318,87 @@ class FailingLLMClient:
         yield
 
 
+class ScriptedRetryLLMClient:
+    def __init__(
+        self,
+        *,
+        tool_scripts: list[tuple[list[AgentEvent], Exception | None]] | None = None,
+        plain_scripts: list[tuple[list[str], Exception | None]] | None = None,
+    ) -> None:
+        self.tool_scripts = [] if tool_scripts is None else tool_scripts
+        self.plain_scripts = [] if plain_scripts is None else plain_scripts
+        self.seen_conversations: list[list[dict[str, object]]] = []
+        self.seen_plain_conversations: list[list[dict[str, object]]] = []
+        self.last_token_usage = None
+        self.last_reasoning_char_count = 0
+        self.last_model_response: dict[str, object] | None = None
+
+    def complete(self, conversation: Conversation) -> Message:
+        raise NotImplementedError
+
+    def stream_complete(self, conversation: Conversation) -> Iterator[str]:
+        self.seen_plain_conversations.append(conversation.to_model_messages())
+        chunks, error = self.plain_scripts.pop(0)
+        content_chars = 0
+        for chunk in chunks:
+            content_chars += len(chunk)
+            yield chunk
+        self._finish_attempt(
+            content_chars=content_chars,
+            stream_chunk_count=len(chunks),
+            error=error,
+        )
+        if error is not None:
+            raise error
+
+    def stream_with_tools(
+        self,
+        conversation: Conversation,
+        tools: list[dict[str, object]],
+    ) -> Iterator[AgentEvent]:
+        self.seen_conversations.append(conversation.to_model_messages())
+        events, error = self.tool_scripts.pop(0)
+        content_chars = 0
+        for event in events:
+            if event.type == "text_delta":
+                content_chars += len(event.content)
+            yield event
+        self._finish_attempt(
+            content_chars=content_chars,
+            stream_chunk_count=len(events),
+            error=error,
+        )
+        if error is not None:
+            raise error
+
+    def _finish_attempt(
+        self,
+        *,
+        content_chars: int,
+        stream_chunk_count: int,
+        error: Exception | None,
+    ) -> None:
+        self.last_model_response = {
+            "model": "fake-retry-model",
+            "content_chars": content_chars,
+            "stream_chunk_count": stream_chunk_count,
+            "error_type": None if error is None else type(error).__name__,
+            "retry_count": None,
+            "empty_response": content_chars == 0,
+        }
+
+
+def retryable_timeout() -> APITimeoutError:
+    return APITimeoutError(
+        request=httpx.Request("POST", "https://example.com/v1/chat/completions")
+    )
+
+
 class FakeArgs(ToolArgs):
     text: str
 
 
-class FakeTool(BaseTool[FakeArgs]):
+class FakeTool(PydanticTool[FakeArgs]):
     name = "fake_tool"
     description = "Fake tool."
     args_model = FakeArgs
@@ -2004,7 +2417,7 @@ class FakeArtifactReadTool(FakeTool):
     description = "Recover an already externalized result."
 
 
-class FakeWriteTool(BaseTool[FakeArgs]):
+class FakeWriteTool(PydanticTool[FakeArgs]):
     name = "write_file"
     description = "Fake write tool."
     args_model = FakeArgs
@@ -2019,7 +2432,7 @@ class FakeValidationArgs(ToolArgs):
     command: list[str]
 
 
-class FakeValidationTool(BaseTool[FakeValidationArgs]):
+class FakeValidationTool(PydanticTool[FakeValidationArgs]):
     name = "run_validation"
     description = "Fake validation tool."
     args_model = FakeValidationArgs
@@ -2058,7 +2471,7 @@ class ActivityProbe:
             self.active -= 1
 
 
-class InstrumentedTool(BaseTool[FakeArgs]):
+class InstrumentedTool(PydanticTool[FakeArgs]):
     name = "instrumented_tool"
     description = "Instrumented tool for concurrency tests."
     args_model = FakeArgs

@@ -2,18 +2,21 @@ import asyncio
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
-from pydantic import ValidationError
-
 from mycode.permissions import (
-    Confirmer,
     ConfirmationRequest,
+    Confirmer,
     DefaultPermissionChecker,
     PermissionChecker,
     PermissionDecision,
     PermissionRequest,
     RejectingConfirmer,
 )
-from mycode.tools.base import BaseTool, ToolResult
+from mycode.tools.base import (
+    BaseTool,
+    SyncTool,
+    ToolArgumentValidationError,
+    ToolResult,
+)
 
 
 class DuplicateToolError(ValueError):
@@ -74,18 +77,26 @@ class ToolRegistry:
                 error=f"Tool not found: {name}",
                 metadata={"tool_name": name},
             )
+        if not isinstance(tool, SyncTool):
+            return ToolResult.failure(
+                error="Tool requires async execution path",
+                metadata={
+                    "tool_name": name,
+                    "reason": "async_execution_required",
+                },
+            )
 
         try:
             args = tool.parse_arguments(arguments)
-        except ValidationError as error:
+        except ToolArgumentValidationError as error:
             return ToolResult.failure(
                 error="Invalid tool arguments",
-                metadata={"validation_errors": error.errors()},
+                metadata={"validation_errors": error.errors},
             )
 
         try:
             request, decision = tool.check_permission(args, self.permission_checker)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 - normalize permission boundary
             return ToolResult.failure(
                 error=f"Tool permission check failed: {error}",
                 metadata={
@@ -122,7 +133,7 @@ class ToolRegistry:
         *,
         permission_lock: asyncio.Lock,
     ) -> ToolResult:
-        """Run one opt-in read tool without overlapping permission interaction."""
+        """Run any tool through the common async execution contract."""
         tool = self.get(name)
 
         if tool is None:
@@ -133,10 +144,10 @@ class ToolRegistry:
 
         try:
             args = tool.parse_arguments(arguments)
-        except ValidationError as error:
+        except ToolArgumentValidationError as error:
             return ToolResult.failure(
                 error="Invalid tool arguments",
-                metadata={"validation_errors": error.errors()},
+                metadata={"validation_errors": error.errors},
             )
 
         async with permission_lock:
@@ -145,7 +156,7 @@ class ToolRegistry:
                     args,
                     self.permission_checker,
                 )
-            except Exception as error:
+            except Exception as error:  # noqa: BLE001 - normalize permission boundary
                 return ToolResult.failure(
                     error=f"Tool permission check failed: {error}",
                     metadata={
@@ -163,8 +174,8 @@ class ToolRegistry:
                 return permission_failure
 
         try:
-            return await asyncio.to_thread(tool.run_authorized, args, decision)
-        except Exception as error:
+            return await tool.run_authorized_async(args, decision)
+        except Exception as error:  # noqa: BLE001 - normalize tool boundary
             return ToolResult.failure(
                 error=f"Tool execution failed: {error}",
                 metadata={"exception_type": type(error).__name__},

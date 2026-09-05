@@ -7,14 +7,14 @@ from mycode.skills import (
     SkillNotFoundError,
     SkillRegistry,
 )
-from mycode.tools.base import BaseTool, ToolArgs, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 
 
 class LoadSkillArgs(ToolArgs):
     name: str = Field(min_length=1)
 
 
-class LoadSkillTool(BaseTool[LoadSkillArgs]):
+class LoadSkillTool(PydanticTool[LoadSkillArgs]):
     name = "load_skill"
     description = (
         "加载一个与当前任务相关的 Skill。加载后的完整 Skill 指导会从下一轮模型调用"

@@ -22,6 +22,7 @@ AgentEventType = Literal[
     "progress",
     "artifact_warning",
     "model_start",
+    "model_retry",
     "reasoning_delta",
     "reasoning_state",
     "text_delta",
@@ -58,6 +59,19 @@ class AgentProgressSnapshot:
 
 
 @dataclass(frozen=True)
+class AgentModelRetry:
+    attempt: int
+    max_retries: int
+    delay_seconds: float
+    error_type: str
+    error_code: str
+    retryable: bool
+    call_kind: str
+    stream_started: bool
+    partial_output_chars: int
+
+
+@dataclass(frozen=True)
 class AgentModelResponse:
     content: str = ""
     tool_calls: list[AgentToolCall] = field(default_factory=list)
@@ -88,6 +102,7 @@ class AgentEvent:
     turn_number: int | None = None
     max_turns: int | None = None
     progress: AgentProgressSnapshot | None = None
+    model_retry: AgentModelRetry | None = None
     tool_call: AgentToolCall | None = None
     tool_result: ToolResult | None = None
     stop_reason: AgentStopReason | None = None

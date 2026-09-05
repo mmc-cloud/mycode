@@ -10,7 +10,12 @@ from mycode.cli import run_agent_command
 from mycode.cli import run_agent_loop
 from mycode.cli import run_chat_loop
 from mycode.cli_presenter import summarize_tool_arguments
-from mycode.agent import AgentEvent, AgentProgressSnapshot, AgentToolCall
+from mycode.agent import (
+    AgentEvent,
+    AgentModelRetry,
+    AgentProgressSnapshot,
+    AgentToolCall,
+)
 from mycode.context_budget import ContextBudget
 from mycode.config import LLMConfig
 from mycode.conversation import Conversation
@@ -56,6 +61,34 @@ def configured_llm() -> LLMConfig:
         base_url="https://example.com/v1",
         model="test-model",
     )
+
+
+def test_build_chat_session_keeps_user_only_config_scope(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_load_llm_config(**kwargs):
+        calls.append(kwargs)
+        return configured_llm()
+
+    monkeypatch.setattr("mycode.cli.load_llm_config", fake_load_llm_config)
+
+    build_chat_session()
+
+    assert calls == [{}]
+
+
+def test_build_agent_runner_loads_config_for_workspace(tmp_path, monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_load_llm_config(**kwargs):
+        captured.update(kwargs)
+        return configured_llm()
+
+    monkeypatch.setattr("mycode.cli.load_llm_config", fake_load_llm_config)
+
+    build_agent_runner(workspace_path=tmp_path)
+
+    assert captured == {"workspace_root": tmp_path.resolve()}
 
 
 def test_context_budget_from_config_uses_token_window_and_reserves() -> None:
@@ -548,6 +581,73 @@ def test_run_agent_loop_streams_text_and_events() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("display_mode", "retry_output"),
+    [
+        (
+            "normal",
+            "重试> 模型连接异常，4.3 秒后重试当前模型轮次（1/2）",
+        ),
+        (
+            "debug",
+            (
+                "model_retry> call_kind=agent_tools attempt=1/2 "
+                "error_type=APITimeoutError error_code=timeout retryable=True "
+                "delay_seconds=4.3 stream_started=True partial_output_chars=7"
+            ),
+        ),
+    ],
+)
+def test_run_agent_loop_reports_retry_after_partial_stream(
+    display_mode: str,
+    retry_output: str,
+) -> None:
+    retry = AgentModelRetry(
+        attempt=1,
+        max_retries=2,
+        delay_seconds=4.3,
+        error_type="APITimeoutError",
+        error_code="timeout",
+        retryable=True,
+        call_kind="agent_tools",
+        stream_started=True,
+        partial_output_chars=7,
+    )
+    runner = FakeRunner(
+        event_batches=[
+            [
+                AgentEvent(type="text_delta", content="partial"),
+                AgentEvent(type="model_retry", model_retry=retry),
+                AgentEvent(type="model_start"),
+                AgentEvent(type="text_delta", content="recovered"),
+                AgentEvent(type="stop", stop_reason="final_answer"),
+            ]
+        ]
+    )
+    inputs = iter(["inspect", "/exit"])
+    outputs: list[str] = []
+
+    run_agent_loop(
+        runner=runner,
+        input_func=lambda prompt: next(inputs),
+        output_func=outputs.append,
+        output_chunk_func=outputs.append,
+        display_mode=display_mode,
+    )
+
+    assert outputs == [
+        "输入 /exit 或 /quit 退出。",
+        "assistant> ",
+        "partial",
+        "",
+        retry_output,
+        "assistant> ",
+        "recovered",
+        "",
+        *(["stop> final_answer"] if display_mode == "debug" else []),
+    ]
+
+
 def test_run_agent_loop_groups_reads_and_reports_error_recovery() -> None:
     runner = FakeRunner(
         event_batches=[
@@ -832,7 +932,7 @@ def test_build_agent_runner_registers_session_scoped_artifact_reader(
         base_url="https://example.com/v1",
         model="test-model",
     )
-    monkeypatch.setattr("mycode.cli.load_llm_config", lambda: config)
+    monkeypatch.setattr("mycode.cli.load_llm_config", lambda **kwargs: config)
     artifact_directory = tmp_path / "state" / "artifacts" / "session"
 
     with pytest.raises(ValueError, match="must be provided together"):
@@ -879,7 +979,7 @@ def test_build_agent_runner_restores_history_under_current_system_prompt(
         "mycode.instructions.default_user_instruction_directory",
         lambda: user_directory,
     )
-    monkeypatch.setattr("mycode.cli.load_llm_config", lambda: config)
+    monkeypatch.setattr("mycode.cli.load_llm_config", lambda **kwargs: config)
 
     runner = build_agent_runner(
         workspace_path=workspace,

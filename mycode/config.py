@@ -1,14 +1,13 @@
+import os
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-import os
 from pathlib import Path
 from typing import Literal
 
 from dotenv import dotenv_values
 
-
-DEFAULT_USER_CONFIG_DIR = ".mycode"
-DEFAULT_USER_ENV_FILE = ".env"
+MYCODE_CONFIG_DIR_NAME = ".mycode"
+MYCODE_ENV_FILE_NAME = ".env"
 DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 128000
 DEFAULT_LLM_RESERVED_OUTPUT_TOKENS = 8192
 DEFAULT_LLM_CONTEXT_SAFETY_MARGIN_TOKENS = 4096
@@ -105,78 +104,110 @@ class LLMConfig:
 
 
 def default_user_env_file() -> Path:
-    return Path.home() / DEFAULT_USER_CONFIG_DIR / DEFAULT_USER_ENV_FILE
+    return Path.home() / MYCODE_CONFIG_DIR_NAME / MYCODE_ENV_FILE_NAME
+
+
+def project_env_file(workspace_root: str | Path) -> Path:
+    return Path(workspace_root) / MYCODE_CONFIG_DIR_NAME / MYCODE_ENV_FILE_NAME
+
+
+def load_layered_environment(
+    env_file: str | Path | None = None,
+    *,
+    workspace_root: str | Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    user_values = dotenv_values(
+        default_user_env_file() if env_file is None else env_file
+    )
+    project_values = (
+        {}
+        if workspace_root is None
+        else dotenv_values(project_env_file(workspace_root))
+    )
+    process_values = os.environ if environ is None else environ
+    merged: dict[str, str] = {}
+    for values in (user_values, project_values, process_values):
+        for name, value in values.items():
+            if value is not None and value.strip() != "":
+                merged[name] = value
+    return merged
 
 
 def load_llm_config(
     env_file: str | Path | None = None,
+    *,
+    workspace_root: str | Path | None = None,
 ) -> LLMConfig:
-    user_values = _RedactedConfigValues(
-        dotenv_values(default_user_env_file() if env_file is None else env_file)
+    values = _RedactedConfigValues(
+        load_layered_environment(
+            env_file,
+            workspace_root=workspace_root,
+        )
     )
 
     api_key = _required_env_value(
         "MYCODE_API_KEY",
-        user_values,
+        values,
     )
     base_url = _required_env_value(
         "MYCODE_BASE_URL",
-        user_values,
+        values,
     )
     model = _required_env_value(
         "MYCODE_MODEL",
-        user_values,
+        values,
     )
     compact_model = _env_value(
         "MYCODE_COMPACT_MODEL",
         model,
-        user_values,
+        values,
     )
     subagent_model = _env_value(
         "MYCODE_SUBAGENT_MODEL",
         model,
-        user_values,
+        values,
     )
     context_window_tokens = _int_env_value(
         "LLM_CONTEXT_WINDOW_TOKENS",
         DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
-        user_values,
+        values,
         minimum=1,
     )
     reserved_output_tokens = _int_env_value(
         "LLM_RESERVED_OUTPUT_TOKENS",
         DEFAULT_LLM_RESERVED_OUTPUT_TOKENS,
-        user_values,
+        values,
         minimum=0,
     )
     context_safety_margin_tokens = _int_env_value(
         "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
         DEFAULT_LLM_CONTEXT_SAFETY_MARGIN_TOKENS,
-        user_values,
+        values,
         minimum=0,
     )
     memory_context_tokens = _int_env_value(
         "LLM_MEMORY_CONTEXT_TOKENS",
         DEFAULT_LLM_MEMORY_CONTEXT_TOKENS,
-        user_values,
+        values,
         minimum=0,
     )
     stream_include_usage = _bool_env_value(
         "LLM_STREAM_INCLUDE_USAGE",
         DEFAULT_LLM_STREAM_INCLUDE_USAGE,
-        user_values,
+        values,
     )
     thinking_enabled = _optional_bool_env_value(
         "LLM_THINKING_ENABLED",
-        user_values,
+        values,
     )
     reasoning_effort = _optional_reasoning_effort_env_value(
         "LLM_REASONING_EFFORT",
-        user_values,
+        values,
     )
     max_output_tokens = _optional_int_env_value(
         "LLM_MAX_OUTPUT_TOKENS",
-        user_values,
+        values,
         minimum=1,
     )
 
@@ -220,8 +251,7 @@ def _env_value(
     default: str,
     *value_maps: Mapping[str, str | None],
 ) -> str:
-    values = [os.getenv(name)]
-    values.extend(value_map.get(name) for value_map in value_maps)
+    values = [value_map.get(name) for value_map in value_maps]
 
     for value in values:
         if value is None:
@@ -315,8 +345,7 @@ def _optional_env_value(
     name: str,
     *value_maps: Mapping[str, str | None],
 ) -> str | None:
-    values = [os.getenv(name)]
-    values.extend(value_map.get(name) for value_map in value_maps)
+    values = [value_map.get(name) for value_map in value_maps]
     for value in values:
         if value is None:
             continue

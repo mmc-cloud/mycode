@@ -12,6 +12,33 @@ from mycode.llm import FakeLLMClient, OpenAICompatibleLLMClient
 from mycode.messages import Message
 
 
+def test_openai_compatible_client_configures_sdk_retries_and_timeouts(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_openai(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace()
+
+    monkeypatch.setattr("mycode.llm.OpenAI", fake_openai)
+
+    OpenAICompatibleLLMClient(
+        config=LLMConfig(
+            api_key="test-key",
+            base_url="https://example.com",
+            model="test-model",
+        )
+    )
+
+    assert captured["max_retries"] == 2
+    timeout = captured["timeout"]
+    assert timeout.connect == 5.0
+    assert timeout.read == 120.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 10.0
+
+
 def test_fake_llm_client_returns_configured_responses() -> None:
     client = FakeLLMClient(responses=["first", "second"])
     conversation = Conversation()

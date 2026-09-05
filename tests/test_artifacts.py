@@ -32,7 +32,7 @@ from mycode.messages import Message
 from mycode.project import ProjectIdentity
 from mycode.runner import AgentRunner
 from mycode.session_store import SessionStore
-from mycode.tools import BaseTool, ToolArgs, ToolRegistry, ToolResult
+from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
 
 
 def test_artifact_store_externalizes_large_result_with_hash_and_safe_reference(
@@ -865,7 +865,7 @@ class LargeToolArgs(ToolArgs):
     text: str
 
 
-class LargeTool(BaseTool[LargeToolArgs]):
+class LargeTool(PydanticTool[LargeToolArgs]):
     name = "large_tool"
     description = "Return a large synthetic result."
     args_model = LargeToolArgs

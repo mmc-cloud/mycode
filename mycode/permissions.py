@@ -4,6 +4,36 @@ from typing import Literal, Protocol
 
 PermissionStatus = Literal["allow", "deny", "ask"]
 ConfirmationStatus = Literal["approved", "rejected"]
+ApprovalScope = Literal["once", "task", "session"]
+
+
+@dataclass
+class ScopedApprovalState:
+    """In-memory approvals owned by one registry; never override a deny."""
+
+    task_approved: bool = False
+    session_approved: bool = False
+
+    def approve(self, scope: ApprovalScope) -> None:
+        if scope == "task":
+            self.task_approved = True
+        elif scope == "session":
+            self.session_approved = True
+        elif scope != "once":
+            raise ValueError("Invalid approval scope")
+
+    def allows_ask(self) -> ApprovalScope | None:
+        if self.session_approved:
+            return "session"
+        if self.task_approved:
+            return "task"
+        return None
+
+    def begin_task(self) -> None:
+        self.task_approved = False
+
+    def end_task(self) -> None:
+        self.task_approved = False
 
 ToolCapability = Literal["read", "write", "command", "control"]
 ToolRisk = Literal["low", "medium", "high"]
@@ -174,18 +204,29 @@ class ConfirmationResult:
     status: ConfirmationStatus
     message: str = ""
     metadata: dict[str, object] = field(default_factory=dict)
+    scope: ApprovalScope | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", dict(self.metadata))
+        if self.status == "approved":
+            scope = "once" if self.scope is None else self.scope
+            if scope not in {"once", "task", "session"}:
+                raise ValueError("Invalid approval scope")
+            object.__setattr__(self, "scope", scope)
+        elif self.scope is not None:
+            raise ValueError("Rejected confirmation cannot carry an approval scope")
 
     @classmethod
     def approved(
         cls,
         message: str = "",
         metadata: dict[str, object] | None = None,
+        *,
+        scope: ApprovalScope = "once",
     ) -> "ConfirmationResult":
         return cls(
             status="approved",
+            scope=scope,
             message=message,
             metadata={} if metadata is None else metadata,
         )

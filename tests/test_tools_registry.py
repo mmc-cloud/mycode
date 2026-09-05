@@ -269,7 +269,9 @@ def test_run_tool_executes_after_confirmation_is_approved() -> None:
 
     result = registry.run_tool("fake", {"text": "hello"})
 
-    assert result == ToolResult.success("hello")
+    assert result.ok and result.content == "hello"
+    assert result.metadata["confirmation_scope"] == "once"
+    assert result.metadata["confirmation_source"] == "explicit"
     assert tool.run_count == 1
     assert len(confirmer.requests) == 1
     assert confirmer.requests[0].prompt == "Please confirm."

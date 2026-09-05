@@ -1,6 +1,6 @@
 from collections.abc import Callable
 
-from mycode.permissions import ConfirmationRequest, ConfirmationResult
+from mycode.permissions import ApprovalScope, ConfirmationRequest, ConfirmationResult
 
 
 class TerminalConfirmer:
@@ -48,15 +48,22 @@ class TerminalConfirmer:
             )
 
         try:
-            answer = self.input_func("是否批准？[y/N] ").strip().lower()
+            answer = self.input_func(
+                "是否批准？[y/yes 本次 | t/task 当前任务 | s/session 当前会话 | N 拒绝] "
+            ).strip().lower()
         except EOFError:
             return ConfirmationResult.rejected(
                 message="Permission confirmation unavailable.",
                 metadata={"input": "eof"},
             )
 
-        if answer in {"y", "yes"}:
+        scopes: dict[str, ApprovalScope] = {
+            "y": "once", "yes": "once", "t": "task", "task": "task",
+            "s": "session", "session": "session",
+        }
+        if answer in scopes:
             return ConfirmationResult.approved(
+                scope=scopes[answer],
                 message="Permission confirmation approved.",
                 metadata={"input": answer},
             )

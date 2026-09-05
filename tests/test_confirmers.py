@@ -14,7 +14,7 @@ def test_terminal_confirmer_approves_yes_input() -> None:
 
     assert result.status == "approved"
     assert result.message == "Permission confirmation approved."
-    assert prompts == ["是否批准？[y/N] "]
+    assert prompts == ["是否批准？[y/yes 本次 | t/task 当前任务 | s/session 当前会话 | N 拒绝] "]
     assert outputs == [
         "permission> read_file 需要确认",
         "target> .env",

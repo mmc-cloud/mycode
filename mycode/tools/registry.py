@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from mycode.permissions import (
     ConfirmationRequest,
@@ -10,6 +10,7 @@ from mycode.permissions import (
     PermissionDecision,
     PermissionRequest,
     RejectingConfirmer,
+    ScopedApprovalState,
 )
 from mycode.tools.base import (
     BaseTool,
@@ -32,6 +33,7 @@ class ToolRegistry:
     _tools: dict[str, BaseTool] = field(default_factory=dict)
     permission_checker: PermissionChecker = field(default_factory=DefaultPermissionChecker)
     confirmer: Confirmer = field(default_factory=RejectingConfirmer)
+    scoped_approvals: ScopedApprovalState = field(default_factory=ScopedApprovalState)
 
     @classmethod
     def from_tools(
@@ -109,11 +111,12 @@ class ToolRegistry:
             request,
             decision,
             self.confirmer,
+            self.scoped_approvals,
         )
         if permission_failure is not None:
             return permission_failure
 
-        return tool.run_authorized(args, decision)
+        return _with_confirmation_metadata(tool.run_authorized(args, decision), decision)
 
     def is_concurrency_safe(self, name: str) -> bool:
         tool = self.get(name)
@@ -169,23 +172,39 @@ class ToolRegistry:
                 request,
                 decision,
                 self.confirmer,
+                self.scoped_approvals,
             )
             if permission_failure is not None:
                 return permission_failure
 
         try:
-            return await tool.run_authorized_async(args, decision)
+            result = await tool.run_authorized_async(args, decision)
         except Exception as error:  # noqa: BLE001 - normalize tool boundary
-            return ToolResult.failure(
+            result = ToolResult.failure(
                 error=f"Tool execution failed: {error}",
                 metadata={"exception_type": type(error).__name__},
             )
+        return _with_confirmation_metadata(result, decision)
 
     def list_tools(self) -> list[BaseTool]:
         return list(self._tools.values())
 
     def get_schemas(self) -> list[dict[str, object]]:
         return [tool.get_schema() for tool in self.list_tools()]
+
+
+def _with_confirmation_metadata(
+    result: ToolResult, decision: PermissionDecision,
+) -> ToolResult:
+    """Keep approval provenance even when a tool does not copy its decision."""
+    keys = (
+        "confirmation_status", "confirmation_scope", "confirmation_source",
+        "confirmation_message", "confirmation_metadata", "grant_scope",
+    )
+    metadata = {key: decision.metadata[key] for key in keys if key in decision.metadata}
+    if not metadata:
+        return result
+    return replace(result, metadata={**result.metadata, **metadata})
 
 
 def _permission_failure(decision: PermissionDecision) -> ToolResult:
@@ -203,12 +222,26 @@ def _resolve_permission(
     request: PermissionRequest,
     decision: PermissionDecision,
     confirmer: Confirmer,
+    scoped_approvals: ScopedApprovalState,
 ) -> tuple[PermissionDecision, ToolResult | None]:
     if decision.status == "deny":
         return decision, _permission_failure(decision)
 
     if decision.status != "ask":
         return decision, None
+
+    grant_scope = scoped_approvals.allows_ask()
+    if grant_scope is not None:
+        return PermissionDecision.allow(
+            message=decision.message,
+            metadata={
+                **decision.metadata,
+                "confirmation_status": "approved",
+                "confirmation_scope": grant_scope,
+                "confirmation_source": "scoped_grant",
+                "grant_scope": grant_scope,
+            },
+        ), None
 
     confirmation_request = ConfirmationRequest(
         permission_request=request,
@@ -231,11 +264,15 @@ def _resolve_permission(
             },
         )
 
+    assert confirmation_result.scope is not None
+    scoped_approvals.approve(confirmation_result.scope)
     return PermissionDecision.allow(
         message=decision.message,
         metadata={
             **decision.metadata,
             "confirmation_status": confirmation_result.status,
+            "confirmation_scope": confirmation_result.scope,
+            "confirmation_source": "explicit",
             "confirmation_message": confirmation_result.message,
             "confirmation_metadata": confirmation_result.metadata,
         },

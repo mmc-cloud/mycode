@@ -335,6 +335,7 @@ class AgentRunner:
     def run(self, user_message: str) -> Iterator[AgentEvent]:
         pending_full_group: TurnLocalFullGroup | None = None
         self._pending_artifact_warnings.clear()
+        self.tool_registry.scoped_approvals.begin_task()
         try:
             if self.active_skill_state is not None:
                 self.active_skill_state.clear()
@@ -684,6 +685,7 @@ class AgentRunner:
             )
 
         finally:
+            self.tool_registry.scoped_approvals.end_task()
             pending_full_group = None
             self._pending_artifact_warnings.clear()
             if self.active_skill_state is not None:

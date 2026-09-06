@@ -61,8 +61,8 @@ DEFAULT_REPEATED_TOOL_CALL_LIMIT = 3
 DEFAULT_MAX_TOOL_CALLS_PER_RESPONSE = 32
 DEFAULT_MAX_CONCURRENT_SAFE_TOOLS = 4
 DEFAULT_MODEL_MAX_RETRIES = 2
-MODEL_RETRY_DELAY_MIN_SECONDS = 3.0
-MODEL_RETRY_DELAY_MAX_SECONDS = 5.0
+MODEL_RETRY_DELAY_MIN_SECONDS = 2.0
+MODEL_RETRY_DELAY_MAX_SECONDS = 3.0
 EMPTY_RESPONSE_RETRY_PROMPT = (
     "Your previous response contained neither tool calls nor a final answer. "
     "Continue the task or provide a final response."
@@ -70,6 +70,19 @@ EMPTY_RESPONSE_RETRY_PROMPT = (
 EMPTY_RESPONSE_ERROR = (
     "模型响应错误（empty_response）：连续两次响应都没有工具调用或非空最终回答。"
 )
+
+
+def _model_retry_delay(
+    retry_attempt: int,
+    retry_after_seconds: float | None,
+) -> float:
+    if retry_after_seconds is not None:
+        return max(0.0, retry_after_seconds)
+    multiplier = 2 ** max(0, retry_attempt - 1)
+    return random.uniform(
+        MODEL_RETRY_DELAY_MIN_SECONDS * multiplier,
+        MODEL_RETRY_DELAY_MAX_SECONDS * multiplier,
+    )
 _OBSERVABLE_BOUNDED_READ_FIELDS = {
     "read_artifact": "max_chars",
     "read_file": "max_lines",
@@ -527,9 +540,9 @@ class AgentRunner:
                                 and model_attempt < DEFAULT_MODEL_MAX_RETRIES
                             ):
                                 retry_attempt = model_attempt + 1
-                                delay_seconds = random.uniform(
-                                    MODEL_RETRY_DELAY_MIN_SECONDS,
-                                    MODEL_RETRY_DELAY_MAX_SECONDS,
+                                delay_seconds = _model_retry_delay(
+                                    retry_attempt,
+                                    classified.retry_after_seconds,
                                 )
                                 retry = self._model_retry(
                                     turn=turn_index + 1,
@@ -739,9 +752,9 @@ class AgentRunner:
                     and model_attempt < DEFAULT_MODEL_MAX_RETRIES
                 ):
                     retry_attempt = model_attempt + 1
-                    delay_seconds = random.uniform(
-                        MODEL_RETRY_DELAY_MIN_SECONDS,
-                        MODEL_RETRY_DELAY_MAX_SECONDS,
+                    delay_seconds = _model_retry_delay(
+                        retry_attempt,
+                        classified.retry_after_seconds,
                     )
                     retry = self._model_retry(
                         turn=self.max_turns + 1,

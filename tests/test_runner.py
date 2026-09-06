@@ -33,6 +33,7 @@ from mycode.runner import (
     ToolCallExecution,
     execute_tool_batch,
     format_tool_result,
+    _model_retry_delay,
 )
 from mycode.run_progress import MAIN_NEAR_LIMIT_PROMPT, MAX_TURNS_FINALIZATION_PROMPT
 from mycode.permissions import ConfirmationResult, PermissionDecision
@@ -53,6 +54,21 @@ def context_budget(max_input_tokens: int) -> ContextBudget:
         reserved_output_tokens=0,
         safety_margin_tokens=0,
     )
+
+
+def test_model_retry_delay_uses_lightweight_attempt_backoff(monkeypatch) -> None:
+    ranges = []
+
+    def record_range(low, high):
+        ranges.append((low, high))
+        return high
+
+    monkeypatch.setattr("mycode.runner.random.uniform", record_range)
+
+    assert _model_retry_delay(1, None) == 3.0
+    assert _model_retry_delay(2, None) == 6.0
+    assert ranges == [(2.0, 3.0), (4.0, 6.0)]
+    assert _model_retry_delay(1, 7.5) == 7.5
 
 
 def _run_response(runner: AgentRunner, user_message: str) -> AgentModelResponse:

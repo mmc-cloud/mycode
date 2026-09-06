@@ -2,14 +2,14 @@ from contextlib import nullcontext
 
 import pytest
 
-from mycode.cli import _context_budget_from_config
-from mycode.cli import build_agent_runner
+from mycode.application import build_agent_runner
+from mycode.application import context_budget_from_config
 from mycode.cli import build_chat_session
 from mycode.cli import main
 from mycode.cli import run_agent_command
 from mycode.cli import run_agent_loop
 from mycode.cli import run_chat_loop
-from mycode.cli_presenter import summarize_tool_arguments
+from mycode.event_format import summarize_tool_arguments
 from mycode.agent import (
     AgentEvent,
     AgentModelRetry,
@@ -22,6 +22,7 @@ from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
 from mycode.instructions import InstructionBundle, InstructionSource
 from mycode.messages import Message
+from mycode.mcp.config import MCPConfig
 from mycode.run_outcome import AgentRunOutcome
 from mycode.session import ChatSession
 from mycode.session_runtime import SessionStartRequest, start_project_session
@@ -84,7 +85,7 @@ def test_build_agent_runner_loads_config_for_workspace(tmp_path, monkeypatch) ->
         captured.update(kwargs)
         return configured_llm()
 
-    monkeypatch.setattr("mycode.cli.load_llm_config", fake_load_llm_config)
+    monkeypatch.setattr("mycode.application.load_llm_config", fake_load_llm_config)
 
     build_agent_runner(workspace_path=tmp_path)
 
@@ -101,7 +102,7 @@ def test_context_budget_from_config_uses_token_window_and_reserves() -> None:
         context_safety_margin_tokens=8000,
     )
 
-    budget = _context_budget_from_config(config)
+    budget = context_budget_from_config(config)
 
     assert budget.context_window_tokens == 200000
     assert budget.reserved_output_tokens == 16000
@@ -871,7 +872,7 @@ def test_build_agent_runner_injects_loaded_instructions(
         thinking_enabled=True,
         reasoning_effort="max",
     )
-    monkeypatch.setattr("mycode.cli.load_instruction_bundle", lambda root: bundle)
+    monkeypatch.setattr("mycode.application.load_instruction_bundle", lambda root: bundle)
 
     runner = build_agent_runner(workspace_path=tmp_path, llm_config=config)
 
@@ -932,7 +933,7 @@ def test_build_agent_runner_registers_session_scoped_artifact_reader(
         base_url="https://example.com/v1",
         model="test-model",
     )
-    monkeypatch.setattr("mycode.cli.load_llm_config", lambda **kwargs: config)
+    monkeypatch.setattr("mycode.application.load_llm_config", lambda **kwargs: config)
     artifact_directory = tmp_path / "state" / "artifacts" / "session"
 
     with pytest.raises(ValueError, match="must be provided together"):
@@ -979,7 +980,7 @@ def test_build_agent_runner_restores_history_under_current_system_prompt(
         "mycode.instructions.default_user_instruction_directory",
         lambda: user_directory,
     )
-    monkeypatch.setattr("mycode.cli.load_llm_config", lambda **kwargs: config)
+    monkeypatch.setattr("mycode.application.load_llm_config", lambda **kwargs: config)
 
     runner = build_agent_runner(
         workspace_path=workspace,
@@ -1465,6 +1466,7 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
         session_request=SessionStartRequest(mode="new"),
         session_store=SessionStore(tmp_path / "state.sqlite3"),
         llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
     )
 
     confirmer = captured["confirmer"]
@@ -1515,6 +1517,7 @@ def test_run_agent_command_persists_runner_messages_and_closes_session(
         session_request=SessionStartRequest(mode="new"),
         session_store=store,
         llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
     )
 
     project = ProjectIdentity.from_workspace(tmp_path)
@@ -1552,6 +1555,7 @@ def test_run_agent_command_marks_session_interrupted_on_unexpected_error(
         session_request=SessionStartRequest(mode="new"),
         session_store=store,
         llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
     )
 
     project = ProjectIdentity.from_workspace(tmp_path)
@@ -1587,6 +1591,7 @@ def test_run_agent_command_marks_session_interrupted_on_keyboard_interrupt(
         session_request=SessionStartRequest(mode="new"),
         session_store=store,
         llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
     )
 
     project = ProjectIdentity.from_workspace(tmp_path)
@@ -1621,6 +1626,7 @@ def test_run_agent_command_reports_session_owned_by_another_agent(tmp_path) -> N
         ),
         session_store=SessionStore(store.database_path),
         llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
     )
 
     assert outputs == [

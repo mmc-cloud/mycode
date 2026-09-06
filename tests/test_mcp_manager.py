@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from time import monotonic
 
+import httpx2
 from mcp.types import (
     CallToolResult,
     ListToolsResult,
@@ -11,7 +12,12 @@ from mcp.types import (
 )
 
 from mycode.mcp.config import MCPConfig
-from mycode.mcp.manager import MCPManager
+from mycode.mcp.manager import (
+    MCP_STARTUP_RETRY_MAX_DELAY_SECONDS,
+    MCP_STARTUP_WAIT_SAFETY_MARGIN_SECONDS,
+    MCPManager,
+    _startup_wait_seconds,
+)
 
 
 class FakeClient:
@@ -80,7 +86,7 @@ def test_best_effort_pagination_call_observability_and_cleanup(monkeypatch) -> N
         assert "arguments" not in repr(events)
     finally:
         manager.close()
-    assert sorted(closed) == ["broken", "good"]
+    assert sorted(closed) == ["broken", "broken", "good"]
     assert manager.shutdown_status.status == "completed"
     assert manager._thread is None
     assert manager._loop is None
@@ -145,6 +151,226 @@ def test_connect_timeout_does_not_cover_discovery(monkeypatch) -> None:
     manager.start()
     try:
         assert manager.statuses[0].status == "connected"
+    finally:
+        manager.close()
+
+
+def test_startup_wait_includes_retry_delay_and_safety_margin() -> None:
+    config = MCPConfig.model_validate({"mcpServers": {
+        "remote": {
+            "transport": "stdio",
+            "command": "remote",
+            "connect_timeout": 0.5,
+            "tool_timeout": 1.0,
+        },
+    }})
+
+    assert _startup_wait_seconds(config) == (
+        2 * 1.5
+        + MCP_STARTUP_RETRY_MAX_DELAY_SECONDS
+        + MCP_STARTUP_WAIT_SAFETY_MARGIN_SECONDS
+    )
+
+
+def test_transient_startup_failure_retries_once_and_recovers(monkeypatch) -> None:
+    attempts = 0
+
+    class RetryingClient:
+        async def list_tools(self, *, cursor=None, cache_mode="use"):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx2.ConnectError("secret transport")
+            return ListToolsResult(tools=[], nextCursor=None)
+
+    @asynccontextmanager
+    async def fake_open(config):
+        yield RetryingClient()
+
+    async def no_sleep(delay):
+        assert delay == 1.25
+
+    monkeypatch.setattr("mycode.mcp.manager.open_mcp_client", fake_open)
+    monkeypatch.setattr("mycode.mcp.manager.random.uniform", lambda _a, _b: 1.25)
+    monkeypatch.setattr("mycode.mcp.manager.asyncio.sleep", no_sleep)
+    config = MCPConfig.model_validate(
+        {"mcpServers": {"remote": {"transport": "stdio", "command": "remote"}}}
+    )
+    events = []
+    manager = MCPManager(config, observability_sink=events.append)
+
+    manager.start()
+    try:
+        assert attempts == 2
+        assert manager.statuses[0].status == "connected"
+        event = next(
+            item
+            for item in events
+            if item["event_type"] == "mcp_server_start"
+        )
+        assert event["attempt"] == 2
+        assert event["retry_count"] == 1
+        assert event["recovered_after_retry"] is True
+        assert event["error_category"] is None
+    finally:
+        manager.close()
+
+
+def test_two_transient_startup_failures_end_failed(monkeypatch) -> None:
+    attempts = 0
+
+    class FailingClient:
+        async def list_tools(self, *, cursor=None, cache_mode="use"):
+            nonlocal attempts
+            attempts += 1
+            raise httpx2.ConnectError("secret transport")
+
+    @asynccontextmanager
+    async def fake_open(config):
+        yield FailingClient()
+
+    async def no_sleep(delay):
+        return None
+
+    monkeypatch.setattr("mycode.mcp.manager.open_mcp_client", fake_open)
+    monkeypatch.setattr("mycode.mcp.manager.random.uniform", lambda _a, _b: 1.0)
+    monkeypatch.setattr("mycode.mcp.manager.asyncio.sleep", no_sleep)
+    config = MCPConfig.model_validate(
+        {"mcpServers": {"remote": {"transport": "stdio", "command": "remote"}}}
+    )
+    events = []
+    manager = MCPManager(config, observability_sink=events.append)
+
+    manager.start()
+    try:
+        assert attempts == 2
+        assert manager.statuses[0].status == "failed"
+        assert manager.statuses[0].error_summary == "Connection failed"
+        event = next(
+            item
+            for item in events
+            if item["event_type"] == "mcp_server_start"
+        )
+        assert event["attempt"] == 2
+        assert event["retry_count"] == 1
+        assert event["recovered_after_retry"] is False
+        assert event["error_category"] == "connection_error"
+    finally:
+        manager.close()
+
+
+def test_authentication_failure_does_not_retry_startup(monkeypatch) -> None:
+    attempts = 0
+    request = httpx2.Request("GET", "https://example.test/mcp")
+    response = httpx2.Response(401, request=request)
+
+    class AuthFailingClient:
+        async def list_tools(self, *, cursor=None, cache_mode="use"):
+            nonlocal attempts
+            attempts += 1
+            raise httpx2.HTTPStatusError(
+                "Bearer secret-token", request=request, response=response
+            )
+
+    @asynccontextmanager
+    async def fake_open(config):
+        yield AuthFailingClient()
+
+    monkeypatch.setattr("mycode.mcp.manager.open_mcp_client", fake_open)
+    config = MCPConfig.model_validate(
+        {"mcpServers": {"remote": {"transport": "stdio", "command": "remote"}}}
+    )
+    manager = MCPManager(config)
+
+    manager.start()
+    try:
+        assert attempts == 1
+        assert manager.statuses[0].error_summary == "Authentication failed (401)"
+    finally:
+        manager.close()
+
+
+def test_permission_error_does_not_retry_startup(monkeypatch) -> None:
+    attempts = 0
+
+    class PermissionFailingClient:
+        async def list_tools(self, *, cursor=None, cache_mode="use"):
+            nonlocal attempts
+            attempts += 1
+            raise PermissionError("private server path")
+
+    @asynccontextmanager
+    async def fake_open(config):
+        yield PermissionFailingClient()
+
+    monkeypatch.setattr("mycode.mcp.manager.open_mcp_client", fake_open)
+    config = MCPConfig.model_validate(
+        {"mcpServers": {"remote": {"transport": "stdio", "command": "remote"}}}
+    )
+    manager = MCPManager(config)
+
+    manager.start()
+    try:
+        assert attempts == 1
+        assert manager.statuses[0].error_summary == "Permission denied"
+    finally:
+        manager.close()
+
+
+def test_generic_oserror_does_not_retry_startup(monkeypatch) -> None:
+    attempts = 0
+
+    class ProcessFailingClient:
+        async def list_tools(self, *, cursor=None, cache_mode="use"):
+            nonlocal attempts
+            attempts += 1
+            raise OSError("private process detail")
+
+    @asynccontextmanager
+    async def fake_open(config):
+        yield ProcessFailingClient()
+
+    monkeypatch.setattr("mycode.mcp.manager.open_mcp_client", fake_open)
+    config = MCPConfig.model_validate(
+        {"mcpServers": {"remote": {"transport": "stdio", "command": "remote"}}}
+    )
+    manager = MCPManager(config)
+
+    manager.start()
+    try:
+        assert attempts == 1
+        assert manager.statuses[0].error_summary == "Server process or transport failed"
+    finally:
+        manager.close()
+
+
+def test_duplicate_tool_schema_failure_does_not_retry_startup(monkeypatch) -> None:
+    opens = 0
+
+    class InvalidClient:
+        async def list_tools(self, *, cursor=None, cache_mode="use"):
+            return ListToolsResult(
+                tools=[Tool(name="same", inputSchema={}), Tool(name="same", inputSchema={})],
+                nextCursor=None,
+            )
+
+    @asynccontextmanager
+    async def fake_open(config):
+        nonlocal opens
+        opens += 1
+        yield InvalidClient()
+
+    monkeypatch.setattr("mycode.mcp.manager.open_mcp_client", fake_open)
+    config = MCPConfig.model_validate(
+        {"mcpServers": {"remote": {"transport": "stdio", "command": "remote"}}}
+    )
+    manager = MCPManager(config)
+
+    manager.start()
+    try:
+        assert opens == 1
+        assert manager.statuses[0].status == "failed"
+        assert manager.statuses[0].error_type == "ValueError"
     finally:
         manager.close()
 

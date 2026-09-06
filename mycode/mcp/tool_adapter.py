@@ -7,6 +7,7 @@ from jsonschema import Draft202012Validator, SchemaError
 from jsonschema.validators import validator_for
 from mcp.types import CallToolResult, Tool
 
+from mycode.mcp.errors import classify_mcp_error
 from mycode.mcp.result_adapter import adapt_mcp_result
 from mycode.permissions import (
     PermissionDecision,
@@ -108,12 +109,16 @@ class MCPToolAdapter(BaseTool[dict[str, object]]):
         try:
             result = await self._call(self.server_alias, self.remote_name, args)
         except Exception as error:  # noqa: BLE001 - normalize provider failures
+            classified = classify_mcp_error(error)
             return ToolResult.failure(
-                f"MCP tool call failed: {type(error).__name__}",
+                f"MCP tool call failed: {classified.summary}",
                 {
                     "server_alias": self.server_alias,
                     "tool_name": self.remote_name,
                     "error_type": type(error).__name__,
+                    "root_error_type": classified.root_error_type,
+                    "error_category": classified.category,
+                    "retryable": classified.retryable,
                 },
             )
         adapted = adapt_mcp_result(result)

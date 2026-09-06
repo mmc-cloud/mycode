@@ -5,7 +5,8 @@ from mycode.agent import AgentModelResponse, AgentToolCall
 from mycode.context_budget import ContextBudget, TokenEstimator
 from mycode.context_builder import ContextBuilder
 from mycode.context_compact import CompactPolicy, ConversationCompactor
-from mycode.cli import build_agent_runner, run_agent_loop
+from mycode.application import build_agent_runner
+from mycode.cli import run_agent_loop
 from mycode.config import LLMConfig
 from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
@@ -231,7 +232,7 @@ def test_build_agent_runner_wires_catalog_tools_and_shared_state(
     registry = SkillRegistry()
     registry.register(skill)
     monkeypatch.setattr(
-        "mycode.cli.SkillRegistry.discover", lambda workspace_root: registry
+        "mycode.application.SkillRegistry.discover", lambda workspace_root: registry
     )
     runner = build_agent_runner(
         workspace_path=tmp_path,
@@ -257,7 +258,8 @@ def test_build_agent_runner_omits_catalog_and_tools_without_skills(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(
-        "mycode.cli.SkillRegistry.discover", lambda workspace_root: SkillRegistry()
+        "mycode.application.SkillRegistry.discover",
+        lambda workspace_root: SkillRegistry(),
     )
     runner = build_agent_runner(
         workspace_path=tmp_path,

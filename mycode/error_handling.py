@@ -1,6 +1,11 @@
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import math
 import socket
 import ssl
+from time import time
 from typing import Literal
 
 import httpx
@@ -14,6 +19,9 @@ from openai import (
     PermissionDeniedError,
     RateLimitError,
 )
+
+
+MAX_MODEL_RETRY_DELAY_SECONDS = 30.0
 
 
 ModelErrorCode = Literal[
@@ -36,52 +44,100 @@ class UserFacingModelError:
     code: ModelErrorCode
     message: str
     retryable: bool | None
+    retry_after_seconds: float | None = None
 
 
 def classify_model_error(error: BaseException) -> UserFacingModelError:
     chain = _exception_chain(error)
+    status_error = next(
+        (item for item in chain if isinstance(item, APIStatusError)), None
+    )
 
-    if isinstance(error, AuthenticationError):
+    if any(isinstance(item, AuthenticationError) for item in chain):
         return UserFacingModelError(
             code="authentication",
             message="模型服务鉴权失败，请检查 API Key 和 API 地址。",
             retryable=False,
         )
-    if isinstance(error, PermissionDeniedError):
+    if any(isinstance(item, PermissionDeniedError) for item in chain):
         return UserFacingModelError(
             code="permission_denied",
             message="模型服务拒绝访问，请检查订阅状态和模型使用权限。",
             retryable=False,
         )
-    if isinstance(error, RateLimitError):
+    if status_error is not None and status_error.status_code in {401, 403}:
+        if status_error.status_code == 401:
+            return UserFacingModelError(
+                code="authentication",
+                message="模型服务鉴权失败，请检查 API Key 和 API 地址。",
+                retryable=False,
+            )
+        return UserFacingModelError(
+            code="permission_denied",
+            message="模型服务拒绝访问，请检查订阅状态和模型使用权限。",
+            retryable=False,
+        )
+    rate_limit = next(
+        (
+            item
+            for item in chain
+            if isinstance(item, RateLimitError)
+            or (
+                isinstance(item, APIStatusError)
+                and item.status_code == 429
+            )
+        ),
+        None,
+    )
+    if rate_limit is not None:
+        quota_exhausted = _quota_exhausted(chain)
         return UserFacingModelError(
             code="rate_limit",
-            message="模型服务当前限流或额度不足，请稍后重试并检查额度。",
-            retryable=True,
+            message=(
+                "模型服务额度已耗尽，请检查账户额度或计费状态。"
+                if quota_exhausted
+                else "模型服务当前限流或额度不足，请稍后重试并检查额度。"
+            ),
+            retryable=not quota_exhausted,
+            retry_after_seconds=(
+                None if quota_exhausted else _retry_after_seconds(rate_limit)
+            ),
         )
-    if isinstance(error, BadRequestError):
+    if any(isinstance(item, BadRequestError) for item in chain):
         return UserFacingModelError(
             code="bad_request",
             message="模型服务拒绝了当前请求，请检查模型名称和请求参数。",
             retryable=False,
         )
-    if isinstance(error, NotFoundError):
+    if any(isinstance(item, NotFoundError) for item in chain):
         return UserFacingModelError(
             code="not_found",
             message="未找到模型服务端点或指定模型，请检查 API 地址和模型名称。",
             retryable=False,
         )
-    if isinstance(error, APIStatusError) and error.status_code == 408:
+    if status_error is not None and status_error.status_code == 408:
         return UserFacingModelError(
             code="timeout",
             message="模型服务请求超时（HTTP 408），请稍后重试。",
             retryable=True,
         )
-    if isinstance(error, APIStatusError) and error.status_code >= 500:
+    if status_error is not None and status_error.status_code in {400, 404}:
+        if status_error.status_code == 400:
+            return UserFacingModelError(
+                code="bad_request",
+                message="模型服务拒绝了当前请求，请检查模型名称和请求参数。",
+                retryable=False,
+            )
+        return UserFacingModelError(
+            code="not_found",
+            message="未找到模型服务端点或指定模型，请检查 API 地址和模型名称。",
+            retryable=False,
+        )
+    if status_error is not None and status_error.status_code >= 500:
         return UserFacingModelError(
             code="server_error",
             message=(
-                f"模型服务暂时不可用（HTTP {error.status_code}），请稍后重试。"
+                f"模型服务暂时不可用（HTTP {status_error.status_code}），请稍后重试。"
             ),
             retryable=True,
         )
@@ -169,16 +225,84 @@ def error_summary(error: BaseException) -> str:
     return first_line[:497] + "..."
 
 
+_QUOTA_EXHAUSTED_MARKERS = {
+    "insufficient_quota",
+    "quota_exceeded",
+    "usage_limit",
+    "billing_hard_limit_reached",
+    "billing_limit",
+    "billing_error",
+    "credits_exhausted",
+    "billing",
+}
+
+
+def _quota_exhausted(chain: tuple[BaseException, ...]) -> bool:
+    for error in chain:
+        for marker in _error_markers(error):
+            if marker in _QUOTA_EXHAUSTED_MARKERS:
+                return True
+    return False
+
+
+def _error_markers(error: BaseException):
+    for attribute in ("code", "type"):
+        value = getattr(error, attribute, None)
+        if isinstance(value, str):
+            yield value.strip().casefold()
+    body = getattr(error, "body", None)
+    if isinstance(body, Mapping):
+        yield from _mapping_error_markers(body)
+
+
+def _mapping_error_markers(value: Mapping[object, object]):
+    for key, nested in value.items():
+        if key in {"code", "type"} and isinstance(nested, str):
+            yield nested.strip().casefold()
+        if isinstance(nested, Mapping):
+            yield from _mapping_error_markers(nested)
+
+
+def _retry_after_seconds(error: BaseException) -> float | None:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    value = headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        delay = float(str(value).strip())
+    except (TypeError, ValueError):
+        delay = None
+    if delay is not None and math.isfinite(delay) and delay >= 0:
+        return min(delay, MAX_MODEL_RETRY_DELAY_SECONDS)
+    try:
+        retry_at = parsedate_to_datetime(str(value))
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        delay = retry_at.timestamp() - time()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(delay):
+        return None
+    return min(max(0.0, delay), MAX_MODEL_RETRY_DELAY_SECONDS)
+
+
 def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
     chain: list[BaseException] = []
     seen: set[int] = set()
-    current: BaseException | None = error
-    while current is not None and id(current) not in seen:
+    pending: list[BaseException] = [error]
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
         seen.add(id(current))
         chain.append(current)
-        current = (
-            current.__cause__
-            if current.__cause__ is not None
-            else current.__context__
-        )
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        elif not current.__suppress_context__ and current.__context__ is not None:
+            pending.append(current.__context__)
     return tuple(chain)

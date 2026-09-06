@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+from email.utils import format_datetime
 import socket
 import ssl
 
@@ -15,15 +17,21 @@ from openai import (
     RateLimitError,
 )
 
-from mycode.error_handling import classify_model_error, format_model_error
+from mycode.error_handling import (
+    MAX_MODEL_RETRY_DELAY_SECONDS,
+    classify_model_error,
+    format_model_error,
+)
 
 
 def request() -> httpx.Request:
     return httpx.Request("POST", "https://example.com/v1/chat/completions")
 
 
-def response(status_code: int) -> httpx.Response:
-    return httpx.Response(status_code, request=request())
+def response(
+    status_code: int, *, headers: dict[str, str] | None = None
+) -> httpx.Response:
+    return httpx.Response(status_code, request=request(), headers=headers)
 
 
 @pytest.mark.parametrize(
@@ -176,3 +184,92 @@ def test_http_408_is_retryable_timeout() -> None:
     assert classified.code == "timeout"
     assert classified.retryable is True
     assert "HTTP 408" in classified.message
+
+
+def test_rate_limit_quota_exhaustion_is_not_retryable() -> None:
+    error = RateLimitError(
+        "quota exhausted",
+        response=response(429),
+        body={"type": "insufficient_quota", "code": "insufficient_quota"},
+    )
+
+    classified = classify_model_error(error)
+
+    assert classified.code == "rate_limit"
+    assert classified.retryable is False
+    assert classified.retry_after_seconds is None
+    assert "额度已耗尽" in classified.message
+
+
+def test_rate_limit_uses_retry_after_header() -> None:
+    error = RateLimitError(
+        "too many requests",
+        response=response(429, headers={"Retry-After": "7"}),
+        body=None,
+    )
+
+    classified = classify_model_error(error)
+
+    assert classified.retryable is True
+    assert classified.retry_after_seconds == 7.0
+
+
+def test_rate_limit_retry_after_seconds_is_capped() -> None:
+    error = RateLimitError(
+        "too many requests",
+        response=response(429, headers={"Retry-After": "60"}),
+        body=None,
+    )
+
+    classified = classify_model_error(error)
+
+    assert classified.retry_after_seconds == MAX_MODEL_RETRY_DELAY_SECONDS
+
+
+def test_rate_limit_retry_after_http_date_is_capped(monkeypatch) -> None:
+    monkeypatch.setattr("mycode.error_handling.time", lambda: 1000.0)
+    retry_at = datetime.fromtimestamp(1040.0, tz=timezone.utc)
+    error = RateLimitError(
+        "too many requests",
+        response=response(
+            429,
+            headers={"Retry-After": format_datetime(retry_at, usegmt=True)},
+        ),
+        body=None,
+    )
+
+    classified = classify_model_error(error)
+
+    assert classified.retry_after_seconds == MAX_MODEL_RETRY_DELAY_SECONDS
+
+
+def test_explicit_model_cause_wins_over_context() -> None:
+    error = APIConnectionError(request=request())
+    error.__context__ = PermissionError("private context")
+    error.__cause__ = httpx.ConnectTimeout("private cause")
+    error.__suppress_context__ = False
+
+    classified = classify_model_error(error)
+
+    assert classified.code == "timeout"
+
+
+def test_unsuppressed_model_context_is_followed() -> None:
+    error = RuntimeError("wrapper")
+    error.__context__ = httpx.ConnectTimeout("private context")
+    error.__suppress_context__ = False
+
+    classified = classify_model_error(error)
+
+    assert classified.code == "timeout"
+
+
+def test_suppressed_model_context_is_not_classified() -> None:
+    error = RuntimeError("safe wrapper")
+    error.__context__ = httpx.ConnectTimeout("private timeout")
+    error.__suppress_context__ = True
+
+    classified = classify_model_error(error)
+
+    assert classified.code == "unknown"
+    assert classified.message == "safe wrapper"

@@ -1,6 +1,8 @@
 import asyncio
 
+import httpx2
 import pytest
+from mcp import MCPError
 from mcp.types import CallToolResult, TextContent, Tool, ToolAnnotations
 
 from mycode.mcp.tool_adapter import (
@@ -145,6 +147,32 @@ def test_native_async_execution_normalizes_result() -> None:
     assert result.ok is True
     assert result.content == "hello"
     assert result.metadata["server_alias"] == "local"
+
+
+def test_failed_call_returns_safe_classification_metadata() -> None:
+    async def failing_call(alias, name, arguments):
+        transport = httpx2.ConnectError("Bearer secret-token")
+        error = MCPError(-32603, "Connection closed")
+        error.__cause__ = transport
+        raise error
+
+    tool = MCPToolAdapter("local", make_tool(), failing_call)
+
+    result = asyncio.run(
+        tool.run_authorized_async({"value": "hello"}, PermissionDecision.allow())
+    )
+
+    assert result.ok is False
+    assert result.error == "MCP tool call failed: Connection failed"
+    assert result.metadata == {
+        "server_alias": "local",
+        "tool_name": "echo",
+        "error_type": "MCPError",
+        "root_error_type": "ConnectError",
+        "error_category": "connection_error",
+        "retryable": True,
+    }
+    assert "secret" not in repr(result)
 
 
 def test_native_async_adapter_has_no_fake_sync_execution_methods() -> None:

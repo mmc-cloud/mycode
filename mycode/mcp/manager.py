@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
+import random
 from threading import Event, Thread
 from time import monotonic
 
@@ -13,10 +14,19 @@ from mycode.mcp.config import (
     MCPConfig,
     MCPServerConfig,
 )
-from mycode.mcp.errors import safe_error_summary
+from mycode.mcp.errors import (
+    classify_mcp_error,
+    is_transient_mcp_error,
+    safe_error_summary,
+)
 from mycode.mcp.models import MCPServerStatus, MCPShutdownStatus
 from mycode.mcp.tool_adapter import MCPToolAdapter
 from mycode.observability import ObservationSink, emit_observation
+
+
+MCP_STARTUP_RETRY_MIN_DELAY_SECONDS = 1.0
+MCP_STARTUP_RETRY_MAX_DELAY_SECONDS = 2.0
+MCP_STARTUP_WAIT_SAFETY_MARGIN_SECONDS = 5.0
 
 
 @dataclass
@@ -47,10 +57,7 @@ class MCPManager:
         self.shutdown_status = MCPShutdownStatus()
         self._thread = Thread(target=self._thread_main, name="mycode-mcp", daemon=True)
         self._thread.start()
-        wait_seconds = max(
-            server.connect_timeout + server.tool_timeout
-            for server in self.config.mcp_servers.values()
-        ) + 1.0
+        wait_seconds = _startup_wait_seconds(self.config)
         if not self._ready.wait(wait_seconds):
             error = TimeoutError()
             self.statuses = tuple(
@@ -170,52 +177,86 @@ class MCPManager:
         startup: asyncio.Future["_ServerStartup"],
     ) -> None:
         started = monotonic()
-        result: _ServerStartup | None = None
-        try:
-            async with AsyncExitStack() as stack:
-                async with asyncio.timeout(server.connect_timeout):
-                    client = await stack.enter_async_context(open_mcp_client(server))
-                async with asyncio.timeout(server.tool_timeout):
-                    discovered = await _discover_all_tools(client)
-                remote_names = [tool.name for tool in discovered]
-                if len(remote_names) != len(set(remote_names)):
-                    raise ValueError("MCP server returned duplicate tool names")
-                adapters = tuple(
-                    MCPToolAdapter(alias, tool, self.call_tool)
-                    for tool in discovered
-                )
-                self._clients[alias] = client
-                self._tool_timeouts[alias] = server.tool_timeout
-                result = _ServerStartup(
-                    status=MCPServerStatus(
-                        alias=alias,
-                        status="connected",
-                        tool_count=len(adapters),
-                    ),
-                    tools=adapters,
-                )
-                self._report_server_start(startup, result, started)
-                await self._stop.wait()
-        except Exception as error:  # noqa: BLE001 - isolate one external server
-            if result is None:
+        retry_count = 0
+        for attempt in range(1, 3):
+            try:
+                async with AsyncExitStack() as stack:
+                    async with asyncio.timeout(server.connect_timeout):
+                        client = await stack.enter_async_context(
+                            open_mcp_client(server)
+                        )
+                    async with asyncio.timeout(server.tool_timeout):
+                        discovered = await _discover_all_tools(client)
+                    remote_names = [tool.name for tool in discovered]
+                    if len(remote_names) != len(set(remote_names)):
+                        raise ValueError("MCP server returned duplicate tool names")
+                    adapters = tuple(
+                        MCPToolAdapter(alias, tool, self.call_tool)
+                        for tool in discovered
+                    )
+                    self._clients[alias] = client
+                    self._tool_timeouts[alias] = server.tool_timeout
+                    result = _ServerStartup(
+                        status=MCPServerStatus(
+                            alias=alias,
+                            status="connected",
+                            tool_count=len(adapters),
+                        ),
+                        tools=adapters,
+                    )
+                    self._report_server_start(
+                        startup,
+                        result,
+                        started,
+                        attempt=attempt,
+                        retry_count=retry_count,
+                        recovered_after_retry=retry_count > 0,
+                    )
+                    await self._stop.wait()
+                    return
+            except Exception as error:  # noqa: BLE001 - isolate one external server
+                classified = classify_mcp_error(error)
+                if attempt == 1 and is_transient_mcp_error(classified):
+                    retry_count = 1
+                    await asyncio.sleep(
+                        random.uniform(
+                            MCP_STARTUP_RETRY_MIN_DELAY_SECONDS,
+                            MCP_STARTUP_RETRY_MAX_DELAY_SECONDS,
+                        )
+                    )
+                    continue
                 result = _ServerStartup(
                     status=MCPServerStatus(
                         alias=alias,
                         status="failed",
                         error_type=type(error).__name__,
-                        error_summary=safe_error_summary(error),
+                        error_summary=classified.summary,
                     )
                 )
-                self._report_server_start(startup, result, started)
-        finally:
-            self._clients.pop(alias, None)
-            self._tool_timeouts.pop(alias, None)
+                self._report_server_start(
+                    startup,
+                    result,
+                    started,
+                    attempt=attempt,
+                    retry_count=retry_count,
+                    recovered_after_retry=False,
+                    error_category=classified.category,
+                )
+                return
+            finally:
+                self._clients.pop(alias, None)
+                self._tool_timeouts.pop(alias, None)
 
     def _report_server_start(
         self,
         startup: asyncio.Future["_ServerStartup"],
         result: "_ServerStartup",
         started: float,
+        *,
+        attempt: int,
+        retry_count: int,
+        recovered_after_retry: bool,
+        error_category: str | None = None,
     ) -> None:
         if not startup.done():
             startup.set_result(result)
@@ -228,6 +269,10 @@ class MCPManager:
                 "tool_count": result.status.tool_count,
                 "duration_ms": round((monotonic() - started) * 1000),
                 "error_type": result.status.error_type,
+                "error_category": error_category,
+                "attempt": attempt,
+                "retry_count": retry_count,
+                "recovered_after_retry": recovered_after_retry,
             },
         )
 
@@ -237,12 +282,17 @@ class MCPManager:
         started = monotonic()
         status = "ok"
         error_type = None
+        error_category = None
+        root_error_type = None
         try:
             async with asyncio.timeout(self._tool_timeouts[alias]):
                 return await self._clients[alias].call_tool(name, arguments)
         except Exception as error:
             status = "error"
+            classified = classify_mcp_error(error)
             error_type = type(error).__name__
+            error_category = classified.category
+            root_error_type = classified.root_error_type
             raise
         finally:
             emit_observation(
@@ -254,6 +304,8 @@ class MCPManager:
                     "status": status,
                     "duration_ms": round((monotonic() - started) * 1000),
                     "error_type": error_type,
+                    "root_error_type": root_error_type,
+                    "error_category": error_category,
                 },
             )
 
@@ -273,3 +325,15 @@ async def _discover_all_tools(client: Client) -> list[object]:
 class _ServerStartup:
     status: MCPServerStatus
     tools: tuple[MCPToolAdapter, ...] = ()
+
+
+def _startup_wait_seconds(config: MCPConfig) -> float:
+    max_server_timeout = max(
+        server.connect_timeout + server.tool_timeout
+        for server in config.mcp_servers.values()
+    )
+    return (
+        2 * max_server_timeout
+        + MCP_STARTUP_RETRY_MAX_DELAY_SECONDS
+        + MCP_STARTUP_WAIT_SAFETY_MARGIN_SECONDS
+    )

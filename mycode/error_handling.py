@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import math
+import re
 import socket
 import ssl
 from time import time
@@ -45,6 +46,16 @@ class UserFacingModelError:
     message: str
     retryable: bool | None
     retry_after_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class ProviderDiagnostic:
+    http_status: int | None = None
+    code: str | None = None
+    error_type: str | None = None
+    message: str | None = None
+    request_id: str | None = None
+    retry_after: str | None = None
 
 
 def classify_model_error(error: BaseException) -> UserFacingModelError:
@@ -212,7 +223,79 @@ def format_model_error(error: BaseException, *, operation: str) -> str:
     classified = classify_model_error(error)
     if classified.code == "unknown":
         return f"{operation}：{classified.message}"
-    return classified.message
+    diagnostic = extract_provider_diagnostic(error)
+    message = classified.message
+    if (
+        diagnostic.http_status is not None
+        and f"HTTP {diagnostic.http_status}" not in message
+    ):
+        message = message.rstrip("。") + f"（HTTP {diagnostic.http_status}）。"
+
+    details: list[str] = []
+    if diagnostic.retry_after is not None:
+        details.append(f"retry-after={diagnostic.retry_after}")
+    provider_label = diagnostic.code or diagnostic.error_type
+    if diagnostic.message is not None:
+        details.append(
+            diagnostic.message
+            if provider_label is None
+            else f"{provider_label}: {diagnostic.message}"
+        )
+    elif provider_label is not None:
+        details.append(provider_label)
+    if (
+        diagnostic.error_type is not None
+        and diagnostic.error_type != diagnostic.code
+    ):
+        details.append(f"provider-type={diagnostic.error_type}")
+    if diagnostic.request_id is not None:
+        details.append(f"request-id={diagnostic.request_id}")
+    return "\n".join([message, *details])
+
+
+def extract_provider_diagnostic(error: BaseException) -> ProviderDiagnostic:
+    http_status: int | None = None
+    code: str | None = None
+    error_type: str | None = None
+    message: str | None = None
+    request_id: str | None = None
+    retry_after: str | None = None
+
+    for current in _exception_chain(error):
+        if http_status is None:
+            http_status = _safe_http_status(current)
+        body = getattr(current, "body", None)
+        if isinstance(body, Mapping):
+            body_code, body_type, body_message = _mapping_provider_fields(body)
+            code = code or body_code
+            error_type = error_type or body_type
+            message = message or body_message
+        code = code or _safe_provider_text(getattr(current, "code", None), 200)
+        error_type = error_type or _safe_provider_text(
+            getattr(current, "type", None), 200
+        )
+        request_id = request_id or _safe_provider_text(
+            getattr(current, "request_id", None), 200
+        )
+        request_id = request_id or _safe_provider_text(
+            getattr(current, "_request_id", None), 200
+        )
+        response = getattr(current, "response", None)
+        request_id = request_id or _safe_provider_text(
+            _header_value(response, "x-request-id"), 200
+        )
+        retry_after = retry_after or _safe_provider_text(
+            _header_value(response, "retry-after"), 100
+        )
+
+    return ProviderDiagnostic(
+        http_status=http_status,
+        code=code,
+        error_type=error_type,
+        message=message,
+        request_id=request_id,
+        retry_after=retry_after,
+    )
 
 
 def error_summary(error: BaseException) -> str:
@@ -223,6 +306,96 @@ def error_summary(error: BaseException) -> str:
     if len(first_line) <= 500:
         return first_line
     return first_line[:497] + "..."
+
+
+_PROVIDER_SECRET_PATTERNS = (
+    re.compile(r"(?i)\bbearer\s+[^\s,;]+"),
+    re.compile(
+        r"(?i)\b(?:authorization|api[\s_-]*key|cookie)\b"
+        r"\s*(?::|=|\bis\b)?\s*[^\s,;]+"
+    ),
+    re.compile(r"(?i)\bsk-[a-z0-9_-]{6,}"),
+)
+
+
+def _safe_provider_text(value: object, max_chars: int) -> str | None:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    text = " ".join(str(value).split())
+    if text == "":
+        return None
+    for pattern in _PROVIDER_SECRET_PATTERNS:
+        text = pattern.sub("[redacted]", text)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 3] + "..."
+
+
+def _safe_http_status(error: BaseException) -> int | None:
+    status = getattr(error, "status_code", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+    if (
+        isinstance(status, int)
+        and not isinstance(status, bool)
+        and 100 <= status <= 599
+    ):
+        return status
+    return None
+
+
+def _mapping_provider_fields(
+    body: Mapping[object, object],
+) -> tuple[str | None, str | None, str | None]:
+    pending: list[tuple[Mapping[object, object], int]] = []
+    nested_error = _mapping_value(body, "error")
+    if isinstance(nested_error, Mapping):
+        pending.append((nested_error, 0))
+    pending.append((body, 0))
+    seen: set[int] = set()
+    code: str | None = None
+    error_type: str | None = None
+    message: str | None = None
+    while pending and (code is None or error_type is None or message is None):
+        current, depth = pending.pop(0)
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        code = code or _safe_provider_text(_mapping_value(current, "code"), 200)
+        error_type = error_type or _safe_provider_text(
+            _mapping_value(current, "type"), 200
+        )
+        message = message or _safe_provider_text(
+            _mapping_value(current, "message"), 500
+        )
+        if message is None:
+            message = _safe_provider_text(_mapping_value(current, "detail"), 500)
+        if depth < 2:
+            pending.extend(
+                (nested, depth + 1)
+                for nested in current.values()
+                if isinstance(nested, Mapping)
+            )
+    return code, error_type, message
+
+
+def _mapping_value(mapping: Mapping[object, object], name: str) -> object | None:
+    for key, value in mapping.items():
+        if isinstance(key, str) and key.casefold() == name:
+            return value
+    return None
+
+
+def _header_value(response: object, name: str) -> object | None:
+    headers = getattr(response, "headers", None)
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return None
+    value = getter(name)
+    if value is not None:
+        return value
+    return getter(name.title())
 
 
 _QUOTA_EXHAUSTED_MARKERS = {

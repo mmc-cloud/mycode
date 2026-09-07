@@ -1,6 +1,5 @@
 from datetime import datetime, timezone
 from pathlib import Path
-import sqlite3
 
 import pytest
 
@@ -19,9 +18,7 @@ from mycode.messages import Message
 from mycode.project import ProjectIdentity
 from mycode.session_runtime import SessionStartRequest, start_project_session
 from mycode.session_store import (
-    SESSION_SCHEMA_VERSION,
     SessionDataError,
-    SessionLeaseLostError,
     SessionStore,
 )
 
@@ -50,7 +47,7 @@ def test_session_store_persists_latest_boundary_and_failure_state(
     tmp_path: Path,
 ) -> None:
     project = ProjectIdentity.from_workspace(tmp_path)
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
     session = store.create_session(project, session_id="session")
     store.append_messages(
         project,
@@ -77,7 +74,7 @@ def test_session_store_rejects_boundary_past_persisted_history(
     tmp_path: Path,
 ) -> None:
     project = ProjectIdentity.from_workspace(tmp_path)
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
     session = store.create_session(project, session_id="session")
 
     with pytest.raises(SessionDataError, match="exceeds"):
@@ -88,48 +85,11 @@ def test_session_store_rejects_boundary_past_persisted_history(
         )
 
 
-def test_compact_state_write_requires_current_session_lease(
-    tmp_path: Path,
-) -> None:
-    project = ProjectIdentity.from_workspace(tmp_path)
-    store = SessionStore(tmp_path / "state.sqlite3")
-    session = store.create_session(
-        project,
-        session_id="session",
-        lease_owner_id="owner-a",
-    )
-    store.append_messages(
-        project,
-        session.id,
-        [
-            Message(role="user", content="old request"),
-            Message(role="assistant", content="old reply"),
-        ],
-        lease_owner_id="owner-a",
-    )
-
-    with pytest.raises(SessionLeaseLostError):
-        store.save_compact_state(
-            project,
-            session.id,
-            CompactState(boundary=compact_boundary()),
-            lease_owner_id="owner-b",
-        )
-
-    store.save_compact_state(
-        project,
-        session.id,
-        CompactState(boundary=compact_boundary()),
-        lease_owner_id="owner-a",
-    )
-    assert store.load_compact_state(project, session.id).boundary is not None
-
-
 def test_resume_rebuilds_compact_summary_plus_recent_tail(
     tmp_path: Path,
 ) -> None:
     project = ProjectIdentity.from_workspace(tmp_path)
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
     active = start_project_session(
         store,
         project,
@@ -170,11 +130,11 @@ def test_resume_rebuilds_compact_summary_plus_recent_tail(
     active.close()
 
 
-def test_invalid_compact_json_is_reset_under_lease_with_persisted_cooldown(
+def test_invalid_compact_json_is_reset_under_lifecycle_lock_with_persisted_cooldown(
     tmp_path: Path,
 ) -> None:
     project = ProjectIdentity.from_workspace(tmp_path)
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
     active = start_project_session(
         store,
         project,
@@ -184,15 +144,7 @@ def test_invalid_compact_json_is_reset_under_lease_with_persisted_cooldown(
     assert active is not None
     active.persist_message(Message(role="user", content="canonical history"))
     active.persist_compact_state(CompactState())
-    with sqlite3.connect(store.database_path) as connection:
-        connection.execute(
-            """
-            UPDATE session_compact_state
-            SET state_json = '{invalid-json'
-            WHERE session_id = ?
-            """,
-            (active.record.id,),
-        )
+    active.writer.layout.compact_path.write_text("{invalid-json")
 
     recovered = active.load_compact_state()
 
@@ -208,38 +160,6 @@ def test_invalid_compact_json_is_reset_under_lease_with_persisted_cooldown(
         Message(role="user", content="canonical history")
     ]
     active.close()
-
-
-def test_schema_v3_migrates_to_compact_state_table(tmp_path: Path) -> None:
-    database_path = tmp_path / "state.sqlite3"
-    with sqlite3.connect(database_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE sessions (
-                id TEXT PRIMARY KEY,
-                project_key TEXT NOT NULL,
-                workspace_root TEXT NOT NULL,
-                title TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
-        connection.execute("PRAGMA user_version = 3")
-
-    SessionStore(database_path)
-
-    with sqlite3.connect(database_path) as connection:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        table_count = connection.execute(
-            """
-            SELECT COUNT(*) FROM sqlite_master
-            WHERE type = 'table' AND name = 'session_compact_state'
-            """
-        ).fetchone()[0]
-    assert version == SESSION_SCHEMA_VERSION
-    assert table_count == 1
 
 
 class NeverSummaryClient:

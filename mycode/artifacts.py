@@ -1,12 +1,10 @@
 from collections.abc import Callable
 import codecs
-from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
 import stat
 import tempfile
 
@@ -19,7 +17,6 @@ from mycode.tool_result_format import (
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.session_lock import SessionLockTimeoutError
 from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
 from mycode.tools.bounds import clamp_positive_int_upper_bound
 
@@ -34,17 +31,11 @@ ARTIFACT_IO_CHUNK_BYTES = 64 * 1024
 ARTIFACT_IO_CHUNK_CHARS = 64 * 1024
 MAX_READABLE_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_ARTIFACT_REFERENCE_METADATA_CHARS = 2400
-DELETION_TRASH_DIRECTORY_NAME = "deletion-trash"
 
-ArtifactWriteGuard = Callable[[], AbstractContextManager[None]]
 ArtifactExternalizationFailureHandler = Callable[
     [str, str, str, Exception],
     str,
 ]
-
-
-class ArtifactCleanupError(RuntimeError):
-    pass
 
 
 class _ArtifactTooLargeError(RuntimeError):
@@ -66,7 +57,6 @@ class ToolResultArtifactStore:
 
     root: Path
     threshold_chars: int
-    write_guard: ArtifactWriteGuard | None = None
 
     def __post_init__(self) -> None:
         if self.threshold_chars < 1:
@@ -96,9 +86,7 @@ class ToolResultArtifactStore:
 
         digest = _sha256_text(content)
         artifact_path = self.root / f"{digest}.txt"
-        guard = nullcontext() if self.write_guard is None else self.write_guard()
-        with guard:
-            self._write_once(artifact_path, content, digest=digest)
+        self._write_once(artifact_path, content, digest=digest)
 
         parsed = parse_tool_result_content(content)
         reference_metadata: dict[str, object] = {
@@ -374,209 +362,6 @@ class ReadArtifactTool(PydanticTool[ReadArtifactArgs]):
         )
 
 
-def artifact_directory_for_session(
-    state_directory: Path,
-    *,
-    project_key: str,
-    session_id: str,
-) -> Path:
-    project_component = _validate_artifact_path_component(
-        project_key,
-        field_name="project_key",
-    )
-    session_component = _validate_artifact_path_component(
-        session_id,
-        field_name="session_id",
-    )
-    return (
-        state_directory.resolve(strict=False)
-        / "artifacts"
-        / project_component
-        / session_component
-    )
-
-
-def artifact_quarantine_directory(
-    state_directory: Path,
-    *,
-    deletion_id: str,
-) -> Path:
-    component = _validate_artifact_path_component(
-        deletion_id,
-        field_name="deletion_id",
-    )
-    return (
-        state_directory.resolve(strict=False)
-        / DELETION_TRASH_DIRECTORY_NAME
-        / component
-    )
-
-
-@dataclass(frozen=True)
-class ArtifactQuarantineResult:
-    had_artifacts: bool
-    quarantine_directory: Path
-
-
-def quarantine_session_artifacts(
-    state_directory: Path,
-    *,
-    project_key: str,
-    session_id: str,
-    deletion_id: str,
-) -> ArtifactQuarantineResult:
-    session_directory = validate_session_artifact_cleanup_target(
-        state_directory,
-        project_key=project_key,
-        session_id=session_id,
-    )
-    quarantine_directory = _validate_artifact_quarantine_target(
-        state_directory,
-        deletion_id=deletion_id,
-    )
-    source_exists = os.path.lexists(session_directory)
-    quarantine_exists = os.path.lexists(quarantine_directory)
-    if source_exists and quarantine_exists:
-        raise ArtifactCleanupError(
-            "Both the active and quarantined session artifact directories exist."
-        )
-    if quarantine_exists:
-        return ArtifactQuarantineResult(
-            had_artifacts=True,
-            quarantine_directory=quarantine_directory,
-        )
-    if not source_exists:
-        return ArtifactQuarantineResult(
-            had_artifacts=False,
-            quarantine_directory=quarantine_directory,
-        )
-
-    quarantine_directory.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        session_directory.replace(quarantine_directory)
-    except OSError as error:
-        raise ArtifactCleanupError(
-            "Failed to quarantine the session artifact directory."
-        ) from error
-    if os.path.lexists(session_directory) or not quarantine_directory.is_dir():
-        raise ArtifactCleanupError(
-            "Session artifact quarantine did not complete atomically."
-        )
-    _remove_empty_artifact_parents(session_directory)
-    return ArtifactQuarantineResult(
-        had_artifacts=True,
-        quarantine_directory=quarantine_directory,
-    )
-
-
-def delete_quarantined_artifacts(
-    state_directory: Path,
-    *,
-    deletion_id: str,
-) -> bool:
-    quarantine_directory = _validate_artifact_quarantine_target(
-        state_directory,
-        deletion_id=deletion_id,
-    )
-    if not os.path.lexists(quarantine_directory):
-        return False
-    try:
-        shutil.rmtree(quarantine_directory)
-    except FileNotFoundError:
-        return False
-    except OSError as error:
-        raise ArtifactCleanupError(
-            "Failed to delete the quarantined session artifact directory."
-        ) from error
-    if os.path.lexists(quarantine_directory):
-        raise ArtifactCleanupError(
-            "Quarantined session artifact directory still exists after deletion."
-        )
-    try:
-        quarantine_directory.parent.rmdir()
-    except OSError:
-        pass
-    return True
-
-
-def validate_session_artifact_cleanup_target(
-    state_directory: Path,
-    *,
-    project_key: str,
-    session_id: str,
-) -> Path:
-    try:
-        session_directory = artifact_directory_for_session(
-            state_directory,
-            project_key=project_key,
-            session_id=session_id,
-        )
-    except ValueError as error:
-        raise ArtifactCleanupError(
-            "Session artifact cleanup target is invalid."
-        ) from error
-
-    artifacts_directory = state_directory.resolve(strict=False) / "artifacts"
-    project_directory = session_directory.parent
-    if project_directory.parent != artifacts_directory:
-        raise ArtifactCleanupError(
-            "Session artifact cleanup target escaped its project directory."
-        )
-
-    for label, path in (
-        ("artifact root", artifacts_directory),
-        ("project artifact directory", project_directory),
-        ("session artifact directory", session_directory),
-    ):
-        if not os.path.lexists(path):
-            continue
-        try:
-            linked_or_reparse = _is_link_or_reparse_point(path)
-        except FileNotFoundError:
-            continue
-        if linked_or_reparse:
-            raise ArtifactCleanupError(
-                f"Refusing to delete through a linked {label}: {path}"
-            )
-        if not path.is_dir():
-            raise ArtifactCleanupError(
-                f"Expected {label} to be a directory: {path}"
-            )
-    return session_directory
-
-
-def delete_session_artifacts(
-    state_directory: Path,
-    *,
-    project_key: str,
-    session_id: str,
-) -> bool:
-    session_directory = validate_session_artifact_cleanup_target(
-        state_directory,
-        project_key=project_key,
-        session_id=session_id,
-    )
-    if not os.path.lexists(session_directory):
-        return False
-
-    try:
-        shutil.rmtree(session_directory)
-    except FileNotFoundError:
-        return False
-    except OSError as error:
-        raise ArtifactCleanupError(
-            f"Failed to delete session artifact directory: {session_directory}"
-        ) from error
-    if os.path.lexists(session_directory):
-        raise ArtifactCleanupError(
-            f"Session artifact directory still exists after deletion: "
-            f"{session_directory}"
-        )
-
-    _remove_empty_artifact_parents(session_directory)
-    return True
-
-
 def artifact_externalization_failure_content(
     *,
     tool_name: str,
@@ -606,20 +391,12 @@ def artifact_externalization_failure_content(
 
 
 def artifact_failure_reason(error: Exception) -> str:
-    if isinstance(error, SessionLockTimeoutError):
-        return "session_lock_timeout"
     if isinstance(error, PermissionError):
         return "permission_denied"
     if isinstance(error, FileNotFoundError):
         return "path_unavailable"
     if isinstance(error, UnicodeError):
         return "encoding_error"
-    if type(error).__name__ in {
-        "SessionDeletingError",
-        "SessionLeaseLostError",
-        "SessionNotFoundError",
-    }:
-        return "session_unavailable"
     if isinstance(error, OSError):
         return "artifact_io_error"
     if isinstance(error, RuntimeError):
@@ -651,19 +428,6 @@ def _bounded_optional_metadata(
     if omitted_count:
         selected["metadata_omitted_count"] = omitted_count
     return selected
-
-
-def _validate_artifact_path_component(value: str, *, field_name: str) -> str:
-    normalized = value.strip()
-    if (
-        normalized == ""
-        or normalized in {".", ".."}
-        or "/" in normalized
-        or "\\" in normalized
-        or "\x00" in normalized
-    ):
-        raise ValueError(f"{field_name} must be a single safe path component.")
-    return normalized
 
 
 def _is_link_or_reparse_point(path: Path) -> bool:
@@ -896,55 +660,6 @@ def _is_valid_artifact_failure_reference(
             for key, value in required_metadata.items()
         )
     )
-
-
-def _validate_artifact_quarantine_target(
-    state_directory: Path,
-    *,
-    deletion_id: str,
-) -> Path:
-    try:
-        quarantine_directory = artifact_quarantine_directory(
-            state_directory,
-            deletion_id=deletion_id,
-        )
-    except ValueError as error:
-        raise ArtifactCleanupError(
-            "Session artifact quarantine target is invalid."
-        ) from error
-    trash_root = state_directory.resolve(strict=False) / DELETION_TRASH_DIRECTORY_NAME
-    if quarantine_directory.parent != trash_root:
-        raise ArtifactCleanupError(
-            "Session artifact quarantine target escaped its root."
-        )
-    for label, path in (
-        ("artifact quarantine root", trash_root),
-        ("artifact quarantine directory", quarantine_directory),
-    ):
-        if not os.path.lexists(path):
-            continue
-        try:
-            linked_or_reparse = _is_link_or_reparse_point(path)
-        except FileNotFoundError:
-            continue
-        if linked_or_reparse:
-            raise ArtifactCleanupError(
-                f"Refusing to use a linked {label}: {path}"
-            )
-        if not path.is_dir():
-            raise ArtifactCleanupError(f"Expected {label} to be a directory: {path}")
-    return quarantine_directory
-
-
-def _remove_empty_artifact_parents(session_directory: Path) -> None:
-    for empty_parent in (
-        session_directory.parent,
-        session_directory.parent.parent,
-    ):
-        try:
-            empty_parent.rmdir()
-        except OSError:
-            break
 
 
 def _validate_reason_code(reason: str) -> str:

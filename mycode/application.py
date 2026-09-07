@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 
 from mycode.agent import AgentEvent, AgentStopReason
 from mycode.artifacts import (
-    ArtifactWriteGuard,
     ReadArtifactTool,
     ToolResultArtifactStore,
 )
@@ -52,17 +52,13 @@ def build_agent_runner(
     compact_state: CompactState | None = None,
     on_compact_state_changed: Callable[[CompactState], None] | None = None,
     artifact_directory: Path | None = None,
-    artifact_write_guard: ArtifactWriteGuard | None = None,
     memory_store: MemoryStore | None = None,
     subagent_observer: SubAgentObserver | None = None,
     llm_config: LLMConfig | None = None,
+    llm_session_id: str | None = None,
     observability_sink: ObservationSink | None = None,
 ) -> AgentRunner:
     """Assemble one Agent runtime without coupling it to a presentation layer."""
-    if (artifact_directory is None) != (artifact_write_guard is None):
-        raise ValueError(
-            "artifact_directory and artifact_write_guard must be provided together."
-        )
     workspace_root = Path.cwd() if workspace_path is None else workspace_path
     workspace = Workspace(workspace_root)
     project = ProjectIdentity.from_workspace(workspace.root)
@@ -77,11 +73,16 @@ def build_agent_runner(
         if llm_config is None
         else llm_config
     )
-    client = OpenAICompatibleLLMClient(config=config)
+    effective_llm_session_id = llm_session_id or uuid4().hex
+    client = OpenAICompatibleLLMClient(
+        config=config,
+        session_id=effective_llm_session_id,
+    )
     summary_client = OpenAICompatibleLLMClient(
         config=config,
         model=config.compact_model,
         thinking_enabled=False,
+        session_id=effective_llm_session_id,
     )
     context_budget = context_budget_from_config(config)
     memory_recall_policy = MemoryRecallPolicy(
@@ -92,6 +93,7 @@ def build_agent_runner(
         llm_client_factory=lambda: OpenAICompatibleLLMClient(
             config=config,
             model=config.subagent_model,
+            session_id=effective_llm_session_id,
         ),
         confirmer=confirmer,
         memory_store=effective_memory_store,
@@ -125,7 +127,6 @@ def build_agent_runner(
         else ToolResultArtifactStore(
             root=artifact_directory,
             threshold_chars=context_budget.tool_result_compression_threshold_chars,
-            write_guard=artifact_write_guard,
         )
     )
     extra_tools = []

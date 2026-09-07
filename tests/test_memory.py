@@ -1,3 +1,5 @@
+from mycode.project_storage import project_directory_name
+from mycode.project_storage import ProjectStorage
 import hashlib
 from pathlib import Path
 
@@ -63,7 +65,7 @@ def test_user_and_project_memories_use_separate_files(tmp_path: Path) -> None:
         tmp_path
         / "user-state"
         / "projects"
-        / store.project.key
+        / project_directory_name(store.project)
         / "MEMORY.md"
     )
     assert [entry.key for entry in store.list_entries()] == [
@@ -254,3 +256,13 @@ def test_atomic_write_leaves_no_temporary_files(tmp_path: Path) -> None:
 
     memory_directory = store.path_for_scope("project").parent
     assert [path.name for path in memory_directory.iterdir()] == ["MEMORY.md"]
+def test_project_memory_matches_project_storage_directory(tmp_path):
+    from mycode.project import ProjectIdentity
+    from mycode.memory import MemoryStore
+
+    project = ProjectIdentity.from_workspace(tmp_path)
+    base = tmp_path / "state"
+    memory = MemoryStore(project, base_directory=base)
+    storage = ProjectStorage.open(project, projects_root=base / "projects")
+    assert memory.path_for_scope("user") == base / "MEMORY.md"
+    assert memory.path_for_scope("project") == storage.project_directory / "MEMORY.md"

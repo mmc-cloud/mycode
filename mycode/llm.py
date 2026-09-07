@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 import json
 from time import perf_counter
 from typing import Any, Literal, Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from openai import OpenAI
@@ -11,6 +12,7 @@ from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.config import LLMConfig, ReasoningEffort
 from mycode.context_budget import TokenUsage
 from mycode.conversation import Conversation
+from mycode.error_handling import extract_provider_diagnostic
 from mycode.messages import Message
 from mycode.reasoning import ReasoningState
 
@@ -22,6 +24,27 @@ SDK_TIMEOUT = httpx.Timeout(
     write=30.0,
     pool=10.0,
 )
+_OPENCODE_GO_HOST = "opencode.ai"
+_OPENCODE_GO_PATHS = frozenset({"/zen/go", "/zen/go/v1"})
+
+
+def _is_opencode_go_base_url(base_url: str) -> bool:
+    try:
+        parsed = urlsplit(base_url)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.casefold() == _OPENCODE_GO_HOST
+        and parsed.username is None
+        and parsed.password is None
+        and port in {None, 443}
+        and parsed.path.rstrip("/") in _OPENCODE_GO_PATHS
+        and parsed.query == ""
+        and parsed.fragment == ""
+    )
 
 
 class LLMClient(Protocol):
@@ -49,6 +72,7 @@ class OpenAICompatibleLLMClient:
     model: str | None = None
     thinking_enabled: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
+    session_id: str | None = field(default=None, repr=False)
     _client: Any = field(default=None, repr=False)
     last_token_usage: TokenUsage | None = field(default=None, init=False)
     last_reasoning_char_count: int = field(default=0, init=False)
@@ -260,6 +284,11 @@ class OpenAICompatibleLLMClient:
             "messages": conversation.to_model_messages(),
             "stream": stream,
         }
+        if _is_opencode_go_base_url(self.config.base_url) and self.session_id:
+            request["extra_headers"] = {
+                "User-Agent": "mycode-agent",
+                "x-opencode-session": self.session_id,
+            }
         if tools:
             request["tools"] = _format_openai_tools(tools)
         if stream and self.config.stream_include_usage:
@@ -448,12 +477,19 @@ class _ModelResponseAccumulator:
         error: Exception | None = None,
     ) -> dict[str, object]:
         finished_at = perf_counter()
+        provider_diagnostic = (
+            None if error is None else extract_provider_diagnostic(error)
+        )
         if error is not None:
             self.error_type = type(error).__name__
         return {
             "model": self.model,
             "request_id": self.request_id,
-            "provider_request_id": self.provider_request_id,
+            "provider_request_id": (
+                self.provider_request_id
+                if provider_diagnostic is None
+                else self.provider_request_id or provider_diagnostic.request_id
+            ),
             "finish_reason": self.finish_reason,
             "stop_reason": self.stop_reason,
             "content_chars": self.content_chars,
@@ -475,6 +511,15 @@ class _ModelResponseAccumulator:
             "retry_count": _retry_count(error),
             "error_type": self.error_type,
             "http_status": _http_status(error),
+            "provider_error_code": (
+                None if provider_diagnostic is None else provider_diagnostic.code
+            ),
+            "provider_error_type": (
+                None if provider_diagnostic is None else provider_diagnostic.error_type
+            ),
+            "provider_error_message": (
+                None if provider_diagnostic is None else provider_diagnostic.message
+            ),
             "empty_response": (
                 self.content_non_whitespace_chars == 0 and not self.tool_names
             ),

@@ -1,7 +1,9 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import httpx
 import pytest
+from openai import BadRequestError
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessage
 
 from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
@@ -109,6 +111,121 @@ def test_openai_compatible_client_sends_model_and_messages() -> None:
         ],
         "stream": False,
     }
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["https://opencode.ai/zen/go", "https://opencode.ai/zen/go/v1"],
+)
+def test_opencode_go_requests_share_session_headers_and_keep_request_fields(
+    base_url: str,
+) -> None:
+    fake_sdk_client = FakeOpenAIClient(response_content="assistant reply")
+    client = OpenAICompatibleLLMClient(
+        config=LLMConfig(
+            api_key="test-key",
+            base_url=base_url,
+            model="test-model",
+            thinking_enabled=True,
+            reasoning_effort="max",
+            max_output_tokens=4096,
+        ),
+        session_id="session-123",
+        _client=fake_sdk_client,
+    )
+
+    client.complete(Conversation())
+    list(client.stream_complete(Conversation()))
+    list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
+
+    requests = fake_sdk_client.chat.completions.requests
+    assert len(requests) == 3
+    assert all(
+        request["extra_headers"]
+        == {
+            "User-Agent": "mycode-agent",
+            "x-opencode-session": "session-123",
+        }
+        for request in requests
+    )
+    assert requests[1]["stream"] is True
+    assert requests[1]["stream_options"] == {"include_usage": True}
+    assert requests[2]["tools"] == [
+        {"type": "function", "function": fake_tool_schema()}
+    ]
+    assert requests[2]["reasoning_effort"] == "max"
+    assert requests[2]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert requests[2]["max_tokens"] == 4096
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://example.com/v1",
+        "https://opencode.ai.example/zen/go/v1",
+        "https://opencode.ai/zen/other/v1",
+        "http://opencode.ai/zen/go/v1",
+    ],
+)
+def test_non_opencode_go_urls_do_not_send_session_header(base_url: str) -> None:
+    fake_sdk_client = FakeOpenAIClient(response_content="assistant reply")
+    client = OpenAICompatibleLLMClient(
+        config=LLMConfig(
+            api_key="test-key",
+            base_url=base_url,
+            model="test-model",
+        ),
+        session_id="session-123",
+        _client=fake_sdk_client,
+    )
+
+    client.complete(Conversation())
+
+    assert "extra_headers" not in fake_sdk_client.chat.completions.last_request
+
+
+def test_model_observation_keeps_only_safe_provider_diagnostic() -> None:
+    error = BadRequestError(
+        "unsafe raw error",
+        response=httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://opencode.ai/zen/go/v1"),
+        ),
+        body={
+            "error": {
+                "code": "MissingSessionID",
+                "type": "invalid_request_error",
+                "message": (
+                    "Request is missing x-opencode-session; "
+                    "Authorization: Bearer secret-token"
+                ),
+            }
+        },
+    )
+    fake_sdk_client = FakeOpenAIClient(
+        response_content="",
+        raised_error=error,
+    )
+    client = OpenAICompatibleLLMClient(
+        config=LLMConfig(
+            api_key="test-key",
+            base_url="https://opencode.ai/zen/go/v1",
+            model="test-model",
+        ),
+        session_id="session-123",
+        _client=fake_sdk_client,
+    )
+
+    with pytest.raises(BadRequestError):
+        client.complete(Conversation())
+
+    observation = client.last_model_response
+    assert observation is not None
+    assert observation["http_status"] == 400
+    assert observation["provider_error_code"] == "MissingSessionID"
+    assert observation["provider_error_type"] == "invalid_request_error"
+    assert "x-opencode-session" in observation["provider_error_message"]
+    assert "secret-token" not in repr(observation)
 
 
 def test_openai_compatible_client_can_override_configured_model() -> None:
@@ -600,6 +717,7 @@ class FakeOpenAIClient:
     stream_chunks: list[SimpleNamespace] | None = None
     response_choices: list[SimpleNamespace] | None = None
     response_usage: SimpleNamespace | None = None
+    raised_error: Exception | None = None
 
     def __post_init__(self) -> None:
         self.chat = SimpleNamespace(
@@ -610,6 +728,7 @@ class FakeOpenAIClient:
                 stream_chunks=self.stream_chunks,
                 response_choices=self.response_choices,
                 response_usage=self.response_usage,
+                raised_error=self.raised_error,
             )
         )
 
@@ -622,7 +741,9 @@ class FakeChatCompletions:
     stream_chunks: list[SimpleNamespace] | None = None
     response_choices: list[SimpleNamespace] | None = None
     response_usage: SimpleNamespace | None = None
+    raised_error: Exception | None = None
     last_request: dict | None = None
+    requests: list[dict] = field(default_factory=list, init=False)
 
     def create(
         self,
@@ -635,6 +756,7 @@ class FakeChatCompletions:
         reasoning_effort: str | None = None,
         max_tokens: int | None = None,
         extra_body: dict[str, object] | None = None,
+        extra_headers: dict[str, str] | None = None,
     ):
         self.last_request = {
             "model": model,
@@ -651,6 +773,11 @@ class FakeChatCompletions:
             self.last_request["max_tokens"] = max_tokens
         if extra_body is not None:
             self.last_request["extra_body"] = extra_body
+        if extra_headers is not None:
+            self.last_request["extra_headers"] = extra_headers
+        self.requests.append(dict(self.last_request))
+        if self.raised_error is not None:
+            raise self.raised_error
 
         if stream:
             if self.stream_chunks is not None:

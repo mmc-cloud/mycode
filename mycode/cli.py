@@ -2,6 +2,7 @@ import argparse
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from uuid import uuid4
 
 from mycode.agent import AgentEvent
 from mycode.application import (
@@ -34,7 +35,6 @@ from mycode.run_outcome import AgentRunOutcome
 from mycode.session import ChatSession
 from mycode.session_runtime import SessionStartRequest, start_project_session
 from mycode.session_store import (
-    SessionDatabaseCorruptionError,
     SessionInUseError,
     SessionNotFoundError,
     SessionStore,
@@ -55,11 +55,13 @@ EXIT_COMMANDS = {"/exit", "/quit"}
 
 def build_chat_session(llm_config: LLMConfig | None = None) -> ChatSession:
     config = load_llm_config() if llm_config is None else llm_config
-    client = OpenAICompatibleLLMClient(config=config)
+    session_id = uuid4().hex
+    client = OpenAICompatibleLLMClient(config=config, session_id=session_id)
     summary_client = OpenAICompatibleLLMClient(
         config=config,
         model=config.compact_model,
         thinking_enabled=False,
+        session_id=session_id,
     )
 
     return ChatSession(
@@ -232,18 +234,17 @@ def run_agent_command(
             input_func=input_func,
             output_func=output_func,
         )
-    except SessionDatabaseCorruptionError as error:
-        output_func(f"session> 严重错误：{error}")
-        return
     except (SessionNotFoundError, SessionInUseError) as error:
         output_func(f"session> 错误：{error}")
+        return
+    except SessionStoreError as error:
+        output_func(f"session> 严重错误：{error}")
         return
     if active_session is None:
         return
 
-    mcp_manager = MCPManager(MCPConfig(), observability_sink=observability_sink)
+    mcp_manager = None
     try:
-        active_session.start_heartbeat()
         confirmer = TerminalConfirmer(
             input_func=input_func,
             output_func=output_func,
@@ -251,10 +252,7 @@ def run_agent_command(
         subagent_observer = CompositeSubAgentObserver(
             observers=(
                 SessionSubAgentObserver(
-                    store=store,
-                    project=project,
-                    parent_session_id=active_session.record.id,
-                    lease_owner_id=active_session.lease_owner_id,
+                    session=active_session.writer,
                 ),
                 CliSubAgentObserver(output=output_func, mode=display_mode),
             )
@@ -306,9 +304,9 @@ def run_agent_command(
             compact_state=compact_state,
             on_compact_state_changed=active_session.persist_compact_state,
             artifact_directory=active_session.artifact_directory,
-            artifact_write_guard=active_session.artifact_write_guard,
             subagent_observer=subagent_observer,
             llm_config=config,
+            llm_session_id=active_session.record.id,
         )
         for tool in mcp_manager.tools:
             runner.tool_registry.register(tool)
@@ -338,7 +336,11 @@ def run_agent_command(
     else:
         active_session.close()
     finally:
-        mcp_manager.close()
+        try:
+            active_session.interrupt()
+        finally:
+            if mcp_manager is not None:
+                mcp_manager.close()
 
 
 def _run_agent_turn(

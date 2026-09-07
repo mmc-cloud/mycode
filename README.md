@@ -120,7 +120,7 @@ mycode --help
 mycode agent --help
 ```
 
-帮助命令也可以简写为 `-h`。`mycode agent` 启动 coding agent，`mycode chat` 启动不带 coding tools 的普通模型对话。会话默认保存在 `%USERPROFILE%\.mycode\state.sqlite3`，并按工作区路径区分项目。
+帮助命令也可以简写为 `-h`。`mycode agent` 启动 coding agent，`mycode chat` 启动不带 coding tools 的普通模型对话。会话默认保存在 `%USERPROFILE%\.mycode\projects\<workspace-basename>-<12-char-hash>\`，并按工作区路径区分项目；每个会话的数据位于该项目目录的 `sessions\<session-id>\` 下。
 
 ### Agent 会话启动方式
 

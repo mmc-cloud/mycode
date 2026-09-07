@@ -110,7 +110,7 @@ def test_context_budget_from_config_uses_token_window_and_reserves() -> None:
     assert budget.max_input_tokens == 176000
 
 
-def test_build_chat_session_routes_main_and_compact_models() -> None:
+def test_build_chat_session_routes_main_and_compact_models(monkeypatch) -> None:
     config = LLMConfig(
         api_key="test-key",
         base_url="https://example.com",
@@ -119,15 +119,30 @@ def test_build_chat_session_routes_main_and_compact_models() -> None:
         thinking_enabled=True,
         reasoning_effort="max",
     )
+    uuid_calls = 0
+
+    class FakeUUID:
+        hex = "chat-session-123"
+
+    def fake_uuid4():
+        nonlocal uuid_calls
+        uuid_calls += 1
+        return FakeUUID()
+
+    monkeypatch.setattr("mycode.cli.uuid4", fake_uuid4)
 
     session = build_chat_session(config)
 
+    assert uuid_calls == 1
     assert session.llm_client.model == "main-model"
     assert session.llm_client.thinking_enabled is True
     assert session.llm_client.reasoning_effort == "max"
+    assert session.llm_client.session_id == "chat-session-123"
     assert session.compactor is not None
     assert session.compactor.llm_client.model == "compact-model"
     assert session.compactor.llm_client.thinking_enabled is False
+    assert session.compactor.llm_client.session_id == session.llm_client.session_id
+    assert session.compactor.llm_client.session_id
 
 
 def test_main_prints_greeting(capsys) -> None:
@@ -936,21 +951,13 @@ def test_build_agent_runner_registers_session_scoped_artifact_reader(
     monkeypatch.setattr("mycode.application.load_llm_config", lambda **kwargs: config)
     artifact_directory = tmp_path / "state" / "artifacts" / "session"
 
-    with pytest.raises(ValueError, match="must be provided together"):
-        build_agent_runner(
-            workspace_path=tmp_path,
-            artifact_directory=artifact_directory,
-        )
-
     runner = build_agent_runner(
         workspace_path=tmp_path,
         artifact_directory=artifact_directory,
-        artifact_write_guard=nullcontext,
     )
 
     assert runner.tool_result_artifact_store is not None
     assert runner.tool_result_artifact_store.root == artifact_directory.resolve()
-    assert runner.tool_result_artifact_store.write_guard is nullcontext
     assert runner.tool_registry.require("read_artifact").name == "read_artifact"
 
 
@@ -1440,9 +1447,9 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
         compact_state=None,
         on_compact_state_changed=None,
         artifact_directory=None,
-        artifact_write_guard=None,
         subagent_observer=None,
         llm_config=None,
+        llm_session_id=None,
     ):
         captured["workspace_path"] = workspace_path
         captured["confirmer"] = confirmer
@@ -1451,20 +1458,21 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
         captured["compact_state"] = compact_state
         captured["on_compact_state_changed"] = on_compact_state_changed
         captured["artifact_directory"] = artifact_directory
-        captured["artifact_write_guard"] = artifact_write_guard
         captured["subagent_observer"] = subagent_observer
         captured["llm_config"] = llm_config
+        captured["llm_session_id"] = llm_session_id
         return FakeRunner(event_batches=[])
 
     monkeypatch.setattr("mycode.cli.build_agent_runner", fake_build_agent_runner)
 
+    store = SessionStore(tmp_path / "projects")
     run_agent_command(
         workspace_path=tmp_path,
         input_func=fake_input,
         output_func=fake_output,
         display_mode="debug",
         session_request=SessionStartRequest(mode="new"),
-        session_store=SessionStore(tmp_path / "state.sqlite3"),
+        session_store=store,
         llm_config=configured_llm(),
         mcp_config=MCPConfig(),
     )
@@ -1473,12 +1481,14 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
     assert confirmer.input_func is fake_input
     assert confirmer.output_func is fake_output
     assert captured["workspace_path"] == tmp_path.resolve()
+    assert captured["llm_session_id"] == store.list_sessions(
+        ProjectIdentity.from_workspace(tmp_path)
+    )[0].id
     assert captured["conversation_history"].get_messages() == []
     assert callable(captured["on_message_added"])
     assert captured["compact_state"].boundary is None
     assert callable(captured["on_compact_state_changed"])
     assert captured["artifact_directory"].is_absolute()
-    assert callable(captured["artifact_write_guard"])
     assert isinstance(captured["subagent_observer"], CompositeSubAgentObserver)
     cli_observer = captured["subagent_observer"].observers[1]
     assert cli_observer.mode == "debug"
@@ -1489,7 +1499,7 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
 def test_run_agent_command_persists_runner_messages_and_closes_session(
     tmp_path, monkeypatch
 ) -> None:
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
 
     class PersistingFakeRunner:
         instruction_sources = ()
@@ -1531,10 +1541,45 @@ def test_run_agent_command_persists_runner_messages_and_closes_session(
     ]
 
 
+def test_run_agent_command_reuses_session_id_when_resumed(tmp_path, monkeypatch) -> None:
+    store = SessionStore(tmp_path / "projects")
+    seen_llm_session_ids: list[str] = []
+
+    def fake_build_agent_runner(**kwargs):
+        seen_llm_session_ids.append(kwargs["llm_session_id"])
+        return FakeRunner(event_batches=[])
+
+    monkeypatch.setattr("mycode.cli.build_agent_runner", fake_build_agent_runner)
+    outputs: list[str] = []
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda prompt: "/exit",
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=store,
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+    project = ProjectIdentity.from_workspace(tmp_path)
+    session_id = store.list_sessions(project)[0].id
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda prompt: "/exit",
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="resume", session_id=session_id),
+        session_store=store,
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert seen_llm_session_ids == [session_id, session_id]
+
+
 def test_run_agent_command_marks_session_interrupted_on_unexpected_error(
     tmp_path, monkeypatch
 ) -> None:
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
 
     class FailingRunner:
         instruction_sources = ()
@@ -1569,7 +1614,7 @@ def test_run_agent_command_marks_session_interrupted_on_unexpected_error(
 def test_run_agent_command_marks_session_interrupted_on_keyboard_interrupt(
     tmp_path, monkeypatch
 ) -> None:
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
 
     class InterruptedRunner:
         instruction_sources = ()
@@ -1605,7 +1650,7 @@ def test_run_agent_command_marks_session_interrupted_on_keyboard_interrupt(
 
 
 def test_run_agent_command_reports_session_owned_by_another_agent(tmp_path) -> None:
-    store = SessionStore(tmp_path / "state.sqlite3")
+    store = SessionStore(tmp_path / "projects")
     project = ProjectIdentity.from_workspace(tmp_path)
     first = start_project_session(
         store,
@@ -1624,14 +1669,13 @@ def test_run_agent_command_reports_session_owned_by_another_agent(tmp_path) -> N
             mode="resume",
             session_id=first.record.id,
         ),
-        session_store=SessionStore(store.database_path),
+        session_store=SessionStore(store.projects_root),
         llm_config=configured_llm(),
         mcp_config=MCPConfig(),
     )
 
     assert outputs == [
-        f"session> 错误：Session is already in use by another agent: "
-        f"{first.record.id}"
+        "session> 错误：Session is in use by another owner."
     ]
     assert store.get_session(project, first.record.id).status == "active"
     first.close()

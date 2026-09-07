@@ -7,6 +7,7 @@ import tempfile
 from typing import Literal
 
 from mycode.project import ProjectIdentity
+from mycode.project_storage import project_directory_name
 
 
 MemoryScope = Literal["user", "project"]
@@ -153,7 +154,7 @@ class MemoryStore:
         return (
             self.base_directory
             / "projects"
-            / self.project.key
+            / project_directory_name(self.project)
             / "MEMORY.md"
         )
 

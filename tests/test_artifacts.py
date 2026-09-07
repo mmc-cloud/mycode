@@ -10,7 +10,6 @@ import mycode.artifacts as artifacts_module
 from mycode.artifacts import (
     ARTIFACT_IO_CHUNK_BYTES,
     ARTIFACT_EXTERNALIZATION_FAILURE_MARKER,
-    ArtifactCleanupError,
     DEFAULT_ARTIFACT_READ_CHARS,
     EXTERNALIZED_TOOL_RESULT_MARKER,
     MAX_ARTIFACT_READ_CHARS,
@@ -18,8 +17,6 @@ from mycode.artifacts import (
     ReadArtifactArgs,
     ReadArtifactTool,
     ToolResultArtifactStore,
-    artifact_directory_for_session,
-    delete_session_artifacts,
 )
 from mycode.context_budget import (
     ContextBudget,
@@ -381,13 +378,9 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
 ) -> None:
     rehydrates = _record_rehydrates(monkeypatch)
     project = ProjectIdentity.from_workspace(tmp_path)
-    session_store = SessionStore(tmp_path / "state.sqlite3")
+    session_store = SessionStore(tmp_path / "projects")
     session = session_store.create_session(project, session_id="artifact-contract")
-    artifact_root = artifact_directory_for_session(
-        session_store.database_path.parent,
-        project_key=project.key,
-        session_id=session.id,
-    )
+    artifact_root = session_store.project_storage(project).session(session.id).artifacts_directory
     artifact_store = ToolResultArtifactStore(
         root=artifact_root,
         threshold_chars=50,
@@ -659,7 +652,7 @@ def test_runner_downgrades_latest_group_without_reprojecting(
 
 
 def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     tool_call = AgentToolCall(
         id="call-large",
@@ -677,10 +670,10 @@ def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
         ],
     )
 
-    @contextmanager
-    def denied_write():
+    def denied_write(*args, **kwargs):
         raise PermissionError("sensitive operating-system detail")
-        yield
+
+    monkeypatch.setattr(ToolResultArtifactStore, "_write_once", denied_write)
 
     runner = AgentRunner(
         llm_client=client,
@@ -688,7 +681,6 @@ def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
         tool_result_artifact_store=ToolResultArtifactStore(
             root=tmp_path / "artifacts",
             threshold_chars=50,
-            write_guard=denied_write,
         ),
     )
 
@@ -715,7 +707,7 @@ def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
 
 
 def test_runner_emits_artifact_warning_without_leaking_it(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch,
 ) -> None:
     tool_call = AgentToolCall(
         id="call-large",
@@ -734,10 +726,10 @@ def test_runner_emits_artifact_warning_without_leaking_it(
         ],
     )
 
-    @contextmanager
-    def denied_write():
+    def denied_write(*args, **kwargs):
         raise PermissionError("sensitive operating-system detail")
-        yield
+
+    monkeypatch.setattr(ToolResultArtifactStore, "_write_once", denied_write)
 
     runner = AgentRunner(
         llm_client=client,
@@ -745,7 +737,6 @@ def test_runner_emits_artifact_warning_without_leaking_it(
         tool_result_artifact_store=ToolResultArtifactStore(
             root=tmp_path / "artifacts",
             threshold_chars=50,
-            write_guard=denied_write,
         ),
     )
 
@@ -765,100 +756,6 @@ def test_runner_emits_artifact_warning_without_leaking_it(
         for event in next_events
     )
     assert runner._pending_artifact_warnings == []
-
-
-def test_delete_session_artifacts_removes_only_the_exact_session_tree(
-    tmp_path: Path,
-) -> None:
-    state_directory = tmp_path / "state"
-    project_key = "a" * 64
-    target_directory = artifact_directory_for_session(
-        state_directory,
-        project_key=project_key,
-        session_id="target-session",
-    )
-    other_directory = artifact_directory_for_session(
-        state_directory,
-        project_key=project_key,
-        session_id="other-session",
-    )
-    (target_directory / "nested").mkdir(parents=True)
-    (target_directory / "nested" / "result.txt").write_text(
-        "target",
-        encoding="utf-8",
-    )
-    other_directory.mkdir(parents=True)
-    (other_directory / "result.txt").write_text("other", encoding="utf-8")
-
-    removed = delete_session_artifacts(
-        state_directory,
-        project_key=project_key,
-        session_id="target-session",
-    )
-    removed_again = delete_session_artifacts(
-        state_directory,
-        project_key=project_key,
-        session_id="target-session",
-    )
-
-    assert removed is True
-    assert removed_again is False
-    assert not target_directory.exists()
-    assert (other_directory / "result.txt").read_text(encoding="utf-8") == "other"
-
-
-@pytest.mark.parametrize(
-    ("project_key", "session_id"),
-    [
-        ("../outside", "session"),
-        ("a" * 64, "../outside"),
-        ("a" * 64, r"..\outside"),
-        ("a" * 64, "."),
-    ],
-)
-def test_artifact_directory_rejects_unsafe_path_components(
-    tmp_path: Path,
-    project_key: str,
-    session_id: str,
-) -> None:
-    with pytest.raises(ValueError, match="safe path component"):
-        artifact_directory_for_session(
-            tmp_path,
-            project_key=project_key,
-            session_id=session_id,
-        )
-
-
-def test_delete_session_artifacts_refuses_linked_cleanup_target(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    state_directory = tmp_path / "state"
-    project_key = "b" * 64
-    target_directory = artifact_directory_for_session(
-        state_directory,
-        project_key=project_key,
-        session_id="target-session",
-    )
-    target_directory.mkdir(parents=True)
-    artifact_file = target_directory / "result.txt"
-    artifact_file.write_text("keep", encoding="utf-8")
-    original_check = artifacts_module._is_link_or_reparse_point
-
-    monkeypatch.setattr(
-        artifacts_module,
-        "_is_link_or_reparse_point",
-        lambda path: path == target_directory or original_check(path),
-    )
-
-    with pytest.raises(ArtifactCleanupError, match="linked session artifact"):
-        delete_session_artifacts(
-            state_directory,
-            project_key=project_key,
-            session_id="target-session",
-        )
-
-    assert artifact_file.read_text(encoding="utf-8") == "keep"
 
 
 class LargeToolArgs(ToolArgs):

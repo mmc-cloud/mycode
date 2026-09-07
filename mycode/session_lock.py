@@ -2,7 +2,6 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
-import hashlib
 import os
 from pathlib import Path
 import time
@@ -11,7 +10,6 @@ from typing import BinaryIO
 
 DEFAULT_SESSION_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_SESSION_LOCK_POLL_SECONDS = 0.05
-SESSION_LOCK_STRIPE_COUNT = 64
 
 
 class SessionLockError(RuntimeError):
@@ -23,8 +21,8 @@ class SessionLockTimeoutError(SessionLockError):
 
 
 @dataclass(frozen=True)
-class SessionOperationLock:
-    """Small cross-process exclusive lock backed by a stable control file."""
+class SessionLifecycleLock:
+    """Exclusive OS lock held for the complete lifetime of one session owner."""
 
     path: Path
     timeout_seconds: float = DEFAULT_SESSION_LOCK_TIMEOUT_SECONDS
@@ -35,62 +33,67 @@ class SessionOperationLock:
             raise ValueError("timeout_seconds must be at least 0.")
         if self.poll_seconds <= 0:
             raise ValueError("poll_seconds must be above 0.")
-        object.__setattr__(self, "path", self.path.resolve(strict=False))
+        raw_path = Path(self.path)
+        if raw_path.is_symlink():
+            raise SessionLockError("Session lifecycle lock file cannot be a symlink.")
+        object.__setattr__(
+            self,
+            "path",
+            raw_path.parent.resolve(strict=False) / raw_path.name,
+        )
 
     @contextmanager
     def acquire(self) -> Iterator[None]:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a+b") as stream:
-            _ensure_lock_byte(stream)
-            deadline = time.monotonic() + self.timeout_seconds
-            while True:
-                try:
-                    _lock_stream(stream)
-                    break
-                except OSError as error:
-                    if not _is_lock_contention(error):
-                        raise SessionLockError(
-                            f"Failed to acquire session operation lock: {self.path}"
-                        ) from error
-                    if time.monotonic() >= deadline:
-                        raise SessionLockTimeoutError(
-                            "Timed out waiting for another session operation to finish."
-                        ) from error
-                    time.sleep(
-                        min(
-                            self.poll_seconds,
-                            max(0.0, deadline - time.monotonic()),
-                        )
-                    )
-
-            try:
-                yield
-            finally:
-                try:
-                    _unlock_stream(stream)
-                except OSError as error:
-                    raise SessionLockError(
-                        f"Failed to release session operation lock: {self.path}"
-                    ) from error
+        with _acquire_lifecycle_lock(
+            self.path,
+            timeout_seconds=self.timeout_seconds,
+            poll_seconds=self.poll_seconds,
+        ):
+            yield
 
 
-def session_operation_lock_path(
-    state_directory: Path,
+@contextmanager
+def _acquire_lifecycle_lock(
+    path: Path,
     *,
-    project_key: str,
-    session_id: str,
-) -> Path:
-    identity = f"{project_key}\0{session_id}".encode("utf-8")
-    stripe = hashlib.sha256(identity).digest()[0] % SESSION_LOCK_STRIPE_COUNT
-    return (
-        state_directory.resolve(strict=False)
-        / "locks"
-        / f"session-{stripe:02x}.lock"
-    )
+    timeout_seconds: float,
+    poll_seconds: float,
+) -> Iterator[None]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink():
+        raise SessionLockError("Session lifecycle lock file cannot be a symlink.")
+    with path.open("a+b") as stream:
+        _ensure_lock_byte(stream)
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            try:
+                _lock_stream(stream)
+                break
+            except OSError as error:
+                if not _is_lock_contention(error):
+                    raise SessionLockError(
+                        f"Failed to acquire session lifecycle lock: {path}"
+                    ) from error
+                if time.monotonic() >= deadline:
+                    raise SessionLockTimeoutError(
+                        "Timed out waiting for another session lifecycle owner to finish."
+                    ) from error
+                time.sleep(
+                    min(
+                        poll_seconds,
+                        max(0.0, deadline - time.monotonic()),
+                    )
+                )
 
-
-def database_maintenance_lock_path(state_directory: Path) -> Path:
-    return state_directory.resolve(strict=False) / "locks" / "database-maintenance.lock"
+        try:
+            yield
+        finally:
+            try:
+                _unlock_stream(stream)
+            except OSError as error:
+                raise SessionLockError(
+                    f"Failed to release session lifecycle lock: {path}"
+                ) from error
 
 
 def _ensure_lock_byte(stream: BinaryIO) -> None:

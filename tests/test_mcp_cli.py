@@ -54,7 +54,7 @@ def test_cli_displays_status_registers_snapshot_and_closes_manager(tmp_path, mon
         input_func=lambda prompt: "/quit",
         output_func=output.append,
         session_request=SessionStartRequest(mode="new"),
-        session_store=SessionStore(tmp_path / "state.sqlite3"),
+        session_store=SessionStore(tmp_path / "projects"),
         llm_config=LLMConfig(api_key="test", base_url="https://example.test/v1", model="test"),
         mcp_config=MCPConfig(),
     )
@@ -91,7 +91,7 @@ def test_agent_command_loads_mcp_config_for_workspace(tmp_path, monkeypatch) -> 
         input_func=lambda prompt: "/quit",
         output_func=lambda message: None,
         session_request=SessionStartRequest(mode="new"),
-        session_store=SessionStore(tmp_path / "state.sqlite3"),
+        session_store=SessionStore(tmp_path / "projects"),
         llm_config=LLMConfig(
             api_key="test",
             base_url="https://example.test/v1",
@@ -166,7 +166,7 @@ def test_rejected_project_mcp_never_reaches_manager_start(tmp_path, monkeypatch)
         input_func=reject,
         output_func=lambda message: None,
         session_request=SessionStartRequest(mode="new"),
-        session_store=SessionStore(tmp_path / "state.sqlite3"),
+        session_store=SessionStore(tmp_path / "projects"),
         llm_config=LLMConfig(
             api_key="test",
             base_url="https://example.test/v1",
@@ -224,7 +224,7 @@ def test_explicit_mcp_config_bypasses_project_trust(tmp_path, monkeypatch) -> No
         input_func=lambda prompt: pytest.fail("must not prompt"),
         output_func=lambda message: None,
         session_request=SessionStartRequest(mode="new"),
-        session_store=SessionStore(tmp_path / "state.sqlite3"),
+        session_store=SessionStore(tmp_path / "projects"),
         llm_config=LLMConfig(
             api_key="test",
             base_url="https://example.test/v1",

@@ -20,6 +20,7 @@ from openai import (
 from mycode.error_handling import (
     MAX_MODEL_RETRY_DELAY_SECONDS,
     classify_model_error,
+    extract_provider_diagnostic,
     format_model_error,
 )
 
@@ -184,6 +185,102 @@ def test_http_408_is_retryable_timeout() -> None:
     assert classified.code == "timeout"
     assert classified.retryable is True
     assert "HTTP 408" in classified.message
+
+
+def test_bad_request_format_includes_safe_provider_diagnostic() -> None:
+    error = BadRequestError(
+        "bad request",
+        response=response(400, headers={"x-request-id": "req-400"}),
+        body={
+            "error": {
+                "code": "MissingSessionID",
+                "message": "Request is missing x-opencode-session",
+            }
+        },
+    )
+
+    message = format_model_error(error, operation="模型请求失败")
+
+    assert "HTTP 400" in message
+    assert "MissingSessionID" in message
+    assert "x-opencode-session" in message
+    assert "request-id=req-400" in message
+
+
+def test_rate_limit_format_includes_provider_message_and_retry_after() -> None:
+    error = RateLimitError(
+        "rate limited",
+        response=response(429, headers={"Retry-After": "7"}),
+        body={"error": {"message": "Provider request rate exceeded"}},
+    )
+
+    message = format_model_error(error, operation="模型请求失败")
+
+    assert "HTTP 429" in message
+    assert "retry-after=7" in message
+    assert "Provider request rate exceeded" in message
+    assert classify_model_error(error).retry_after_seconds == 7.0
+
+
+def test_server_error_format_includes_provider_code_and_message() -> None:
+    error = InternalServerError(
+        "provider unavailable",
+        response=response(503),
+        body={
+            "failure": {
+                "code": "UpstreamUnavailable",
+                "type": "provider_error",
+                "message": "Upstream model is temporarily unavailable",
+            }
+        },
+    )
+
+    message = format_model_error(error, operation="模型请求失败")
+
+    assert "HTTP 503" in message
+    assert "UpstreamUnavailable" in message
+    assert "provider_error" in message
+    assert "Upstream model is temporarily unavailable" in message
+
+
+def test_provider_diagnostic_redacts_secrets_and_bounds_plain_text() -> None:
+    error = BadRequestError(
+        "unsafe raw error",
+        response=response(
+            400,
+            headers={
+                "x-request-id": "req-sensitive",
+                "Authorization": "Bearer response-header-secret",
+            },
+        ),
+        body={
+            "error": {
+                "code": "InvalidRequest",
+                "message": (
+                    "Authorization: Bearer secret-token; "
+                    "API key=sk-super-secret; Cookie=session-secret; "
+                    + "x" * 600
+                ),
+            },
+            "Authorization": "Bearer body-secret",
+        },
+    )
+
+    diagnostic = extract_provider_diagnostic(error)
+    message = format_model_error(error, operation="模型请求失败")
+    rendered = repr((diagnostic, message))
+
+    assert diagnostic.request_id == "req-sensitive"
+    assert diagnostic.message is not None
+    assert len(diagnostic.message) <= 500
+    for secret in (
+        "secret-token",
+        "sk-super-secret",
+        "session-secret",
+        "response-header-secret",
+        "body-secret",
+    ):
+        assert secret not in rendered
 
 
 def test_rate_limit_quota_exhaustion_is_not_retryable() -> None:

@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
-from mycode.artifacts import (
+from mycode.context.artifacts import (
     ArtifactExternalizationFailureHandler,
     EXTERNALIZED_TOOL_RESULT_MARKER,
     ToolResultArtifactStore,
@@ -14,7 +14,7 @@ from mycode.artifacts import (
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.tool_result_format import (
+from mycode.context.tool_result_format import (
     COMPRESSED_TOOL_RESULT_MARKER,
     _compress_tool_result,
     _group_non_system_messages,
@@ -23,7 +23,7 @@ from mycode.tool_result_format import (
 )
 
 if TYPE_CHECKING:
-    from mycode.context_budget import ContextBudget
+    from mycode.context.budget import ContextBudget
 
 ToolGroup = tuple[Message, ...]
 

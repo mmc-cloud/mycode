@@ -7,7 +7,7 @@ from time import sleep
 
 from pydantic import ValidationError
 
-from mycode.agent import (
+from mycode.agent.events import (
     AgentEvent,
     AgentModelRetry,
     AgentModelResponse,
@@ -15,17 +15,17 @@ from mycode.agent import (
     AgentToolCall,
     AgentWarning,
 )
-from mycode.artifacts import (
+from mycode.context.artifacts import (
     ToolResultArtifactStore,
     artifact_externalization_failure_content,
     artifact_failure_reason,
     artifact_reference_info,
 )
-from mycode.context_compact import ConversationCompactor
-from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
-from mycode.context_builder import ContextBuilder
+from mycode.context.compact import ConversationCompactor
+from mycode.context.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
+from mycode.context.builder import ContextBuilder
 from mycode.error_handling import classify_model_error, format_model_error
-from mycode.context_budget import (
+from mycode.context.budget import (
     ContextBudget,
     ModelContext,
     TokenEstimator,
@@ -40,7 +40,7 @@ from mycode.messages import Message
 from mycode.observability import ObservationSink, emit_observation
 from mycode.skills import ActiveSkillState
 from mycode.reasoning import ReasoningState
-from mycode.run_progress import (
+from mycode.agent.progress import (
     DEFAULT_MAX_TURNS,
     MAIN_NEAR_LIMIT_PROMPT,
     MAIN_NEAR_LIMIT_REMAINING_TURNS,

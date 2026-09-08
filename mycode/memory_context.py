@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from typing import Protocol
 
-from mycode.context_budget import MemoryContextStats, TokenEstimator
+from mycode.context.budget import MemoryContextStats, TokenEstimator
 from mycode.memory import MemoryDocument, MemoryEntry, MemoryScope, MemoryStore
 from mycode.messages import Message
 

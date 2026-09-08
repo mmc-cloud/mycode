@@ -5,10 +5,10 @@ import sys
 
 import pytest
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.session_store import SessionStore, SessionDataError, SessionInUseError, SessionStoreError
+from mycode.persistence.session_store import SessionStore, SessionDataError, SessionInUseError, SessionStoreError
 
 
 def test_full_message_round_trip_and_project_isolation(tmp_path):
@@ -110,7 +110,7 @@ def test_cross_process_owner_crash_releases_lock(tmp_path):
     script = (
         "import sys\n"
         "from mycode.project import ProjectIdentity\n"
-        "from mycode.session_store import SessionStore\n"
+        "from mycode.persistence.session_store import SessionStore\n"
         f"store = SessionStore({str(tmp_path / 'projects')!r})\n"
         f"project = ProjectIdentity.from_workspace({str(tmp_path)!r})\n"
         "with store.open_session(project, 'one'):\n"

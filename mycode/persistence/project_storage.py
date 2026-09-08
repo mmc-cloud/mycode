@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import re
 
-from mycode.filesystem import (
+from mycode.persistence.filesystem import (
     JsonSnapshotError,
     StorageBoundaryError,
     ensure_storage_directory,

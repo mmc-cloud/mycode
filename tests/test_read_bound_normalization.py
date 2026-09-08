@@ -3,13 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from mycode.artifacts import (
+from mycode.context.artifacts import (
     MAX_ARTIFACT_READ_CHARS,
     ReadArtifactArgs,
     ReadArtifactTool,
     ToolResultArtifactStore,
 )
-from mycode.context_budget import parse_tool_result_content
+from mycode.context.budget import parse_tool_result_content
 from mycode.tools import (
     GlobArgs,
     GlobTool,

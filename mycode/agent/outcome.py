@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import json
 from typing import Literal, cast
 
-from mycode.agent import AgentStopReason
+from mycode.agent.events import AgentStopReason
 
 
 AgentRunStatus = Literal["completed", "task_incomplete", "runtime_failure"]

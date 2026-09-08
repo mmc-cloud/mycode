@@ -1,7 +1,7 @@
 import pytest
-from mycode.artifacts import ToolResultArtifactStore, ReadArtifactTool
+from mycode.context.artifacts import ToolResultArtifactStore, ReadArtifactTool
 from mycode.project import ProjectIdentity
-from mycode.session_store import SessionStore, SessionInUseError, SessionDataError
+from mycode.persistence.session_store import SessionStore, SessionInUseError, SessionDataError
 
 
 def test_delete_removes_all_session_data_but_preserves_lock_and_other_session(tmp_path):

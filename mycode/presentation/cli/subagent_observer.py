@@ -2,7 +2,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-from mycode.cli_presenter import CliDisplayMode
+from mycode.presentation.cli.presenter import CliDisplayMode
 from mycode.subagents.audit import SubAgentToolAudit
 from mycode.subagents.contracts import SubAgentTask
 from mycode.subagents.lifecycle import SubAgentStateTransition

@@ -2,8 +2,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 
-from mycode.context_budget import MemoryContextStats
-from mycode.session_store import WritableSession
+from mycode.context.budget import MemoryContextStats
+from mycode.persistence.session_store import WritableSession
 from mycode.subagents.audit import SubAgentToolAudit
 from mycode.subagents.contracts import SubAgentTask
 from mycode.subagents.lifecycle import SubAgentStateTransition

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from mycode.filesystem import (
+from mycode.persistence.filesystem import (
     JsonLinesCorruptionError,
     JsonSnapshotError,
     StorageBoundaryError,

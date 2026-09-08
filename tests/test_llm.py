@@ -6,9 +6,9 @@ import pytest
 from openai import BadRequestError
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessage
 
-from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.config import LLMConfig
-from mycode.context_budget import TokenUsage
+from mycode.context.budget import TokenUsage
 from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient, OpenAICompatibleLLMClient
 from mycode.messages import Message

@@ -8,9 +8,9 @@ from urllib.parse import urlsplit
 import httpx
 from openai import OpenAI
 
-from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.config import LLMConfig, ReasoningEffort
-from mycode.context_budget import TokenUsage
+from mycode.context.budget import TokenUsage
 from mycode.conversation import Conversation
 from mycode.error_handling import extract_provider_diagnostic
 from mycode.messages import Message

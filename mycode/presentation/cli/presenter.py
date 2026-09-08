@@ -3,7 +3,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal
 
-from mycode.agent import AgentEvent, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentToolCall
 from mycode.event_format import summarize_event_content, summarize_tool_arguments
 
 

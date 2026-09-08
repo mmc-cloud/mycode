@@ -7,9 +7,10 @@ import pytest
 from mycode.mcp.config import load_mcp_config_layers
 from mycode.mcp.manager import MCPManager
 from mycode.mcp.trust import (
-    apply_project_mcp_trust,
     project_mcp_fingerprint,
+    resolve_project_mcp_trust,
 )
+from mycode.presentation.cli.mcp_trust import TerminalMCPTrustConfirmer
 from mycode.project import ProjectIdentity
 
 
@@ -82,13 +83,16 @@ def decide(
     workspace = tmp_path / "workspace"
     project = ProjectIdentity.from_workspace(workspace)
     sink = [] if outputs is None else outputs
-    return apply_project_mcp_trust(
+    resolution = resolve_project_mcp_trust(
         loaded,
         project,
-        input_func=(lambda prompt: answer) if input_func is None else input_func,
-        output_func=sink.append,
+        confirmer=TerminalMCPTrustConfirmer(
+            input_func=(lambda prompt: answer) if input_func is None else input_func,
+            output_func=sink.append,
+        ),
         trust_file=tmp_path / "mcp-trust.json",
     )
+    return resolution.config
 
 
 def _legacy_stdio_fingerprint(loaded) -> str:

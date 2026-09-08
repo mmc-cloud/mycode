@@ -3,15 +3,15 @@ import json
 
 import pytest
 
-from mycode.agent import AgentToolCall
-from mycode.context_compact import CompactState
+from mycode.agent.events import AgentToolCall
+from mycode.context.compact import CompactState
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.project_storage import ProjectStorageError, validate_storage_component
-from mycode.session_runtime import SessionStartRequest, start_project_session
-from mycode.session_store import SessionStore, SessionStoreError
-import mycode.filesystem as filesystem
-import mycode.session_store as persistence
+from mycode.persistence.project_storage import ProjectStorageError, validate_storage_component
+from mycode.application.sessions import SessionStartRequest, start_project_session
+from mycode.persistence.session_store import SessionStore, SessionStoreError
+import mycode.persistence.filesystem as filesystem
+import mycode.persistence.session_store as persistence
 
 
 @pytest.mark.parametrize("tail", ["normal", "no-newline", "partial"])
@@ -36,7 +36,7 @@ def test_writable_startup_parses_once_and_load_history_uses_writer(tmp_path, mon
 
     monkeypatch.setattr(filesystem, "read_jsonl_records", counted_read)
     monkeypatch.setattr(persistence, "read_jsonl_records", counted_read)
-    active = start_project_session(store, project, request=SessionStartRequest(mode="resume", session_id="one"), output_func=lambda _: None)
+    active = start_project_session(store, project, request=SessionStartRequest(mode="resume", session_id="one"))
     try:
         assert active.load_history().get_messages() == history
         active.load_history().clear()

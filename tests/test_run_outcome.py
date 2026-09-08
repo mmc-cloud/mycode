@@ -1,6 +1,6 @@
 import pytest
 
-from mycode.run_outcome import AgentRunOutcome
+from mycode.agent.outcome import AgentRunOutcome
 
 
 @pytest.mark.parametrize("stop_reason", ["final_answer", "control_tool"])

@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.messages import Message
 from mycode.reasoning import ReasoningState
 

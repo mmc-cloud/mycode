@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
-from mycode.agent import AgentToolCall
-from mycode.runner import (
+from mycode.agent.events import AgentToolCall
+from mycode.agent.runner import (
     ToolBatchExecution,
     ToolCallExecution,
     append_tool_call_limit_failures,

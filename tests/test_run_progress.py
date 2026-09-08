@@ -2,7 +2,7 @@ import pytest
 
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.run_progress import (
+from mycode.agent.progress import (
     RESUME_PROMPT,
     RuntimeObservation,
     RuntimePolicy,

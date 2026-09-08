@@ -7,7 +7,7 @@ import tempfile
 from typing import Literal
 
 from mycode.project import ProjectIdentity
-from mycode.project_storage import project_directory_name
+from mycode.persistence.project_storage import project_directory_name
 
 
 MemoryScope = Literal["user", "project"]

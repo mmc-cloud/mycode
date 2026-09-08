@@ -5,8 +5,8 @@ import sys
 import pytest
 
 from mycode.project import ProjectIdentity
-from mycode.project_storage import ProjectStorage
-from mycode.session_lock import (
+from mycode.persistence.project_storage import ProjectStorage
+from mycode.persistence.session_lock import (
     SessionLifecycleLock,
     SessionLockError,
 )
@@ -31,7 +31,7 @@ def test_session_lifecycle_lock_is_exclusive_for_complete_owner_scope(
     lock_path = tmp_path / "project" / "locks" / "session-1.lock"
     script = (
         "from pathlib import Path\n"
-        "from mycode.session_lock import SessionLifecycleLock, "
+        "from mycode.persistence.session_lock import SessionLifecycleLock, "
         "SessionLockTimeoutError\n"
         f"lock = SessionLifecycleLock(Path({str(lock_path)!r}), "
         "timeout_seconds=0.1, poll_seconds=0.01)\n"

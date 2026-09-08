@@ -1,9 +1,13 @@
+"""Presentation-neutral project MCP trust resolution."""
+
+from __future__ import annotations
+
 import hashlib
 import json
 import os
-from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol
 from urllib.parse import urlsplit
 from uuid import uuid4
 
@@ -18,6 +22,7 @@ from mycode.mcp.config import (
     merge_mcp_configs,
 )
 from mycode.project import ProjectIdentity
+
 
 DEFAULT_MCP_TRUST_FILE = "mcp-trust.json"
 
@@ -36,6 +41,47 @@ class MCPTrustStore(BaseModel):
         ):
             raise ValueError("project keys and fingerprints must be SHA-256 digests")
         return value
+
+
+MCPTrustTransport = Literal["stdio", "streamable_http"]
+MCPTrustWarningCode = Literal["invalid_trust_store", "persistence_failed"]
+
+
+@dataclass(frozen=True)
+class MCPTrustServer:
+    """Safe, displayable project MCP information without secret values."""
+
+    alias: str
+    transport: MCPTrustTransport
+    command: str | None = None
+    args: tuple[str, ...] = ()
+    env_keys: tuple[str, ...] = ()
+    url_template: str | None = None
+    destination: str | None = None
+    header_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MCPTrustRequest:
+    servers: tuple[MCPTrustServer, ...]
+
+
+@dataclass(frozen=True)
+class MCPTrustWarning:
+    code: MCPTrustWarningCode
+    message: str
+
+
+@dataclass(frozen=True)
+class MCPTrustResolution:
+    config: MCPConfig
+    approved: bool | None = None
+    warnings: tuple[MCPTrustWarning, ...] = ()
+
+
+class MCPTrustConfirmer(Protocol):
+    def confirm(self, request: MCPTrustRequest) -> bool:
+        pass
 
 
 def default_mcp_trust_file() -> Path:
@@ -97,76 +143,115 @@ def project_mcp_fingerprint(loaded: MCPLoadedConfig) -> str | None:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def apply_project_mcp_trust(
+def resolve_project_mcp_trust(
     loaded: MCPLoadedConfig,
     project: ProjectIdentity,
     *,
-    input_func: Callable[[str], str] = input,
-    output_func: Callable[[str], None] = print,
+    confirmer: MCPTrustConfirmer,
     trust_file: str | Path | None = None,
-) -> MCPConfig:
+) -> MCPTrustResolution:
     fingerprint = project_mcp_fingerprint(loaded)
     if fingerprint is None:
-        return loaded.merged
+        return MCPTrustResolution(config=loaded.merged)
 
     path = default_mcp_trust_file() if trust_file is None else Path(trust_file)
     store, invalid = _read_trust_store(path)
+    warnings: list[MCPTrustWarning] = []
     if invalid:
-        output_func(
-            "MCP trust> 警告：信任状态文件无效；"
-            "项目级 MCP 将按未信任处理"
+        warning = MCPTrustWarning(
+            code="invalid_trust_store",
+            message=(
+                "MCP trust store is invalid; project MCP will be treated as untrusted."
+            ),
         )
+        warnings.append(warning)
+        _report_warning(confirmer, warning)
     if store.projects.get(project.key) == fingerprint:
-        return loaded.merged
+        return MCPTrustResolution(config=loaded.merged, warnings=tuple(warnings))
 
-    _show_trust_request(loaded, output_func)
-    try:
-        approved = input_func(
-            "MCP trust> 是否信任并启用这些项目级 MCP？[y/N] "
-        ).strip().lower() in {"y", "yes"}
-    except EOFError:
-        approved = False
-
+    approved = confirmer.confirm(_build_trust_request(loaded))
     if not approved:
-        output_func("MCP trust> 未启用项目级 MCP")
-        return merge_mcp_configs(loaded.user, MCPConfig())
+        return MCPTrustResolution(
+            config=merge_mcp_configs(loaded.user, MCPConfig()),
+            approved=False,
+            warnings=tuple(warnings),
+        )
 
     store.projects[project.key] = fingerprint
     try:
         _write_trust_store(path, store)
     except OSError:
-        output_func(
-            "MCP trust> 警告：信任状态未能保存；"
-            "本次仍会启用，下次将再次询问"
+        warning = MCPTrustWarning(
+            code="persistence_failed",
+            message=(
+                "MCP trust store could not be saved; this run remains enabled."
+            ),
         )
-    return loaded.merged
+        warnings.append(warning)
+        _report_warning(confirmer, warning)
+    return MCPTrustResolution(
+        config=loaded.merged,
+        approved=True,
+        warnings=tuple(warnings),
+    )
 
 
-def _show_trust_request(
+def apply_project_mcp_trust(
     loaded: MCPLoadedConfig,
-    output_func: Callable[[str], None],
-) -> None:
-    output_func("MCP trust> 项目配置请求启用以下 MCP Server：")
-    for alias, server in loaded.project_unresolved.mcp_servers.items():
-        output_func("")
-        output_func(f"server> {alias!r}")
-        output_func(f"transport> {server.transport}")
-        if isinstance(server, MCPStdioServerConfig):
-            output_func(f"command> {server.command!r}")
-            output_func(f"args> {server.args!r}")
-            if server.env:
-                output_func(f"env keys> {sorted(server.env)!r}")
-            continue
+    project: ProjectIdentity,
+    *,
+    confirmer: MCPTrustConfirmer,
+    trust_file: str | Path | None = None,
+) -> MCPConfig:
+    """Compatibility name for callers that only need the resolved config."""
 
+    return resolve_project_mcp_trust(
+        loaded,
+        project,
+        confirmer=confirmer,
+        trust_file=trust_file,
+    ).config
+
+
+def _build_trust_request(loaded: MCPLoadedConfig) -> MCPTrustRequest:
+    servers: list[MCPTrustServer] = []
+    for alias in sorted(loaded.project_unresolved.mcp_servers):
+        unresolved = loaded.project_unresolved.mcp_servers[alias]
         resolved = loaded.project.mcp_servers[alias]
-        if not isinstance(resolved, MCPStreamableHTTPServerConfig):
-            raise TypeError("MCP project config layers do not match")
-        output_func(f"url template> {_safe_url_template(server.url)!r}")
-        destination = _safe_http_destination(resolved.url)
-        if destination is not None:
-            output_func(f"destination> {destination!r}")
-        if server.headers:
-            output_func(f"header keys> {sorted(server.headers)!r}")
+        if isinstance(unresolved, MCPStdioServerConfig) and isinstance(
+            resolved, MCPStdioServerConfig
+        ):
+            servers.append(
+                MCPTrustServer(
+                    alias=alias,
+                    transport="stdio",
+                    command=unresolved.command,
+                    args=tuple(unresolved.args),
+                    env_keys=tuple(sorted(unresolved.env)),
+                )
+            )
+            continue
+        if isinstance(unresolved, MCPStreamableHTTPServerConfig) and isinstance(
+            resolved, MCPStreamableHTTPServerConfig
+        ):
+            servers.append(
+                MCPTrustServer(
+                    alias=alias,
+                    transport="streamable_http",
+                    url_template=_safe_url_template(unresolved.url),
+                    destination=_safe_http_destination(resolved.url),
+                    header_keys=tuple(sorted(unresolved.headers)),
+                )
+            )
+            continue
+        raise TypeError("MCP project config layers do not match")
+    return MCPTrustRequest(servers=tuple(servers))
+
+
+def _report_warning(confirmer: MCPTrustConfirmer, warning: MCPTrustWarning) -> None:
+    reporter = getattr(confirmer, "report_warning", None)
+    if reporter is not None:
+        reporter(warning)
 
 
 def _safe_url_template(url: str) -> str:

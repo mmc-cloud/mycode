@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.messages import Message
 
 

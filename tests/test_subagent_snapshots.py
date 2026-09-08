@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from pathlib import Path
 
-from mycode.context_budget import MemoryContextStats
+from mycode.context.budget import MemoryContextStats
 from mycode.instructions import (
     InstructionBundle,
     InstructionIssue,

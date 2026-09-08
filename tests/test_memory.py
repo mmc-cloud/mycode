@@ -1,5 +1,5 @@
-from mycode.project_storage import project_directory_name
-from mycode.project_storage import ProjectStorage
+from mycode.persistence.project_storage import project_directory_name
+from mycode.persistence.project_storage import ProjectStorage
 import hashlib
 from pathlib import Path
 
@@ -14,7 +14,7 @@ from mycode.memory import (
     validate_memory_content,
     validate_memory_key,
 )
-from mycode.session_store import ProjectIdentity
+from mycode.persistence.session_store import ProjectIdentity
 
 
 def memory_store(tmp_path: Path, *, limits: MemoryLimits | None = None) -> MemoryStore:

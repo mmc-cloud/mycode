@@ -14,17 +14,17 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from mycode.agent import AgentToolCall
-from mycode.context_compact import CompactState, DEFAULT_COMPACT_FAILURE_COOLDOWN_MESSAGES
+from mycode.agent.events import AgentToolCall
+from mycode.context.compact import CompactState, DEFAULT_COMPACT_FAILURE_COOLDOWN_MESSAGES
 from mycode.conversation import Conversation
-from mycode.filesystem import (
+from mycode.persistence.filesystem import (
     FilesystemStorageError, JsonSnapshotError, append_jsonl_record, prepare_jsonl_for_append,
     read_json_snapshot, read_jsonl_records, write_json_snapshot,
 )
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.project_storage import ProjectStorage, ProjectStorageError, validate_storage_component
-from mycode.session_lock import (
+from mycode.persistence.project_storage import ProjectStorage, ProjectStorageError, validate_storage_component
+from mycode.persistence.session_lock import (
     SessionLifecycleLock, SessionLockError, SessionLockTimeoutError,
 )
 

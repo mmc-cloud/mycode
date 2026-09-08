@@ -4,8 +4,8 @@ import json
 
 import pytest
 
-from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
-from mycode.context_budget import (
+from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.context.budget import (
     ContextBudget,
     ContextBudgetExceededError,
     MemoryContextStats,
@@ -14,8 +14,8 @@ from mycode.context_budget import (
     estimate_conversation,
     format_model_context_stats,
 )
-from mycode.context_builder import ContextBuilder
-from mycode.context_compact import (
+from mycode.context.builder import ContextBuilder
+from mycode.context.compact import (
     COMPACT_SUMMARY_MARKER,
     CompactBoundary,
     CompactPolicy,
@@ -25,7 +25,7 @@ from mycode.context_compact import (
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.runner import AgentRunner
+from mycode.agent.runner import AgentRunner
 from mycode.session import ChatSession
 from mycode.tools import ToolRegistry
 
@@ -553,7 +553,7 @@ def test_chat_session_uses_same_compact_summary_plus_recent_tail_model() -> None
     "status", ["not_needed", "compacted", "active", "failed", "cooldown", "circuit_open"]
 )
 def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tmp_path) -> None:
-    import mycode.context_builder as builder_module
+    import mycode.context.builder as builder_module
 
     summary_client = RecordingSummaryClient(
         responses=["invalid" if status == "failed" else summary_json("continue")],
@@ -607,7 +607,7 @@ def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tm
         client = RecordingAgentClient(
             usage=TokenUsage(prompt_tokens=50, completion_tokens=10, total_tokens=60)
         )
-        from mycode.artifacts import ToolResultArtifactStore
+        from mycode.context.artifacts import ToolResultArtifactStore
         owner = AgentRunner(
             llm_client=client, tool_registry=ToolRegistry(), conversation=history,
             compactor=compactor, context_budget=context_budget(2000),
@@ -645,7 +645,7 @@ def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tm
 def test_builder_assembles_memory_guidance_and_tools_before_final_budget(
     omit_memory, monkeypatch,
 ) -> None:
-    import mycode.context_builder as builder_module
+    import mycode.context.builder as builder_module
 
     history = conversation_with_tool_turn()
     memory = Message(role="system", content="memory " * (1000 if omit_memory else 1))
@@ -783,8 +783,8 @@ class RecordingChatClient:
 @pytest.mark.parametrize("reuse", [False, True])
 def test_retention_precedes_compact_and_budget_does_not_repeat_it(tmp_path, monkeypatch, reuse):
     from dataclasses import replace
-    from mycode.artifacts import ToolResultArtifactStore, EXTERNALIZED_TOOL_RESULT_MARKER
-    from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
+    from mycode.context.artifacts import ToolResultArtifactStore, EXTERNALIZED_TOOL_RESULT_MARKER
+    from mycode.context.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
 
     store = ToolResultArtifactStore(tmp_path / "a", 50)
     messages = conversation_with_tool_turn().get_messages()

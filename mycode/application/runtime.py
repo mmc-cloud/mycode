@@ -6,14 +6,14 @@ from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
-from mycode.agent import AgentEvent, AgentStopReason
-from mycode.artifacts import (
+from mycode.agent.events import AgentEvent, AgentStopReason
+from mycode.context.artifacts import (
     ReadArtifactTool,
     ToolResultArtifactStore,
 )
 from mycode.config import LLMConfig, load_llm_config
-from mycode.context_budget import ContextBudget
-from mycode.context_compact import CompactState, ConversationCompactor
+from mycode.context.budget import ContextBudget
+from mycode.context.compact import CompactState, ConversationCompactor
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.llm import OpenAICompatibleLLMClient
@@ -24,8 +24,8 @@ from mycode.observability import ObservationSink
 from mycode.permissions import Confirmer
 from mycode.project import ProjectIdentity
 from mycode.prompts import build_agent_system_prompt
-from mycode.run_outcome import AgentRunOutcome
-from mycode.runner import AgentRunner
+from mycode.agent.outcome import AgentRunOutcome
+from mycode.agent.runner import AgentRunner
 from mycode.skills import ActiveSkillState, SkillRegistry
 from mycode.subagents.delegate import DelegateTaskTool
 from mycode.subagents.delegation import DelegationToolBatchHandler

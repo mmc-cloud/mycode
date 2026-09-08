@@ -6,8 +6,8 @@ from mycode.cli import run_agent_command
 from mycode.config import LLMConfig
 from mycode.mcp.config import MCPConfig, MCPLoadedConfig
 from mycode.mcp.models import MCPServerStatus
-from mycode.session_runtime import SessionStartRequest
-from mycode.session_store import SessionStore
+from mycode.application.sessions import SessionStartRequest
+from mycode.persistence.session_store import SessionStore
 from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
 
 
@@ -43,9 +43,9 @@ def test_cli_displays_status_registers_snapshot_and_closes_manager(tmp_path, mon
     )
     manager.start = lambda: setattr(manager, "started", True)
     manager.close = lambda: setattr(manager, "closed", True)
-    monkeypatch.setattr("mycode.cli.MCPManager", lambda config, observability_sink=None: manager)
+    monkeypatch.setattr("mycode.application.agent_session.MCPManager", lambda config, observability_sink=None: manager)
     runner = SimpleNamespace(tool_registry=ToolRegistry())
-    monkeypatch.setattr("mycode.cli.build_agent_runner", lambda **kwargs: runner)
+    monkeypatch.setattr("mycode.application.agent_session.build_agent_runner", lambda **kwargs: runner)
     monkeypatch.setattr("mycode.cli.run_agent_loop", lambda **kwargs: None)
     output = []
 
@@ -151,7 +151,7 @@ def test_rejected_project_mcp_never_reaches_manager_start(tmp_path, monkeypatch)
         def close(self):
             pass
 
-    monkeypatch.setattr("mycode.cli.MCPManager", CapturingManager)
+    monkeypatch.setattr("mycode.application.agent_session.MCPManager", CapturingManager)
     loop_calls = []
     monkeypatch.setattr(
         "mycode.cli.run_agent_loop", lambda **kwargs: loop_calls.append(kwargs)
@@ -208,13 +208,13 @@ def test_explicit_mcp_config_bypasses_project_trust(tmp_path, monkeypatch) -> No
         def close(self):
             pass
 
-    monkeypatch.setattr("mycode.cli.MCPManager", CapturingManager)
+    monkeypatch.setattr("mycode.application.agent_session.MCPManager", CapturingManager)
     monkeypatch.setattr(
         "mycode.cli.load_mcp_config_layers",
         lambda **kwargs: pytest.fail("explicit config must bypass auto loading"),
     )
     monkeypatch.setattr(
-        "mycode.cli.apply_project_mcp_trust",
+        "mycode.cli.resolve_project_mcp_trust",
         lambda *args, **kwargs: pytest.fail("explicit config must bypass trust"),
     )
     monkeypatch.setattr("mycode.cli.run_agent_loop", lambda **kwargs: None)

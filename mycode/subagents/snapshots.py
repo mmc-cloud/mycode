@@ -4,7 +4,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from mycode.context_budget import MemoryContextStats
+from mycode.context.budget import MemoryContextStats
 from mycode.instructions import InstructionBundle, InstructionIssueCode, InstructionScope
 from mycode.memory import MemoryKind, MemoryScope
 from mycode.memory_context import MemoryRecall

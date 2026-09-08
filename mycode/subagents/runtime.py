@@ -6,11 +6,11 @@ import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from mycode.artifacts import ToolResultArtifactStore
+from mycode.context.artifacts import ToolResultArtifactStore
 from uuid import uuid4
 
-from mycode.agent import AgentEvent, AgentModelResponse
-from mycode.context_budget import ContextBudget, MemoryContextStats, TokenEstimator, TokenUsage
+from mycode.agent.events import AgentEvent, AgentModelResponse
+from mycode.context.budget import ContextBudget, MemoryContextStats, TokenEstimator, TokenUsage
 from mycode.conversation import Conversation
 from mycode.instructions import InstructionBundle, load_instruction_bundle
 from mycode.llm import LLMClient
@@ -19,7 +19,7 @@ from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
 from mycode.messages import Message
 from mycode.observability import ObservationSink
 from mycode.permissions import Confirmer, RejectingConfirmer
-from mycode.runner import (
+from mycode.agent.runner import (
     DEFAULT_REPEATED_TOOL_CALL_LIMIT,
     AgentRunner,
 )

@@ -2,7 +2,7 @@ from dataclasses import dataclass, field
 import json
 from typing import Literal
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.reasoning import ReasoningState, normalize_reasoning
 
 

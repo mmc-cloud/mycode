@@ -3,10 +3,10 @@ import sys
 
 import pytest
 
-from mycode.agent import AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentModelResponse, AgentToolCall
 from mycode.llm import FakeLLMClient
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
-from mycode.runner import AgentRunner
+from mycode.agent.runner import AgentRunner
 from mycode.tools import Workspace, create_default_tool_registry
 
 

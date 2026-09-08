@@ -3,11 +3,11 @@ import sys
 
 import pytest
 
-from mycode.agent import AgentModelResponse, AgentToolCall
-from mycode.confirmers import TerminalConfirmer
+from mycode.agent.events import AgentModelResponse, AgentToolCall
+from mycode.presentation.cli.confirmer import TerminalConfirmer
 from mycode.llm import FakeLLMClient
 from mycode.permissions import ConfirmationResult, PermissionDecision, ScopedApprovalState
-from mycode.runner import AgentRunner
+from mycode.agent.runner import AgentRunner
 from mycode.tools import ToolRegistry, Workspace
 from mycode.tools.write_file import WriteFileTool
 from mycode.tools.run_command import RunCommandTool
@@ -148,7 +148,7 @@ def test_task_cleanup_all_exits(tmp_path, ending):
                     stream.throw(KeyboardInterrupt())
                 break
             if ending == 'overflow':
-                from mycode.context_budget import ContextBudget
+                from mycode.context.budget import ContextBudget
                 runner.context_budget = ContextBudget(context_window_tokens=1, reserved_output_tokens=0, safety_margin_tokens=0)
     assert saw_grant
     if ending in {'final', 'error', 'max_turns', 'overflow'}:

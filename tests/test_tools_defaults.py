@@ -3,7 +3,7 @@ import sys
 
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
 from mycode.memory import MemoryStore
-from mycode.session_store import ProjectIdentity
+from mycode.persistence.session_store import ProjectIdentity
 from mycode.tools import Workspace, create_default_tool_registry, create_read_only_tool_registry
 from mycode.tools import GlobTool, GrepTool, ReadFileTool, ToolRegistry
 

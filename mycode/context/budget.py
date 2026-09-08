@@ -4,12 +4,12 @@ import math
 
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.tool_result_format import (
+from mycode.context.tool_result_format import (
     COMPRESSED_TOOL_RESULT_MARKER, TOOL_RESULT_METADATA_MARKER,
     ParsedToolResultContent, parse_tool_result_content, safe_tool_metadata,
     _group_non_system_messages, _flatten_groups, _count_compressed_tool_results,
 )
-from mycode.tool_result_retention import (
+from mycode.context.tool_result_retention import (
     ToolResultRetentionPolicy, RetentionProjection, ToolResultRetentionStats,
 )
 

@@ -6,8 +6,8 @@ import time
 
 import pytest
 
-from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
-from mycode.context_budget import ContextBudget
+from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.context.budget import ContextBudget
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.memory import MemoryStore
@@ -1061,7 +1061,7 @@ class SystemExitingLLM:
 
 def test_subagent_retention_restores_recent_and_isolates_artifact_roots(tmp_path, monkeypatch):
     from tempfile import TemporaryDirectory
-    from mycode.artifacts import EXTERNALIZED_TOOL_RESULT_MARKER, parse_tool_result_content
+    from mycode.context.artifacts import EXTERNALIZED_TOOL_RESULT_MARKER, parse_tool_result_content
     import mycode.subagents.runtime as module
 
     workspace = tmp_path / "workspace"

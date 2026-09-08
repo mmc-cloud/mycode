@@ -6,12 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from mycode.context_compact import CompactBoundary, CompactState, CompactSummary, DEFAULT_COMPACT_FAILURE_COOLDOWN_MESSAGES
+from mycode.context.compact import CompactBoundary, CompactState, CompactSummary, DEFAULT_COMPACT_FAILURE_COOLDOWN_MESSAGES
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.session_runtime import SessionStartRequest, start_project_session
-from mycode.session_store import SessionDataError, SessionInUseError, SessionStore, SessionStoreError
-import mycode.session_store as persistence
+from mycode.application.sessions import SessionStartRequest, start_project_session
+from mycode.persistence.session_store import SessionDataError, SessionInUseError, SessionStore, SessionStoreError
+import mycode.persistence.session_store as persistence
 
 
 @pytest.fixture
@@ -32,8 +32,9 @@ def test_orphans_and_non_session_entries_do_not_poison_select(session):
     assert session.store.get_session(session.project, "orphan") is None
     assert [r.id for r in session.store.list_sessions(session.project)] == ["one"]
     active = start_project_session(
-        session.store, session.project, request=SessionStartRequest(mode="select"),
-        input_func=lambda _: "1", output_func=lambda _: None,
+        session.store,
+        session.project,
+        request=SessionStartRequest(mode="resume", session_id="one"),
     )
     try:
         assert active.record.id == "one"
@@ -186,7 +187,7 @@ def test_writer_does_not_reset_compact_on_unrelated_error(session, monkeypatch, 
             target = session.layout.meta_path if damage == "meta" else session.storage.metadata_path
             target.write_text("bad")
         else:
-            from mycode.filesystem import JsonSnapshotError, StorageBoundaryError
+            from mycode.persistence.filesystem import JsonSnapshotError, StorageBoundaryError
 
             def fail_read(root, path):
                 if path == session.layout.compact_path:

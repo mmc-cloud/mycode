@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from mycode.project import ProjectIdentity
-from mycode.project_storage import (
+from mycode.persistence.project_storage import (
     PROJECT_HASH_LENGTH,
     ProjectMetadataError,
     ProjectStorage,

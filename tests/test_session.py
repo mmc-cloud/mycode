@@ -2,7 +2,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from mycode.context_budget import ContextBudget, ContextBudgetExceededError, TokenUsage
+from mycode.context.budget import ContextBudget, ContextBudgetExceededError, TokenUsage
 from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
 from mycode.messages import Message

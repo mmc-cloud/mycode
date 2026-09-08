@@ -1,4 +1,4 @@
-from mycode.confirmers import TerminalConfirmer
+from mycode.presentation.cli.confirmer import TerminalConfirmer
 from mycode.permissions import ConfirmationRequest, PermissionDecision, PermissionRequest
 
 

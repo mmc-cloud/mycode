@@ -8,15 +8,15 @@ import threading
 
 import pytest
 
-from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
-from mycode.session_store import SessionStore
-from mycode.filesystem import read_jsonl_records
-from mycode.subagents.cli_observer import CliSubAgentObserver
+from mycode.persistence.session_store import SessionStore
+from mycode.persistence.filesystem import read_jsonl_records
+from mycode.presentation.cli.subagent_observer import CliSubAgentObserver
 from mycode.subagents.delegate import DelegateTaskTool
 from mycode.subagents.delegation import DelegationToolBatchHandler
 from mycode.subagents.observability import CompositeSubAgentObserver

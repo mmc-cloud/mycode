@@ -5,9 +5,9 @@ from pathlib import Path
 
 import pytest
 
-from mycode.agent import AgentModelResponse, AgentToolCall
-import mycode.artifacts as artifacts_module
-from mycode.artifacts import (
+from mycode.agent.events import AgentModelResponse, AgentToolCall
+import mycode.context.artifacts as artifacts_module
+from mycode.context.artifacts import (
     ARTIFACT_IO_CHUNK_BYTES,
     ARTIFACT_EXTERNALIZATION_FAILURE_MARKER,
     DEFAULT_ARTIFACT_READ_CHARS,
@@ -18,7 +18,7 @@ from mycode.artifacts import (
     ReadArtifactTool,
     ToolResultArtifactStore,
 )
-from mycode.context_budget import (
+from mycode.context.budget import (
     ContextBudget,
     TOOL_RESULT_METADATA_MARKER,
     parse_tool_result_content,
@@ -27,8 +27,8 @@ from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.runner import AgentRunner
-from mycode.session_store import SessionStore
+from mycode.agent.runner import AgentRunner
+from mycode.persistence.session_store import SessionStore
 from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
 
 
@@ -818,7 +818,7 @@ def _record_rehydrates(monkeypatch):
 @pytest.mark.parametrize("finalization", [False, True])
 def test_turn_local_full_is_released_after_next_build(tmp_path, monkeypatch, finalization):
     import weakref
-    from mycode.context_builder import ContextBuilder
+    from mycode.context.builder import ContextBuilder
 
     rehydrates = _record_rehydrates(monkeypatch)
     handed_off = []
@@ -863,7 +863,7 @@ def test_turn_local_full_is_released_after_next_build(tmp_path, monkeypatch, fin
 def test_empty_response_retry_reuses_turn_local_full_only_within_turn(
     tmp_path, monkeypatch,
 ):
-    from mycode.context_builder import ContextBuilder
+    from mycode.context.builder import ContextBuilder
 
     seen_groups = []
     real_build = ContextBuilder.build
@@ -907,7 +907,7 @@ def test_empty_response_retry_reuses_turn_local_full_only_within_turn(
 
 def test_new_batch_replaces_unconsumed_turn_local_handoff(tmp_path, monkeypatch):
     import weakref
-    from mycode.runner import ToolBatchExecution, ToolCallExecution
+    from mycode.agent.runner import ToolBatchExecution, ToolCallExecution
 
     rehydrates = _record_rehydrates(monkeypatch)
     runner = AgentRunner(

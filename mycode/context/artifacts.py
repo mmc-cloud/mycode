@@ -10,7 +10,7 @@ import tempfile
 
 from pydantic import Field, field_validator
 
-from mycode.tool_result_format import (
+from mycode.context.tool_result_format import (
     TOOL_RESULT_METADATA_MARKER,
     parse_tool_result_content,
     safe_tool_metadata,

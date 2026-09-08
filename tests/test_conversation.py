@@ -1,6 +1,6 @@
 import pytest
 
-from mycode.agent import AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentModelResponse, AgentToolCall
 from mycode.conversation import Conversation
 from mycode.messages import Message
 

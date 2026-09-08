@@ -6,10 +6,10 @@ import time
 
 import pytest
 
-from mycode.agent import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.runner import (
+from mycode.agent.runner import (
     AgentRunner,
     DEFAULT_MAX_CONCURRENT_SAFE_TOOLS,
     DEFAULT_MAX_TOOL_CALLS_PER_RESPONSE,

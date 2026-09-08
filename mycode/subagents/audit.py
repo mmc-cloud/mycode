@@ -4,7 +4,7 @@ import json
 import math
 from typing import TypeAlias
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.tools.base import ToolResult
 
 

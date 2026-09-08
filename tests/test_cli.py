@@ -10,23 +10,27 @@ from mycode.cli import run_agent_command
 from mycode.cli import run_agent_loop
 from mycode.cli import run_chat_loop
 from mycode.event_format import summarize_tool_arguments
-from mycode.agent import (
+from mycode.agent.events import (
     AgentEvent,
     AgentModelRetry,
     AgentProgressSnapshot,
     AgentToolCall,
 )
-from mycode.context_budget import ContextBudget
+from mycode.context.budget import ContextBudget
 from mycode.config import LLMConfig
 from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
 from mycode.instructions import InstructionBundle, InstructionSource
 from mycode.messages import Message
 from mycode.mcp.config import MCPConfig
-from mycode.run_outcome import AgentRunOutcome
+from mycode.agent.outcome import AgentRunOutcome
 from mycode.session import ChatSession
-from mycode.session_runtime import SessionStartRequest, start_project_session
-from mycode.session_store import ProjectIdentity, SessionStore
+from mycode.application.sessions import SessionStartRequest, start_project_session
+from mycode.persistence.session_store import (
+    ProjectIdentity,
+    SessionInUseError,
+    SessionStore,
+)
 from mycode.subagents.delegate import DelegateTaskTool
 from mycode.subagents.delegation import DelegationToolBatchHandler
 from mycode.subagents.limits import (
@@ -85,7 +89,7 @@ def test_build_agent_runner_loads_config_for_workspace(tmp_path, monkeypatch) ->
         captured.update(kwargs)
         return configured_llm()
 
-    monkeypatch.setattr("mycode.application.load_llm_config", fake_load_llm_config)
+    monkeypatch.setattr("mycode.application.runtime.load_llm_config", fake_load_llm_config)
 
     build_agent_runner(workspace_path=tmp_path)
 
@@ -169,7 +173,7 @@ def test_main_prints_top_level_help(help_flag, capsys) -> None:
     assert captured.err == ""
 
 
-@pytest.mark.parametrize("command", ["agent", "chat"])
+@pytest.mark.parametrize("command", ["agent", "chat", "runtime"])
 def test_main_prints_subcommand_help_without_starting_runtime(
     command,
     monkeypatch,
@@ -192,6 +196,34 @@ def test_main_prints_subcommand_help_without_starting_runtime(
     assert error.value.code == 0
     assert f"usage: mycode {command}" in captured.out
     assert captured.err == ""
+
+
+@pytest.mark.parametrize(
+    ("args", "expected_request"),
+    [
+        (["runtime", "--jsonl"], None),
+        (["runtime", "--jsonl", "--new"], SessionStartRequest(mode="new")),
+        (["runtime", "--jsonl", "--continue"], SessionStartRequest(mode="continue")),
+        (
+            ["runtime", "--jsonl", "--resume", "session-1"],
+            SessionStartRequest(mode="resume", session_id="session-1"),
+        ),
+    ],
+)
+def test_main_runtime_passes_session_request_to_jsonl_adapter(
+    args,
+    expected_request,
+    monkeypatch,
+) -> None:
+    calls: list[object] = []
+    monkeypatch.setattr(
+        "mycode.cli.run_jsonl_runtime",
+        lambda *, session_request: calls.append(session_request) or 0,
+    )
+
+    main(args)
+
+    assert calls == [expected_request]
 
 
 def test_main_agent_help_explains_default_session_menu(capsys) -> None:
@@ -226,7 +258,7 @@ def test_main_agent_uses_agent_command(monkeypatch) -> None:
 
     main(["agent", "--verbose"])
 
-    assert calls == [(SessionStartRequest(mode="select"), "verbose")]
+    assert calls == [(None, "verbose")]
 
 
 @pytest.mark.parametrize(
@@ -267,7 +299,7 @@ def test_main_reports_startup_failure_without_traceback(
 @pytest.mark.parametrize(
     ("args", "expected"),
     [
-        (["agent"], (SessionStartRequest(mode="select"), "normal")),
+        (["agent"], (None, "normal")),
         (
             ["agent", "--debug", "--resume", "session-id"],
             (
@@ -887,7 +919,7 @@ def test_build_agent_runner_injects_loaded_instructions(
         thinking_enabled=True,
         reasoning_effort="max",
     )
-    monkeypatch.setattr("mycode.application.load_instruction_bundle", lambda root: bundle)
+    monkeypatch.setattr("mycode.application.runtime.load_instruction_bundle", lambda root: bundle)
 
     runner = build_agent_runner(workspace_path=tmp_path, llm_config=config)
 
@@ -948,7 +980,7 @@ def test_build_agent_runner_registers_session_scoped_artifact_reader(
         base_url="https://example.com/v1",
         model="test-model",
     )
-    monkeypatch.setattr("mycode.application.load_llm_config", lambda **kwargs: config)
+    monkeypatch.setattr("mycode.application.runtime.load_llm_config", lambda **kwargs: config)
     artifact_directory = tmp_path / "state" / "artifacts" / "session"
 
     runner = build_agent_runner(
@@ -987,7 +1019,7 @@ def test_build_agent_runner_restores_history_under_current_system_prompt(
         "mycode.instructions.default_user_instruction_directory",
         lambda: user_directory,
     )
-    monkeypatch.setattr("mycode.application.load_llm_config", lambda **kwargs: config)
+    monkeypatch.setattr("mycode.application.runtime.load_llm_config", lambda **kwargs: config)
 
     runner = build_agent_runner(
         workspace_path=workspace,
@@ -1450,6 +1482,7 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
         subagent_observer=None,
         llm_config=None,
         llm_session_id=None,
+        observability_sink=None,
     ):
         captured["workspace_path"] = workspace_path
         captured["confirmer"] = confirmer
@@ -1461,9 +1494,10 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
         captured["subagent_observer"] = subagent_observer
         captured["llm_config"] = llm_config
         captured["llm_session_id"] = llm_session_id
+        captured["observability_sink"] = observability_sink
         return FakeRunner(event_batches=[])
 
-    monkeypatch.setattr("mycode.cli.build_agent_runner", fake_build_agent_runner)
+    monkeypatch.setattr("mycode.application.agent_session.build_agent_runner", fake_build_agent_runner)
 
     store = SessionStore(tmp_path / "projects")
     run_agent_command(
@@ -1492,8 +1526,182 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
     assert isinstance(captured["subagent_observer"], CompositeSubAgentObserver)
     cli_observer = captured["subagent_observer"].observers[1]
     assert cli_observer.mode == "debug"
+    assert captured["observability_sink"] is None
     assert outputs[0].startswith("session> 已创建新会话 ")
     assert outputs[1:] == ["输入 /exit 或 /quit 退出。"]
+
+
+def test_run_agent_command_retries_default_menu_after_session_race(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    first_request = SessionStartRequest(mode="resume", session_id="raced")
+    second_request = SessionStartRequest(mode="new")
+    menu_requests = iter([first_request, second_request])
+    menu_calls: list[int] = []
+    start_requests: list[SessionStartRequest] = []
+    outputs: list[str] = []
+
+    class FakeApplicationSession:
+        runner = object()
+        compact_state_recovered = False
+        mcp_statuses = ()
+        active_project_session = type(
+            "ActiveSession",
+            (),
+            {
+                "created": True,
+                "record": type(
+                    "SessionRecord",
+                    (),
+                    {"id": "new-session", "title": "New session"},
+                )(),
+            },
+        )()
+
+        def close(self) -> None:
+            pass
+
+        def interrupt(self) -> None:
+            pass
+
+        def run_turn(self, content, *, event_handler=None):
+            return None
+
+    def fake_select_session_request(
+        store,
+        project,
+        *,
+        input_func,
+        output_func,
+    ):
+        menu_calls.append(len(menu_calls) + 1)
+        output_func(f"menu {len(menu_calls)}")
+        return next(menu_requests)
+
+    def fake_start_agent_application_session(*args, **kwargs):
+        request = kwargs["request"]
+        start_requests.append(request)
+        if len(start_requests) == 1:
+            raise SessionInUseError("Session is in use by another owner.")
+        return FakeApplicationSession()
+
+    monkeypatch.setattr(
+        "mycode.cli.select_session_request",
+        fake_select_session_request,
+    )
+    monkeypatch.setattr(
+        "mycode.cli.start_agent_application_session",
+        fake_start_agent_application_session,
+    )
+    monkeypatch.setattr(
+        "mycode.cli.run_agent_loop",
+        lambda **kwargs: outputs.append("agent loop"),
+    )
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        output_func=outputs.append,
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert menu_calls == [1, 2]
+    assert start_requests == [first_request, second_request]
+    assert outputs == [
+        "menu 1",
+        "session> 当前不可用：Session is in use by another owner.",
+        "menu 2",
+        "session> 已创建新会话 new-session",
+        "agent loop",
+    ]
+
+
+@pytest.mark.parametrize(
+    "session_request",
+    [
+        SessionStartRequest(mode="new"),
+        SessionStartRequest(mode="continue"),
+        SessionStartRequest(mode="resume", session_id="raced"),
+    ],
+)
+def test_run_agent_command_explicit_session_in_use_does_not_retry_menu(
+    tmp_path,
+    monkeypatch,
+    session_request,
+) -> None:
+    outputs: list[str] = []
+
+    def fail_start(*args, **kwargs):
+        raise SessionInUseError("Session is in use by another owner.")
+
+    monkeypatch.setattr(
+        "mycode.cli.start_agent_application_session",
+        fail_start,
+    )
+    monkeypatch.setattr(
+        "mycode.cli.select_session_request",
+        lambda **kwargs: pytest.fail("explicit mode must not open the menu"),
+    )
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        output_func=outputs.append,
+        session_request=session_request,
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert outputs == [
+        "session> 错误：Session is in use by another owner."
+    ]
+
+
+def test_run_agent_command_uses_cli_menu_when_request_is_omitted(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_select_session_request(
+        store,
+        project,
+        *,
+        input_func,
+        output_func,
+    ):
+        captured["store"] = store
+        captured["project"] = project
+        captured["input_func"] = input_func
+        captured["output_func"] = output_func
+        return SessionStartRequest(mode="new")
+
+    monkeypatch.setattr(
+        "mycode.cli.select_session_request",
+        fake_select_session_request,
+    )
+    monkeypatch.setattr(
+        "mycode.application.agent_session.build_agent_runner",
+        lambda **kwargs: FakeRunner(event_batches=[]),
+    )
+
+    outputs: list[str] = []
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: "/exit",
+        output_func=outputs.append,
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert captured["project"] == ProjectIdentity.from_workspace(tmp_path)
+    assert captured["input_func"] is not None
+    assert captured["output_func"] is not None
+    assert outputs[0].startswith("session> 已创建新会话 ")
+    assert outputs[1] == "输入 /exit 或 /quit 退出。"
 
 
 def test_run_agent_command_persists_runner_messages_and_closes_session(
@@ -1516,7 +1724,7 @@ def test_run_agent_command_persists_runner_messages_and_closes_session(
     def fake_build_agent_runner(**kwargs):
         return PersistingFakeRunner(kwargs["on_message_added"])
 
-    monkeypatch.setattr("mycode.cli.build_agent_runner", fake_build_agent_runner)
+    monkeypatch.setattr("mycode.application.agent_session.build_agent_runner", fake_build_agent_runner)
     inputs = iter(["persist this", "/exit"])
     outputs: list[str] = []
 
@@ -1549,7 +1757,7 @@ def test_run_agent_command_reuses_session_id_when_resumed(tmp_path, monkeypatch)
         seen_llm_session_ids.append(kwargs["llm_session_id"])
         return FakeRunner(event_batches=[])
 
-    monkeypatch.setattr("mycode.cli.build_agent_runner", fake_build_agent_runner)
+    monkeypatch.setattr("mycode.application.agent_session.build_agent_runner", fake_build_agent_runner)
     outputs: list[str] = []
     run_agent_command(
         workspace_path=tmp_path,
@@ -1589,7 +1797,7 @@ def test_run_agent_command_marks_session_interrupted_on_unexpected_error(
             raise RuntimeError("unexpected failure")
             yield
 
-    monkeypatch.setattr("mycode.cli.build_agent_runner", lambda **kwargs: FailingRunner())
+    monkeypatch.setattr("mycode.application.agent_session.build_agent_runner", lambda **kwargs: FailingRunner())
     inputs = iter(["trigger failure"])
     outputs: list[str] = []
 
@@ -1625,7 +1833,7 @@ def test_run_agent_command_marks_session_interrupted_on_keyboard_interrupt(
             yield
 
     monkeypatch.setattr(
-        "mycode.cli.build_agent_runner", lambda **kwargs: InterruptedRunner()
+        "mycode.application.agent_session.build_agent_runner", lambda **kwargs: InterruptedRunner()
     )
     outputs: list[str] = []
 
@@ -1656,7 +1864,6 @@ def test_run_agent_command_reports_session_owned_by_another_agent(tmp_path) -> N
         store,
         project,
         request=SessionStartRequest(mode="new"),
-        output_func=lambda message: None,
     )
     assert first is not None
     outputs: list[str] = []

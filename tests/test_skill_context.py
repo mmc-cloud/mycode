@@ -1,10 +1,10 @@
 import json
 from pathlib import Path
 
-from mycode.agent import AgentModelResponse, AgentToolCall
-from mycode.context_budget import ContextBudget, TokenEstimator
-from mycode.context_builder import ContextBuilder
-from mycode.context_compact import CompactPolicy, ConversationCompactor
+from mycode.agent.events import AgentModelResponse, AgentToolCall
+from mycode.context.budget import ContextBudget, TokenEstimator
+from mycode.context.builder import ContextBuilder
+from mycode.context.compact import CompactPolicy, ConversationCompactor
 from mycode.application import build_agent_runner
 from mycode.cli import run_agent_loop
 from mycode.config import LLMConfig
@@ -12,10 +12,10 @@ from mycode.conversation import Conversation
 from mycode.llm import FakeLLMClient
 from mycode.messages import Message
 from mycode.prompts import build_agent_system_prompt
-from mycode.runner import AgentRunner
+from mycode.agent.runner import AgentRunner
 from mycode.skills import ActiveSkillState, Skill, SkillRegistry
 from mycode.tools import LoadSkillTool, ToolRegistry
-from mycode.tool_result_retention import ToolResultRetentionPolicy
+from mycode.context.tool_result_retention import ToolResultRetentionPolicy
 
 
 def make_skill(tmp_path: Path, *, body: str = "PRIVATE SKILL PROCEDURE") -> Skill:
@@ -232,7 +232,7 @@ def test_build_agent_runner_wires_catalog_tools_and_shared_state(
     registry = SkillRegistry()
     registry.register(skill)
     monkeypatch.setattr(
-        "mycode.application.SkillRegistry.discover", lambda workspace_root: registry
+        "mycode.application.runtime.SkillRegistry.discover", lambda workspace_root: registry
     )
     runner = build_agent_runner(
         workspace_path=tmp_path,
@@ -258,7 +258,7 @@ def test_build_agent_runner_omits_catalog_and_tools_without_skills(
     tmp_path: Path, monkeypatch
 ) -> None:
     monkeypatch.setattr(
-        "mycode.application.SkillRegistry.discover",
+        "mycode.application.runtime.SkillRegistry.discover",
         lambda workspace_root: SkillRegistry(),
     )
     runner = build_agent_runner(

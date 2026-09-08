@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from mycode.confirmers import TerminalConfirmer
+from mycode.presentation.cli.confirmer import TerminalConfirmer
 from mycode.permissions import ConfirmationResult
 from mycode.skills import MAX_ACTIVE_SKILLS, ActiveSkillState, Skill, SkillRegistry
 from mycode.tools import (

@@ -1,10 +1,10 @@
 import sys
 from pathlib import Path
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.mcp.config import MCPConfig
 from mycode.mcp.manager import MCPManager
-from mycode.runner import execute_tool_batch
+from mycode.agent.runner import execute_tool_batch
 from mycode.tools import ToolRegistry
 
 

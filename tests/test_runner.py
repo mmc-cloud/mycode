@@ -6,13 +6,13 @@ import httpx
 import pytest
 from openai import APITimeoutError, BadRequestError
 
-from mycode.agent import (
+from mycode.agent.events import (
     AgentEvent,
     AgentModelResponse,
     AgentProgressSnapshot,
     AgentToolCall,
 )
-from mycode.context_budget import (
+from mycode.context.budget import (
     ContextBudget, MemoryContextStats, TokenUsage, estimate_conversation,
 )
 from mycode.conversation import Conversation
@@ -21,7 +21,7 @@ from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecall
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.runner import (
+from mycode.agent.runner import (
     AgentRunner,
     DEFAULT_MAX_CONCURRENT_SAFE_TOOLS,
     DEFAULT_MODEL_MAX_RETRIES,
@@ -35,7 +35,7 @@ from mycode.runner import (
     format_tool_result,
     _model_retry_delay,
 )
-from mycode.run_progress import MAIN_NEAR_LIMIT_PROMPT, MAX_TURNS_FINALIZATION_PROMPT
+from mycode.agent.progress import MAIN_NEAR_LIMIT_PROMPT, MAX_TURNS_FINALIZATION_PROMPT
 from mycode.permissions import ConfirmationResult, PermissionDecision
 from mycode.tools import (
     PydanticTool,
@@ -63,7 +63,7 @@ def test_model_retry_delay_uses_lightweight_attempt_backoff(monkeypatch) -> None
         ranges.append((low, high))
         return high
 
-    monkeypatch.setattr("mycode.runner.random.uniform", record_range)
+    monkeypatch.setattr("mycode.agent.runner.random.uniform", record_range)
 
     assert _model_retry_delay(1, None) == 3.0
     assert _model_retry_delay(2, None) == 6.0
@@ -1617,7 +1617,7 @@ def test_runner_streams_model_error_when_streaming_raises() -> None:
 def test_runner_retries_retryable_model_error_and_recovers(
     monkeypatch,
 ) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     observations: list[dict[str, object]] = []
     sleeps: list[float] = []
@@ -1685,7 +1685,7 @@ def test_runner_retries_retryable_model_error_and_recovers(
 
 
 def test_runner_exhausts_three_retryable_model_attempts(monkeypatch) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     observations: list[dict[str, object]] = []
     sleeps: list[float] = []
@@ -1744,7 +1744,7 @@ def test_runner_does_not_retry_non_retryable_or_unknown_model_error(
     error: Exception,
     monkeypatch,
 ) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     sleeps: list[float] = []
     client = ScriptedRetryLLMClient(tool_scripts=[([], error)])
@@ -1760,7 +1760,7 @@ def test_runner_does_not_retry_non_retryable_or_unknown_model_error(
 
 
 def test_runner_discards_partial_response_from_failed_attempt(monkeypatch) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     observations: list[dict[str, object]] = []
     client = ScriptedRetryLLMClient(
@@ -1799,7 +1799,7 @@ def test_runner_discards_partial_response_from_failed_attempt(monkeypatch) -> No
 
 
 def test_runner_never_executes_tool_call_from_failed_attempt(monkeypatch) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     tool_call = AgentToolCall(
         id="call_write",
@@ -1839,7 +1839,7 @@ def test_runner_never_executes_tool_call_from_failed_attempt(monkeypatch) -> Non
 
 
 def test_network_retry_is_independent_from_empty_response_retry(monkeypatch) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     client = ScriptedRetryLLMClient(
         tool_scripts=[
@@ -1874,7 +1874,7 @@ def test_network_retry_is_independent_from_empty_response_retry(monkeypatch) -> 
 
 
 def test_runner_stream_stops_after_max_turns(monkeypatch) -> None:
-    import mycode.context_builder as builder_module
+    import mycode.context.builder as builder_module
 
     requests = []
     real_budget = builder_module.budget_model_context
@@ -2109,7 +2109,7 @@ def test_runner_stream_reports_memory_counts_without_memory_content(
 
 @pytest.mark.parametrize("omit_memory", [False, True])
 def test_runner_budgets_guidance_and_memory_together(omit_memory, monkeypatch) -> None:
-    import mycode.context_builder as builder_module
+    import mycode.context.builder as builder_module
 
     history = Conversation.from_messages([
         Message(role="system", content="rules"),
@@ -2152,7 +2152,7 @@ def test_runner_budgets_guidance_and_memory_together(omit_memory, monkeypatch) -
 
 @pytest.mark.parametrize("overflow", [False, True])
 def test_finalization_budgets_complete_request_without_pretrimming(overflow, monkeypatch) -> None:
-    import mycode.context_builder as builder_module
+    import mycode.context.builder as builder_module
 
     history = Conversation.from_messages([
         Message(role="system", content="rules " * (1000 if overflow else 1)),
@@ -2185,7 +2185,7 @@ def test_finalization_budgets_complete_request_without_pretrimming(overflow, mon
 
 
 def test_max_turns_finalization_retries_and_recovers(monkeypatch) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     observations: list[dict[str, object]] = []
     client = ScriptedRetryLLMClient(
@@ -2225,7 +2225,7 @@ def test_max_turns_finalization_retries_and_recovers(monkeypatch) -> None:
 
 
 def test_max_turns_finalization_retry_exhausted(monkeypatch) -> None:
-    import mycode.runner as runner_module
+    import mycode.agent.runner as runner_module
 
     observations: list[dict[str, object]] = []
     client = ScriptedRetryLLMClient(

@@ -3,8 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from mycode.context_budget import ContextBudget, TokenEstimator
-from mycode.context_compact import (
+from mycode.context.budget import ContextBudget, TokenEstimator
+from mycode.context.compact import (
     COMPACT_SUMMARY_MARKER,
     DEFAULT_COMPACT_FAILURE_COOLDOWN_MESSAGES,
     CompactBoundary,
@@ -16,8 +16,8 @@ from mycode.context_compact import (
 from mycode.conversation import Conversation
 from mycode.messages import Message
 from mycode.project import ProjectIdentity
-from mycode.session_runtime import SessionStartRequest, start_project_session
-from mycode.session_store import (
+from mycode.application.sessions import SessionStartRequest, start_project_session
+from mycode.persistence.session_store import (
     SessionDataError,
     SessionStore,
 )
@@ -94,7 +94,6 @@ def test_resume_rebuilds_compact_summary_plus_recent_tail(
         store,
         project,
         request=SessionStartRequest(mode="new"),
-        output_func=lambda _message: None,
     )
     assert active is not None
     for message in (
@@ -139,7 +138,6 @@ def test_invalid_compact_json_is_reset_under_lifecycle_lock_with_persisted_coold
         store,
         project,
         request=SessionStartRequest(mode="new"),
-        output_func=lambda _message: None,
     )
     assert active is not None
     active.persist_message(Message(role="user", content="canonical history"))

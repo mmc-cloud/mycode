@@ -1,9 +1,9 @@
 from dataclasses import dataclass, field
 from collections.abc import Iterator
 
-from mycode.context_compact import ConversationCompactor
-from mycode.context_builder import ContextBuilder
-from mycode.context_budget import (
+from mycode.context.compact import ConversationCompactor
+from mycode.context.builder import ContextBuilder
+from mycode.context.budget import (
     ContextBudget,
     ContextBudgetExceededError,
     ModelContext,

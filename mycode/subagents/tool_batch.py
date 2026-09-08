@@ -4,8 +4,8 @@ import json
 
 from pydantic import ValidationError
 
-from mycode.agent import AgentModelResponse, AgentToolCall
-from mycode.runner import (
+from mycode.agent.events import AgentModelResponse, AgentToolCall
+from mycode.agent.runner import (
     ToolBatchExecution,
     ToolCallExecution,
     append_tool_call_limit_failures,

@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import TypeVar
 
-from mycode.agent import AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.tools.base import ToolResult
 
 

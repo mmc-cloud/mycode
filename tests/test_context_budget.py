@@ -2,8 +2,8 @@ import json
 
 import pytest
 
-from mycode.agent import AgentToolCall
-from mycode.context_budget import (
+from mycode.agent.events import AgentToolCall
+from mycode.context.budget import (
     ContextBudget,
     MemoryContextStats,
     TokenEstimator,

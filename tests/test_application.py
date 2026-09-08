@@ -1,10 +1,10 @@
 from uuid import uuid4
 
-from mycode.agent import AgentEvent
+from mycode.agent.events import AgentEvent
 from mycode.application import build_agent_runner, run_agent_turn
 from mycode.config import LLMConfig
-from mycode.run_outcome import AgentRunOutcome
-from mycode.runner import AgentRunner
+from mycode.agent.outcome import AgentRunOutcome
+from mycode.agent.runner import AgentRunner
 
 
 class EventRunner:
@@ -65,7 +65,7 @@ def test_build_agent_runner_generates_one_shared_fallback_session_id(
         calls += 1
         return uuid4()
 
-    monkeypatch.setattr("mycode.application.uuid4", counted_uuid4)
+    monkeypatch.setattr("mycode.application.runtime.uuid4", counted_uuid4)
 
     runner = build_agent_runner(
         workspace_path=tmp_path,

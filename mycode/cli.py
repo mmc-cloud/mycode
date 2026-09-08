@@ -4,17 +4,21 @@ from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
-from mycode.agent import AgentEvent
+from mycode.agent.events import AgentEvent
+from mycode.adapters.jsonl import run_jsonl_runtime
+from mycode.application.events import RuntimeEvent
 from mycode.application import (
-    build_agent_runner,
+    AgentApplicationSession,
     context_budget_from_config,
     run_agent_turn,
+    SessionStartRequest,
+    start_agent_application_session,
 )
-from mycode.confirmers import TerminalConfirmer
-from mycode.cli_presenter import CliDisplayMode, CliPresenter
+from mycode.presentation.cli.confirmer import TerminalConfirmer
+from mycode.presentation.cli.presenter import CliDisplayMode, CliPresenter
 from mycode.config import LLMConfig, load_llm_config
-from mycode.context_compact import ConversationCompactor
-from mycode.context_budget import (
+from mycode.context.compact import ConversationCompactor
+from mycode.context.budget import (
     ContextBudgetExceededError,
     format_model_context_stats,
 )
@@ -23,28 +27,24 @@ from mycode.conversation import Conversation
 from mycode.mcp import (
     MCPConfig,
     MCPConfigError,
-    MCPManager,
-    apply_project_mcp_trust,
     load_mcp_config_layers,
+    resolve_project_mcp_trust,
 )
 from mycode.observability import ObservationSink
 from mycode.llm import OpenAICompatibleLLMClient
 from mycode.project import ProjectIdentity
-from mycode.runner import AgentRunner
-from mycode.run_outcome import AgentRunOutcome
+from mycode.agent.runner import AgentRunner
+from mycode.agent.outcome import AgentRunOutcome
 from mycode.session import ChatSession
-from mycode.session_runtime import SessionStartRequest, start_project_session
-from mycode.session_store import (
+from mycode.persistence.session_store import (
     SessionInUseError,
     SessionNotFoundError,
     SessionStore,
     SessionStoreError,
 )
-from mycode.subagents.cli_observer import CliSubAgentObserver
-from mycode.subagents.observability import (
-    CompositeSubAgentObserver,
-)
-from mycode.subagents.persistence import SessionSubAgentObserver
+from mycode.presentation.cli.subagent_observer import CliSubAgentObserver
+from mycode.presentation.cli.session_menu import select_session_request
+from mycode.presentation.cli.mcp_trust import TerminalMCPTrustConfirmer
 from mycode.tools import (
     Workspace,
 )
@@ -165,9 +165,24 @@ def run_agent_loop(
     output_func: Callable[[str], None] = print,
     output_chunk_func: Callable[[str], None] | None = None,
     display_mode: CliDisplayMode = "normal",
+    *,
+    turn_func: Callable[..., AgentRunOutcome] | None = None,
 ) -> AgentRunOutcome | None:
     if output_chunk_func is None:
         output_chunk_func = _print_chunk
+    if turn_func is None:
+        def effective_turn_func(
+            content: str,
+            *,
+            event_handler: Callable[[AgentEvent], None],
+        ) -> AgentRunOutcome:
+            return run_agent_turn(
+                runner,
+                content,
+                event_handler=event_handler,
+            )
+    else:
+        effective_turn_func = turn_func
 
     presenter = CliPresenter(output=output_func, mode=display_mode)
 
@@ -200,6 +215,7 @@ def run_agent_loop(
             output_func=output_func,
             output_chunk_func=output_chunk_func,
             presenter=presenter,
+            turn_func=effective_turn_func,
         )
 
     return last_outcome
@@ -225,108 +241,130 @@ def run_agent_command(
         if llm_config is None
         else llm_config
     )
+    store = SessionStore() if session_store is None else session_store
+    effective_request = session_request
     try:
-        store = SessionStore() if session_store is None else session_store
-        active_session = start_project_session(
-            store,
-            project,
-            request=session_request,
-            input_func=input_func,
-            output_func=output_func,
-        )
+        if effective_request is None:
+            effective_request = select_session_request(
+                store,
+                project,
+                input_func=input_func,
+                output_func=output_func,
+            )
     except (SessionNotFoundError, SessionInUseError) as error:
         output_func(f"session> 错误：{error}")
         return
     except SessionStoreError as error:
         output_func(f"session> 严重错误：{error}")
         return
-    if active_session is None:
+    if effective_request is None:
         return
 
-    mcp_manager = None
     try:
-        confirmer = TerminalConfirmer(
-            input_func=input_func,
-            output_func=output_func,
-        )
-        subagent_observer = CompositeSubAgentObserver(
-            observers=(
-                SessionSubAgentObserver(
-                    session=active_session.writer,
-                ),
-                CliSubAgentObserver(output=output_func, mode=display_mode),
+        if mcp_config is None:
+            loaded_mcp_config = load_mcp_config_layers(
+                workspace_root=workspace.root
             )
-        )
-        conversation_history = active_session.load_history()
-        compact_state = active_session.load_compact_state()
-        if active_session.compact_state_recovered:
-            output_func(
-                "session> 警告：无效的 Compact 状态已重置；"
-                "已恢复完整历史并进入 Compact 冷却期"
+            trust_confirmer = TerminalMCPTrustConfirmer(
+                input_func=input_func,
+                output_func=output_func,
             )
+            trust_resolution = resolve_project_mcp_trust(
+                loaded_mcp_config,
+                project,
+                confirmer=trust_confirmer,
+            )
+            effective_mcp_config = trust_resolution.config
+        else:
+            effective_mcp_config = mcp_config
+    except MCPConfigError as error:
+        output_func("MCP servers:")
+        output_func(f"✗ config      {error}")
+        effective_mcp_config = MCPConfig()
+
+    confirmer = TerminalConfirmer(
+        input_func=input_func,
+        output_func=output_func,
+    )
+    cli_observer = CliSubAgentObserver(output=output_func, mode=display_mode)
+    interactive_session_selection = session_request is None
+    while True:
         try:
-            if mcp_config is None:
-                loaded_mcp_config = load_mcp_config_layers(
-                    workspace_root=workspace.root
-                )
-                effective_mcp_config = apply_project_mcp_trust(
-                    loaded_mcp_config,
+            application_session = start_agent_application_session(
+                store,
+                project,
+                request=effective_request,
+                mcp_config=effective_mcp_config,
+                confirmer=confirmer,
+                external_observer=cli_observer,
+                llm_config=config,
+                observability_sink=observability_sink,
+            )
+        except SessionInUseError as error:
+            if not interactive_session_selection:
+                output_func(f"session> 错误：{error}")
+                return
+            output_func(f"session> 当前不可用：{error}")
+            try:
+                effective_request = select_session_request(
+                    store,
                     project,
                     input_func=input_func,
                     output_func=output_func,
                 )
-            else:
-                effective_mcp_config = mcp_config
-        except MCPConfigError as error:
-            output_func("MCP servers:")
-            output_func(f"✗ config      {error}")
-            effective_mcp_config = MCPConfig()
-        mcp_manager = MCPManager(
-            effective_mcp_config,
-            observability_sink=observability_sink,
+            except (SessionNotFoundError, SessionInUseError) as menu_error:
+                output_func(f"session> 错误：{menu_error}")
+                return
+            except SessionStoreError as menu_error:
+                output_func(f"session> 严重错误：{menu_error}")
+                return
+            if effective_request is None:
+                return
+            continue
+        except SessionNotFoundError as error:
+            output_func(f"session> 错误：{error}")
+            return
+        except SessionStoreError as error:
+            output_func(f"session> 严重错误：{error}")
+            return
+        except Exception as error:
+            output_func("")
+            output_func(
+                "错误> " + format_model_error(error, operation="Agent 运行失败")
+            )
+            return
+        break
+
+    _output_session_started(application_session, output_func)
+    if application_session.compact_state_recovered:
+        output_func(
+            "session> 警告：无效的 Compact 状态已重置；"
+            "已恢复完整历史并进入 Compact 冷却期"
         )
-        mcp_manager.start()
-        if mcp_manager.statuses:
-            output_func("MCP servers:")
-            for status in mcp_manager.statuses:
-                if status.status == "connected":
-                    output_func(f"✓ {status.alias:<12} {status.tool_count} tools")
-                else:
-                    output_func(
-                        f"✗ {status.alias:<12} "
-                        f"{status.error_summary or status.error_type or 'unavailable'}"
-                    )
-        runner = build_agent_runner(
-            workspace_path=workspace.root,
-            confirmer=confirmer,
-            conversation_history=conversation_history,
-            on_message_added=active_session.persist_message,
-            compact_state=compact_state,
-            on_compact_state_changed=active_session.persist_compact_state,
-            artifact_directory=active_session.artifact_directory,
-            subagent_observer=subagent_observer,
-            llm_config=config,
-            llm_session_id=active_session.record.id,
-        )
-        for tool in mcp_manager.tools:
-            runner.tool_registry.register(tool)
+    _output_mcp_statuses(application_session, output_func)
+    try:
         run_agent_loop(
-            runner=runner,
+            runner=application_session.runner,
             input_func=input_func,
             output_func=output_func,
             output_chunk_func=output_chunk_func,
             display_mode=display_mode,
+            turn_func=lambda content, *, event_handler: _run_cli_application_turn(
+                application_session,
+                content,
+                event_handler=event_handler,
+            ),
         )
     except KeyboardInterrupt:
         try:
-            active_session.interrupt()
+            application_session.interrupt()
         except SessionStoreError as lifecycle_error:
             output_func(f"session> 警告：{lifecycle_error}")
         output_func("")
         output_func("提示> Agent 已中断，当前进度已保存。")
     except Exception as error:
         try:
-            active_session.interrupt()
+            application_session.interrupt()
         except SessionStoreError as lifecycle_error:
             output_func(f"session> 警告：{lifecycle_error}")
         output_func("")
@@ -334,13 +372,43 @@ def run_agent_command(
             "错误> " + format_model_error(error, operation="Agent 运行失败")
         )
     else:
-        active_session.close()
+        application_session.close()
     finally:
         try:
-            active_session.interrupt()
-        finally:
-            if mcp_manager is not None:
-                mcp_manager.close()
+            application_session.interrupt()
+        except SessionStoreError as lifecycle_error:
+            output_func(f"session> 警告：{lifecycle_error}")
+
+
+def _output_session_started(
+    application_session: AgentApplicationSession,
+    output_func: Callable[[str], None],
+) -> None:
+    active_session = application_session.active_project_session
+    if active_session.created:
+        output_func(f"session> 已创建新会话 {active_session.record.id}")
+    else:
+        output_func(
+            f"session> 已恢复 {active_session.record.id}："
+            f"{active_session.record.title}"
+        )
+
+
+def _output_mcp_statuses(
+    application_session: AgentApplicationSession,
+    output_func: Callable[[str], None],
+) -> None:
+    if not application_session.mcp_statuses:
+        return
+    output_func("MCP servers:")
+    for status in application_session.mcp_statuses:
+        if status.status == "connected":
+            output_func(f"✓ {status.alias:<12} {status.tool_count} tools")
+        else:
+            output_func(
+                f"✗ {status.alias:<12} "
+                f"{status.error_summary or status.error_type or 'unavailable'}"
+            )
 
 
 def _run_agent_turn(
@@ -350,6 +418,7 @@ def _run_agent_turn(
     output_func: Callable[[str], None],
     output_chunk_func: Callable[[str], None],
     presenter: CliPresenter,
+    turn_func: Callable[..., AgentRunOutcome],
 ) -> AgentRunOutcome:
     assistant_started = False
 
@@ -374,16 +443,28 @@ def _run_agent_turn(
 
         presenter.show_agent_event(event)
 
-    outcome = run_agent_turn(
-        runner,
-        content,
-        event_handler=show_event,
-    )
+    outcome = turn_func(content, event_handler=show_event)
 
     if assistant_started:
         output_func("")
     presenter.flush()
     return outcome
+
+
+def _run_cli_application_turn(
+    application_session: AgentApplicationSession,
+    content: str,
+    *,
+    event_handler: Callable[[AgentEvent], None],
+) -> AgentRunOutcome:
+    def handle_runtime_event(runtime_event: RuntimeEvent) -> None:
+        if runtime_event.type == "agent" and runtime_event.agent_event is not None:
+            event_handler(runtime_event.agent_event)
+
+    return application_session.run_turn(
+        content,
+        event_handler=handle_runtime_event,
+    )
 
 
 def _print_chunk(content: str) -> None:
@@ -410,7 +491,23 @@ def main(argv: list[str] | None = None) -> None:
             print(f"错误> Chat 启动失败：{error_summary(error)}")
         return
 
-    session_request = SessionStartRequest(mode="select")
+    if options.command == "runtime":
+        runtime_request: SessionStartRequest | None = None
+        if options.new:
+            runtime_request = SessionStartRequest(mode="new")
+        elif options.continue_session:
+            runtime_request = SessionStartRequest(mode="continue")
+        elif options.resume is not None:
+            runtime_request = SessionStartRequest(
+                mode="resume",
+                session_id=options.resume,
+            )
+        exit_code = run_jsonl_runtime(session_request=runtime_request)
+        if exit_code != 0:
+            raise SystemExit(exit_code)
+        return
+
+    session_request: SessionStartRequest | None = None
     if options.new:
         session_request = SessionStartRequest(mode="new")
     elif options.continue_session:
@@ -522,6 +619,38 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="显示调试级运行信息",
+    )
+
+    runtime_parser = subparsers.add_parser(
+        "runtime",
+        add_help=False,
+        help="启动机器可消费的 JSONL runtime",
+        description="启动 version 1 JSONL runtime；stdout 只输出 JSONL。",
+    )
+    _add_help_argument(runtime_parser)
+    runtime_parser.add_argument(
+        "--jsonl",
+        action="store_true",
+        required=True,
+        help="启用 JSONL machine protocol",
+    )
+    runtime_session_options = runtime_parser.add_argument_group("会话选项")
+    runtime_session_group = runtime_session_options.add_mutually_exclusive_group()
+    runtime_session_group.add_argument(
+        "--new",
+        action="store_true",
+        help="创建新会话",
+    )
+    runtime_session_group.add_argument(
+        "--continue",
+        dest="continue_session",
+        action="store_true",
+        help="续接最近会话；没有历史会话时新建",
+    )
+    runtime_session_group.add_argument(
+        "--resume",
+        metavar="SESSION_ID",
+        help="续接指定的未删除会话",
     )
     return parser
 

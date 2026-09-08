@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, replace
 
-from mycode.context_budget import (
+from mycode.context.budget import (
     ContextBudget,
     MemoryContextStats,
     ModelContext,
@@ -10,10 +10,10 @@ from mycode.context_budget import (
     TokenUsage,
     budget_model_context,
 )
-from mycode.context_compact import ConversationCompactor
+from mycode.context.compact import ConversationCompactor
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
+from mycode.context.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
 
 
 @dataclass(frozen=True)

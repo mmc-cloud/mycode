@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator
 
-from mycode.context_budget import (
+from mycode.context.budget import (
     CompactContextStats,
     ContextBudget,
     TokenEstimator,

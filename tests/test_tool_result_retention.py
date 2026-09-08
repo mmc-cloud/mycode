@@ -2,16 +2,16 @@ from pathlib import Path
 
 import pytest
 
-from mycode.agent import AgentToolCall
-from mycode.artifacts import (
+from mycode.agent.events import AgentToolCall
+from mycode.context.artifacts import (
     EXTERNALIZED_TOOL_RESULT_MARKER, ToolResultArtifactStore, artifact_reference_info,
 )
-from mycode.context_budget import ContextBudget, MemoryContextStats, TokenEstimator, estimate_conversation
-from mycode.context_builder import ContextBuilder
+from mycode.context.budget import ContextBudget, MemoryContextStats, TokenEstimator, estimate_conversation
+from mycode.context.builder import ContextBuilder
 from mycode.conversation import Conversation
 from mycode.messages import Message
-from mycode.tool_result_format import COMPRESSED_TOOL_RESULT_MARKER, parse_tool_result_content
-from mycode.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
+from mycode.context.tool_result_format import COMPRESSED_TOOL_RESULT_MARKER, parse_tool_result_content
+from mycode.context.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
 
 
 def _history(store, *, batches=1, width=3, body_size=12000):
@@ -55,7 +55,7 @@ def test_projection_recency_is_by_batch_and_never_mutates_canonical(tmp_path, ke
 
 @pytest.mark.parametrize("reuse", [False, True])
 def test_budget_downgrades_entire_batch_with_memory_guidance_and_schemas(tmp_path, monkeypatch, reuse):
-    import mycode.context_builder as module
+    import mycode.context.builder as module
 
     store = ToolResultArtifactStore(tmp_path / "a", 50)
     history, originals = _history(store)
@@ -113,7 +113,7 @@ def test_budget_downgrades_entire_batch_with_memory_guidance_and_schemas(tmp_pat
 
 
 def test_budget_compresses_older_reference_batch_before_latest(tmp_path):
-    from mycode.tool_result_format import _group_non_system_messages, _flatten_groups
+    from mycode.context.tool_result_format import _group_non_system_messages, _flatten_groups
 
     store = ToolResultArtifactStore(tmp_path / "a", 50)
     history, originals = _history(store, batches=2, width=2)
@@ -143,7 +143,7 @@ def test_budget_compresses_older_reference_batch_before_latest(tmp_path):
 
 @pytest.mark.parametrize("failure", ["missing", "hash", "size", "utf8", "foreign", "reparse", "malformed"])
 def test_rehydrate_failure_keeps_whole_batch_and_canonical_refs(tmp_path, monkeypatch, failure):
-    import mycode.artifacts as module
+    import mycode.context.artifacts as module
 
     store = ToolResultArtifactStore(tmp_path / "a", 50)
     history, _ = _history(store, width=2)
@@ -250,7 +250,7 @@ def test_reused_tool_call_ids_do_not_cross_batch_boundaries(tmp_path):
 
 
 def test_rehydrate_byte_limit_also_bounds_multibyte_content(tmp_path, monkeypatch):
-    import mycode.artifacts as module
+    import mycode.context.artifacts as module
 
     store = ToolResultArtifactStore(tmp_path / "a", 50)
     body = "OK\n" + "汉字" * 100

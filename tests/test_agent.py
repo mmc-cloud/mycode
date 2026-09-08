@@ -2,7 +2,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from mycode.agent import (
+from mycode.agent.events import (
     AgentEvent,
     AgentModelResponse,
     AgentProgressSnapshot,

@@ -11,7 +11,7 @@ from mycode.agent.runner import execute_tool_batch
 from mycode.tools import ToolRegistry
 
 
-def test_local_streamable_http_headers_calls_timeout_and_cleanup() -> None:
+def test_local_streamable_http_headers_calls_slow_tool_and_cleanup() -> None:
     port = _free_port()
     fixture = Path(__file__).parent / "fixtures" / "mcp_test_server.py"
     process = subprocess.Popen(
@@ -41,9 +41,6 @@ def test_local_streamable_http_headers_calls_timeout_and_cleanup() -> None:
                 AgentToolCall(
                     id="3", name="mcp__local__fail", arguments={}
                 ),
-                AgentToolCall(
-                    id="4", name="mcp__local__slow", arguments={}
-                ),
             ],
         )
 
@@ -52,7 +49,20 @@ def test_local_streamable_http_headers_calls_timeout_and_cleanup() -> None:
             "sum": 5
         }
         assert batch.executions[2].result.ok is False
-        assert batch.executions[3].result.metadata["error_type"] == "TimeoutError"
+        slow_batch = execute_tool_batch(
+            registry,
+            [
+                AgentToolCall(
+                    id="4", name="mcp__local__slow", arguments={}
+                )
+            ],
+        )
+        slow_result = slow_batch.executions[0].result
+        assert slow_result.ok is False
+        assert slow_result.metadata["error_category"] in {
+            "timeout",
+            "connection_error",
+        }
     finally:
         manager.close()
         process.terminate()

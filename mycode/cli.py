@@ -45,6 +45,7 @@ from mycode.persistence.session_store import (
 from mycode.presentation.cli.subagent_observer import CliSubAgentObserver
 from mycode.presentation.cli.session_menu import select_session_request
 from mycode.presentation.cli.mcp_trust import TerminalMCPTrustConfirmer
+from mycode.presentation.tui.app import run_tui
 from mycode.tools import (
     Workspace,
 )
@@ -507,6 +508,16 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(exit_code)
         return
 
+    if options.command == "tui":
+        try:
+            run_tui()
+        except KeyboardInterrupt:
+            print("")
+            print("提示> TUI 已中断。")
+        except Exception as error:
+            print(f"错误> TUI 启动失败：{error_summary(error)}")
+        return
+
     session_request: SessionStartRequest | None = None
     if options.new:
         session_request = SessionStartRequest(mode="new")
@@ -544,6 +555,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         epilog=(
             "示例：\n"
             "  mycode agent\n"
+            "  mycode tui\n"
             "  mycode agent --new --verbose\n"
             "  mycode agent --resume SESSION_ID\n"
             "\n"
@@ -566,6 +578,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         description="启动不带文件、命令等 coding tools 的普通模型对话。",
     )
     _add_help_argument(chat_parser)
+
+    tui_parser = subparsers.add_parser(
+        "tui",
+        add_help=False,
+        help="启动 Textual 终端用户界面",
+        description=(
+            "启动 MyCode Textual 终端用户界面。\n"
+            "14.6.2 提供 Welcome、Session 启动和主界面展示；不执行 Agent Turn。"
+        ),
+    )
+    _add_help_argument(tui_parser)
 
     agent_parser = subparsers.add_parser(
         "agent",

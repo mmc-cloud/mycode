@@ -293,14 +293,23 @@ def test_session_in_use_returns_to_welcome_and_refreshes(monkeypatch, tmp_path) 
             await _wait_for_welcome(app, pilot)
             app.screen.query_one("#session-options").focus()
             await pilot.press("enter")
-            await pilot.pause(0.2)
-            assert isinstance(app.screen, WelcomeScreen)
-            assert "currently in use" in str(app.screen.query_one("#welcome-notice").render())
-            options = app.screen.query_one("#session-options")
-            assert options.option_count == 3
-            assert "Resume: Refreshed session    refreshe" in str(
-                options.get_option_at_index(2).prompt
-            )
+            refreshed = False
+            for _ in range(150):
+                await pilot.pause(0.02)
+                if not isinstance(app.screen, WelcomeScreen):
+                    continue
+                notice = str(app.screen.query_one("#welcome-notice").render())
+                options = app.screen.query_one("#session-options")
+                if (
+                    "currently in use" in notice
+                    and options.option_count == 3
+                    and "Resume: Refreshed session    refreshe"
+                    in str(options.get_option_at_index(2).prompt)
+                ):
+                    refreshed = True
+                    break
+
+            assert refreshed
 
     run_async(exercise())
 

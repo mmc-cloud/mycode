@@ -26,6 +26,7 @@ from mycode.context.compact import (
 from mycode.conversation import Conversation
 from mycode.messages import Message
 from mycode.agent.runner import AgentRunner
+from mycode.application.agent_session import AgentApplicationSession
 from mycode.session import ChatSession
 from mycode.tools import ToolRegistry
 
@@ -118,7 +119,6 @@ def test_compactor_summarizes_old_turns_and_keeps_recent_protocol_groups() -> No
     assert visible[2].tool_calls[0].id == "call-read"
     assert visible[3].tool_call_id == "call-read"
     assert observed_states == [compactor.state]
-
     boundary = compactor.state.boundary
     assert boundary is not None
     assert boundary.summary_prompt_tokens == 120
@@ -129,6 +129,185 @@ def test_compactor_summarizes_old_turns_and_keeps_recent_protocol_groups() -> No
         "assistant",
     ]
 
+
+def test_manual_compact_forces_attempt_below_trigger_without_changing_other_gates() -> None:
+    client = RecordingSummaryClient(responses=[summary_json("manual compact")])
+    compactor = ConversationCompactor(
+        llm_client=client,
+        policy=CompactPolicy(trigger_ratio=0.99, recent_turns_to_keep=2),
+    )
+    conversation = conversation_with_tool_turn()
+
+    automatic = compactor.prepare(
+        conversation,
+        context_budget(2000),
+        token_estimator=TokenEstimator(),
+    )
+    assert automatic.stats.status == "not_needed"
+    assert client.seen_conversations == []
+
+    manual = compactor.prepare(
+        conversation,
+        context_budget(2000),
+        token_estimator=TokenEstimator(),
+        force=True,
+    )
+
+    assert manual.stats.status == "compacted"
+    assert len(client.seen_conversations) == 1
+
+
+def test_context_status_recomputes_without_model_call_and_manual_compact_returns_fresh_result() -> None:
+    summary_client = RecordingSummaryClient(
+        responses=[summary_json("manual compact")],
+    )
+    runner = AgentRunner(
+        llm_client=RecordingAgentClient(
+            usage=TokenUsage(prompt_tokens=79, completion_tokens=10, total_tokens=89)
+        ),
+        tool_registry=ToolRegistry(),
+        conversation=conversation_with_tool_turn(),
+        context_budget=context_budget(2000),
+        compactor=ConversationCompactor(
+            llm_client=summary_client,
+            policy=CompactPolicy(trigger_ratio=0.99, recent_turns_to_keep=2),
+        ),
+    )
+    runner.last_token_usage = TokenUsage(
+        prompt_tokens=79,
+        completion_tokens=10,
+        total_tokens=89,
+    )
+    application = AgentApplicationSession(
+        runner=runner,
+        active_project_session=None,
+        mcp_manager=None,
+    )
+
+    before = application.get_context_status()
+
+    assert before.context_window_tokens == 2000
+    assert before.last_provider_prompt_tokens == 79
+    assert before.estimated_input_tokens > 0
+    assert summary_client.seen_conversations == []
+    assert runner.last_model_context is None
+
+    result = application.compact_context()
+
+    assert result.status == "compacted"
+    assert result.before is not None
+    assert result.after is not None
+    assert result.before.estimated_input_tokens > result.after.estimated_input_tokens
+    assert len(summary_client.seen_conversations) == 1
+    assert runner.last_model_context is None
+
+
+def test_successful_manual_compact_uses_returned_context_without_after_inspection() -> None:
+    summary_client = RecordingSummaryClient(
+        responses=[summary_json("manual compact")],
+    )
+    runner = AgentRunner(
+        llm_client=RecordingAgentClient(
+            usage=TokenUsage(prompt_tokens=79, completion_tokens=10, total_tokens=89)
+        ),
+        tool_registry=ToolRegistry(),
+        conversation=conversation_with_tool_turn(),
+        context_budget=context_budget(2000),
+        compactor=ConversationCompactor(
+            llm_client=summary_client,
+            policy=CompactPolicy(trigger_ratio=0.99, recent_turns_to_keep=2),
+        ),
+    )
+    application = AgentApplicationSession(
+        runner=runner,
+        active_project_session=None,
+        mcp_manager=None,
+    )
+    real_get_context_status = application.get_context_status
+    inspection_calls = 0
+
+    def inspect_before_only():
+        nonlocal inspection_calls
+        inspection_calls += 1
+        if inspection_calls > 1:
+            raise RuntimeError("after inspection unavailable")
+        return real_get_context_status()
+
+    application.get_context_status = inspect_before_only
+
+    result = application.compact_context()
+
+    assert result.status == "compacted"
+    assert result.after is not None
+    assert inspection_calls == 1
+    assert runner.last_model_context is None
+
+
+def test_manual_compact_failure_returns_failed_and_preserves_conversation() -> None:
+    summary_client = RecordingSummaryClient(responses=["not valid compact json"])
+    conversation = conversation_with_tool_turn()
+    original_messages = conversation.get_messages()
+    runner = AgentRunner(
+        llm_client=RecordingAgentClient(
+            usage=TokenUsage(prompt_tokens=20, completion_tokens=5, total_tokens=25)
+        ),
+        tool_registry=ToolRegistry(),
+        conversation=conversation,
+        context_budget=context_budget(2000),
+        compactor=ConversationCompactor(
+            llm_client=summary_client,
+            policy=CompactPolicy(trigger_ratio=0.99, recent_turns_to_keep=2),
+        ),
+    )
+    application = AgentApplicationSession(
+        runner=runner,
+        active_project_session=None,
+        mcp_manager=None,
+    )
+
+    result = application.compact_context()
+
+    assert result.status == "failed"
+    assert result.reason
+    assert conversation.get_messages() == original_messages
+    assert runner.compactor.state.boundary is None
+
+
+def test_compact_context_inspection_failure_returns_failed_without_closing_session() -> None:
+    runner = AgentRunner(
+        llm_client=RecordingAgentClient(
+            usage=TokenUsage(prompt_tokens=20, completion_tokens=5, total_tokens=25)
+        ),
+        tool_registry=ToolRegistry(),
+        conversation=Conversation(),
+        context_budget=context_budget(2000),
+        compactor=ConversationCompactor(
+            llm_client=RecordingSummaryClient(responses=[]),
+            policy=CompactPolicy(trigger_ratio=0.99, recent_turns_to_keep=2),
+        ),
+    )
+    real_inspect_context = runner.inspect_context
+    inspection_calls = 0
+
+    def fail_first_inspection():
+        nonlocal inspection_calls
+        inspection_calls += 1
+        if inspection_calls == 1:
+            raise RuntimeError("inspection unavailable")
+        return real_inspect_context()
+
+    runner.inspect_context = fail_first_inspection
+    application = AgentApplicationSession(
+        runner=runner,
+        active_project_session=None,
+        mcp_manager=None,
+    )
+
+    result = application.compact_context()
+
+    assert result.status == "failed"
+    assert result.reason == "inspection unavailable"
+    assert application.run_turn("next request").stop_reason == "final_answer"
 
 def test_compactor_incrementally_merges_previous_summary_without_splitting_tools() -> None:
     client = RecordingSummaryClient(

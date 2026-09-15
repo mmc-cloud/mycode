@@ -23,6 +23,7 @@ from mycode.agent.events import (
 )
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.application.events import RuntimeEvent
+from mycode.application.agent_session import CompactResult, ContextStatus
 from mycode.application.sessions import SessionStartRequest
 from mycode.cli import main
 from mycode.config import LLMConfig
@@ -35,7 +36,12 @@ from mycode.permissions import (
     PermissionDecision,
     PermissionRequest,
 )
-from mycode.persistence.session_store import SessionInUseError, SessionStore
+from mycode.persistence.session_store import (
+    SessionInUseError,
+    SessionNotFoundError,
+    SessionStore,
+)
+from mycode.project import ProjectIdentity
 from mycode.presentation.tui import app as tui_app
 from mycode.presentation.tui.app import MyCodeTuiApp
 from mycode.presentation.tui.screens import (
@@ -81,7 +87,7 @@ def test_tui_help_does_not_start_app(monkeypatch, capsys) -> None:
     captured = capsys.readouterr()
     assert error.value.code == 0
     assert "usage: mycode tui" in captured.out
-    assert "14.6.2" in captured.out
+    assert "启动 MyCode Textual TUI" in captured.out
     assert captured.err == ""
 
 
@@ -180,6 +186,7 @@ def test_welcome_lists_real_sessions_without_fake_resume(tmp_path) -> None:
 class _FakeApplicationSession:
     history: Conversation
     session_id: str = "session-1"
+    title: str = "Demo session"
     closed: bool = False
     close_count: int = 0
     interrupt_count: int = 0
@@ -187,14 +194,14 @@ class _FakeApplicationSession:
     def __post_init__(self) -> None:
         self.active_project_session = SimpleNamespace(
             load_history=lambda: self.history,
-            record=SimpleNamespace(id=self.session_id),
+            record=SimpleNamespace(id=self.session_id, title=self.title),
         )
 
     def startup_events(self):
         yield RuntimeEvent(
             type="runtime_ready",
             session_id=self.session_id,
-            session_title="Demo session",
+            session_title=self.title,
         )
 
     def close(self) -> None:
@@ -204,6 +211,33 @@ class _FakeApplicationSession:
     def interrupt(self) -> None:
         self.interrupt_count += 1
         self.closed = True
+
+    def get_context_status(self) -> ContextStatus:
+        return ContextStatus(
+            estimated_input_tokens=120,
+            context_window_tokens=1000,
+            max_input_tokens=900,
+            reserved_output_tokens=80,
+            safety_margin_tokens=20,
+            estimate_source="default",
+            last_provider_prompt_tokens=None,
+            source_message_count=2,
+            model_visible_message_count=2,
+            memory_entry_count=0,
+            memory_estimated_tokens=0,
+            compact_status="none",
+            compact_covered_message_count=0,
+            compressed_tool_result_count=0,
+        )
+
+    def compact_context(self) -> CompactResult:
+        status = self.get_context_status()
+        return CompactResult(
+            status="skipped",
+            reason="insufficient_history",
+            before=status,
+            after=status,
+        )
 
 
 def _fake_session() -> _FakeApplicationSession:
@@ -798,6 +832,204 @@ def test_main_input_only_adds_user_message_and_clears_input(tmp_path) -> None:
             conversation = app.screen.query_one(ConversationView)
             assert "hi" in conversation.transcript_text
             assert app.screen.query_one("#prompt").value == ""
+
+    run_async(exercise())
+
+
+def test_tui_commands_use_shared_help_and_do_not_enter_agent(
+    monkeypatch, tmp_path
+) -> None:
+    fake = _fake_session()
+    run_calls: list[str] = []
+    fake.run_turn = lambda content, **kwargs: run_calls.append(content)
+    monkeypatch.setattr(
+        tui_app,
+        "start_agent_application_session",
+        lambda *args, **kwargs: fake,
+    )
+
+    async def exercise() -> None:
+        store = SessionStore(tmp_path / "projects")
+        project = ProjectIdentity.from_workspace(tmp_path)
+        store.create_session(project, session_id="session-1", title="Current")
+        app = _app(tmp_path, store=store)
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            app.submit_user_message("/help")
+            await pilot.pause()
+            app.submit_user_message("/sessions")
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if "Current" in app.screen.query_one(ConversationView).transcript_text:
+                    break
+            app.submit_user_message("/context")
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if "estimated input: 120 / 900 tokens" in app.screen.query_one(ConversationView).transcript_text:
+                    break
+            app.submit_user_message("/compact")
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if "compact skipped: insufficient_history" in app.screen.query_one(ConversationView).transcript_text:
+                    break
+
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "/help" in transcript
+            assert "/quit" in transcript
+            assert "command> * session-1  Current" in transcript
+            assert "estimated input: 120 / 900 tokens (13.3%)" in transcript
+            assert "context window: 1,000" in transcript
+            assert "memory: none" in transcript
+            assert "compact skipped: insufficient_history" in transcript
+            assert "not available yet" not in transcript
+            assert run_calls == []
+
+    run_async(exercise())
+
+
+def test_tui_compact_worker_owns_session_until_unmount_cleanup(
+    monkeypatch, tmp_path
+) -> None:
+    fake = _fake_session()
+    started = Event()
+    release = Event()
+    original_status = fake.get_context_status()
+
+    def blocking_compact() -> CompactResult:
+        started.set()
+        assert release.wait(2)
+        return CompactResult(
+            status="skipped",
+            reason="insufficient_history",
+            before=original_status,
+            after=original_status,
+        )
+
+    fake.compact_context = blocking_compact
+    monkeypatch.setattr(
+        tui_app,
+        "start_agent_application_session",
+        lambda *args, **kwargs: fake,
+    )
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            app.submit_user_message("/compact")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if started.is_set():
+                    break
+            assert started.is_set()
+            assert app._command_session_owned_by_worker is fake
+
+            app.submit_user_message("/sessions")
+            await pilot.pause()
+            assert (
+                "Command is running; wait for it to finish."
+                in app.screen.query_one(ConversationView).transcript_text
+            )
+
+            app.on_unmount()
+            assert fake.close_count == 0
+            assert app._application_session is fake
+
+            release.set()
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if fake.close_count == 1:
+                    break
+            assert fake.close_count == 1
+            assert app._application_session is None
+
+    run_async(exercise())
+
+
+def test_tui_new_switches_after_target_session_is_ready(monkeypatch, tmp_path) -> None:
+    current = _fake_session()
+    target = _FakeApplicationSession(
+        Conversation.from_messages(
+            [Message(role="user", content="target question")]
+        ),
+        session_id="target",
+        title="Target session",
+    )
+    starts = iter([current, target])
+    monkeypatch.setattr(
+        tui_app,
+        "start_agent_application_session",
+        lambda *args, **kwargs: next(starts),
+    )
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            app.submit_user_message("/new")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if (
+                    app._application_session is target
+                    and "target question"
+                    in app.screen.query_one(ConversationView).transcript_text
+                ):
+                    break
+
+            assert isinstance(app.screen, MainScreen)
+            assert app._application_session is target
+            assert current.close_count == 1
+            assert target.close_count == 0
+            assert "target question" in app.screen.query_one(ConversationView).transcript_text
+            assert "Target session" in str(app.screen.query_one(HeaderBar).render())
+
+    run_async(exercise())
+
+
+def test_tui_resume_failure_keeps_current_session_usable(monkeypatch, tmp_path) -> None:
+    current = _fake_session()
+    turn_calls: list[str] = []
+
+    def run_turn(content, **kwargs):
+        turn_calls.append(content)
+        return AgentRunOutcome.from_stop_reason("final_answer")
+
+    current.run_turn = run_turn
+    start_calls = 0
+
+    def fake_start(*args, **kwargs):
+        nonlocal start_calls
+        start_calls += 1
+        if start_calls == 1:
+            return current
+        raise SessionNotFoundError("Session not found in current project: missing")
+
+    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            app.submit_user_message("/resume missing")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if (
+                    not app._startup_active
+                    and "Session switch failed" in app.screen.query_one(ConversationView).transcript_text
+                ):
+                    break
+
+            assert isinstance(app.screen, MainScreen)
+            assert app._application_session is current
+            assert current.close_count == 0
+            assert "Session switch failed" in app.screen.query_one(ConversationView).transcript_text
+
+            app.submit_user_message("still works")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if not app._active_turn_id:
+                    break
+            assert turn_calls == ["still works"]
 
     run_async(exercise())
 

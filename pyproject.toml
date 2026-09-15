@@ -1,9 +1,21 @@
 [project]
-name = "mycode-project"
+name = "mycode"
 version = "0.1.0"
-description = "Add your description here"
+description = "A terminal coding agent with tool calling, context management, subagents, MCP, and skills."
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
+authors = [
+    { name = "mmc-cloud" }
+]
+
+keywords = [
+    "coding-agent",
+    "ai-agent",
+    "cli",
+    "tui",
+    "mcp",
+]
 dependencies = [
     "editables~=0.3",
     "httpx>=0.28.1,<1",

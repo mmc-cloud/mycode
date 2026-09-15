@@ -1,6 +1,7 @@
 """One-way model context construction shared by Agent and Chat."""
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from mycode.context.budget import (
     ContextBudget,
@@ -22,6 +23,9 @@ class ContextBuildResult:
     compact_attempt_token_usage: TokenUsage | None = None
 
 
+ContextCompactionMode = Literal["auto", "preview", "force"]
+
+
 @dataclass
 class ContextBuilder:
     budget: ContextBudget
@@ -41,6 +45,7 @@ class ContextBuilder:
         persistent_system_messages: tuple[Message, ...] = (),
         turn_local_full_group: TurnLocalFullGroup | None = None,
         observability_turn: int | None = None,
+        compaction_mode: ContextCompactionMode = "auto",
     ) -> ContextBuildResult:
         """Project tool retention, Compact, assemble this request, then budget once.
 
@@ -63,14 +68,24 @@ class ContextBuilder:
         compact_stats = None
         compact_usage = None
         if self.compactor is not None:
-            prepared = self.compactor.prepare(
-                conversation,
-                self.budget,
-                tools=tools,
-                token_estimator=self.token_estimator,
-                memory_message=memory_message,
-                observability_turn=observability_turn,
-            )
+            if compaction_mode == "preview":
+                prepared = self.compactor.preview(
+                    conversation,
+                    self.budget,
+                    tools=tools,
+                    token_estimator=self.token_estimator,
+                    memory_message=memory_message,
+                )
+            else:
+                prepared = self.compactor.prepare(
+                    conversation,
+                    self.budget,
+                    tools=tools,
+                    token_estimator=self.token_estimator,
+                    memory_message=memory_message,
+                    observability_turn=observability_turn,
+                    force=compaction_mode == "force",
+                )
             conversation = prepared.conversation
             compact_stats = prepared.stats
             compact_usage = prepared.attempt_token_usage

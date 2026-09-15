@@ -376,11 +376,17 @@ def _run_message_loop(
             if not _run_turn_message(channel, application_session, message):
                 return 1
             continue
+        if message_type == "context_status":
+            _run_context_status_message(channel, application_session)
+            continue
+        if message_type == "compact":
+            _run_compact_message(channel, application_session)
+            continue
         channel.emit(
             {
                 "type": "runtime_error",
                 "code": "unexpected_message",
-                "message": "Expected turn or close.",
+                "message": "Expected turn, context_status, compact, or close.",
             }
         )
 
@@ -430,6 +436,46 @@ def _run_turn_message(
         _interrupt_application_session(channel, application_session)
         return False
     return True
+
+
+def _run_context_status_message(
+    channel: JsonlChannel,
+    application_session: AgentApplicationSession,
+) -> None:
+    try:
+        status = application_session.get_context_status()
+    except Exception as error:  # noqa: BLE001 - control boundary
+        channel.diagnostic(
+            f"context status failed: {type(error).__name__}: {error}"
+        )
+        channel.emit(
+            {
+                "type": "runtime_error",
+                "code": "context_status_failed",
+                "message": "Context status inspection failed.",
+            }
+        )
+        return
+    channel.emit({"type": "context_status", **status.to_dict()})
+
+
+def _run_compact_message(
+    channel: JsonlChannel,
+    application_session: AgentApplicationSession,
+) -> None:
+    try:
+        result = application_session.compact_context()
+    except Exception as error:  # noqa: BLE001 - control boundary
+        channel.diagnostic(f"compact failed: {type(error).__name__}: {error}")
+        channel.emit(
+            {
+                "type": "runtime_error",
+                "code": "compact_failed",
+                "message": "Context Compact failed.",
+            }
+        )
+        return
+    channel.emit({"type": "compact_result", **result.to_dict()})
 
 
 def _close_application_session(

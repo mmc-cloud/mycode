@@ -4,6 +4,7 @@ import asyncio
 import json
 import random
 from time import sleep
+from typing import Literal
 
 from pydantic import ValidationError
 
@@ -862,6 +863,8 @@ class AgentRunner:
         request_messages: tuple[Message, ...] = (),
         turn_local_full_group: TurnLocalFullGroup | None = None,
         observability_turn: int | None = None,
+        compaction_mode: Literal["auto", "preview", "force"] = "auto",
+        update_last_model_context: bool = True,
     ) -> ModelContext:
         memory_recall = self.last_memory_recall
         result = ContextBuilder(
@@ -889,10 +892,29 @@ class AgentRunner:
             ),
             turn_local_full_group=turn_local_full_group,
             observability_turn=observability_turn,
+            compaction_mode=compaction_mode,
         )
-        self._accumulate_run_token_usage(result.compact_attempt_token_usage)
-        self.last_model_context = result.context
+        if compaction_mode == "auto":
+            self._accumulate_run_token_usage(result.compact_attempt_token_usage)
+        if update_last_model_context:
+            self.last_model_context = result.context
         return result.context
+
+    def inspect_context(self) -> ModelContext:
+        """Recompute the current model-visible context without model calls."""
+        return self._model_context(
+            self.tool_registry.get_schemas(),
+            compaction_mode="preview",
+            update_last_model_context=False,
+        )
+
+    def compact_context(self) -> ModelContext:
+        """Run one user-requested Compact while preserving all safety gates."""
+        return self._model_context(
+            self.tool_registry.get_schemas(),
+            compaction_mode="force",
+            update_last_model_context=False,
+        )
 
     def _persist_tool_results(
         self, batch: ToolBatchExecution,

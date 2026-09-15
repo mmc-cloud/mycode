@@ -2,6 +2,8 @@
 
 from mycode.application.agent_session import (
     AgentApplicationSession,
+    CompactResult,
+    ContextStatus,
     start_agent_application_session,
 )
 from mycode.application.events import RuntimeEvent, RuntimeEventType
@@ -21,6 +23,8 @@ from mycode.application.sessions import (
 __all__ = [
     "ActiveProjectSession",
     "AgentApplicationSession",
+    "CompactResult",
+    "ContextStatus",
     "RuntimeEvent",
     "RuntimeEventType",
     "SessionStartRequest",

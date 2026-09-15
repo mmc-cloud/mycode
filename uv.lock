@@ -534,7 +534,7 @@ wheels = [
 ]
 
 [[package]]
-name = "mycode-project"
+name = "mycode"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

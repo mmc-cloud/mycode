@@ -14,6 +14,8 @@ from textual.widgets import Input, OptionList
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.application.agent_session import (
     AgentApplicationSession,
+    CompactResult,
+    ContextStatus,
     start_agent_application_session,
 )
 from mycode.application.events import RuntimeEvent
@@ -30,6 +32,17 @@ from mycode.persistence.session_store import (
     SessionInUseError,
     SessionRecord,
     SessionStore,
+)
+from mycode.presentation.commands import (
+    CommandParseError,
+    ParsedCommand,
+    parse_slash_command,
+)
+from mycode.presentation.command_format import (
+    format_command_help,
+    format_compact_result,
+    format_context_status,
+    format_session_list,
 )
 from mycode.presentation.tui.interactions import (
     MCPTrustRequestMessage,
@@ -96,16 +109,62 @@ class StartupSucceededMessage(Message):
         self,
         application_session: AgentApplicationSession,
         history: tuple[HistoryItem, ...],
+        *,
+        replace_current: bool = False,
     ) -> None:
         self.application_session = application_session
         self.history = history
+        self.replace_current = replace_current
         super().__init__()
 
 
 class StartupFailedMessage(Message):
-    def __init__(self, error: BaseException, *, session_in_use: bool = False) -> None:
+    def __init__(
+        self,
+        error: BaseException,
+        *,
+        session_in_use: bool = False,
+        replace_current: bool = False,
+    ) -> None:
         self.error = error
         self.session_in_use = session_in_use
+        self.replace_current = replace_current
+        super().__init__()
+
+
+class SessionListMessage(Message):
+    def __init__(
+        self,
+        sessions: tuple[SessionRecord, ...],
+        *,
+        error: str = "",
+    ) -> None:
+        self.sessions = sessions
+        self.error = error
+        super().__init__()
+
+
+class ContextStatusMessage(Message):
+    def __init__(
+        self,
+        status: ContextStatus | None = None,
+        *,
+        error: str = "",
+    ) -> None:
+        self.status = status
+        self.error = error
+        super().__init__()
+
+
+class CompactResultMessage(Message):
+    def __init__(
+        self,
+        result: CompactResult | None = None,
+        *,
+        error: str = "",
+    ) -> None:
+        self.result = result
+        self.error = error
         super().__init__()
 
 
@@ -308,7 +367,11 @@ class MyCodeTuiApp(App[None]):
         self._pending_application_sessions: list[AgentApplicationSession] = []
         self._turn_session_owned_by_worker = False
         self._active_turn_id: str | None = None
+        self._command_worker_active = False
         self._session_unusable = False
+        self._session_switch_active = False
+        self._session_switch_events: list[RuntimeEvent] = []
+        self._command_session_owned_by_worker: AgentApplicationSession | None = None
         self._status_bar: StatusBar | None = None
         self._permission_queue: list[PermissionResponseHandle] = []
         self._active_permission_handle: PermissionResponseHandle | None = None
@@ -399,6 +462,8 @@ class MyCodeTuiApp(App[None]):
         # Invalidate any refresh result that was started before this startup.
         self._metadata_generation += 1
         self._startup_active = True
+        self._session_switch_active = False
+        self._session_switch_events = []
         self.switch_screen(
             LoadingScreen(
                 workspace=self.workspace_label,
@@ -415,7 +480,36 @@ class MyCodeTuiApp(App[None]):
             exit_on_error=False,
         )
 
-    def _startup_worker(self, request: SessionStartRequest) -> None:
+    def _begin_session_switch(self, request: SessionStartRequest) -> None:
+        if self._startup_active or self._active_turn_id is not None:
+            return
+        if self._llm_config is None:
+            self._show_command_notice(
+                "Session commands are unavailable until runtime startup completes.",
+                level="warning",
+            )
+            return
+        self._metadata_generation += 1
+        self._startup_active = True
+        self._session_switch_active = True
+        self._session_switch_events = []
+        self._set_prompt_enabled(False)
+        self._set_status("Opening session…")
+        self.run_worker(
+            lambda: self._startup_worker(request, replace_current=True),
+            name="session-switch",
+            group="startup",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _startup_worker(
+        self,
+        request: SessionStartRequest,
+        *,
+        replace_current: bool = False,
+    ) -> None:
         application_session: AgentApplicationSession | None = None
         try:
             if self._shutdown_requested.is_set():
@@ -466,15 +560,29 @@ class MyCodeTuiApp(App[None]):
 
             for event in application_session.startup_events():
                 self.post_message(StartupEventMessage(event))
-            self.post_message(StartupSucceededMessage(application_session, history))
+            self.post_message(
+                StartupSucceededMessage(
+                    application_session,
+                    history,
+                    replace_current=replace_current,
+                )
+            )
         except SessionInUseError as caught:
             if application_session is not None:
                 self._cleanup_startup_session(application_session)
-            self.post_message(StartupFailedMessage(caught, session_in_use=True))
+            self.post_message(
+                StartupFailedMessage(
+                    caught,
+                    session_in_use=True,
+                    replace_current=replace_current,
+                )
+            )
         except Exception as caught:  # noqa: BLE001 - worker boundary returns to Welcome
             if application_session is not None:
                 self._cleanup_startup_session(application_session)
-            self.post_message(StartupFailedMessage(caught))
+            self.post_message(
+                StartupFailedMessage(caught, replace_current=replace_current)
+            )
 
     def _register_pending_application_session(
         self,
@@ -512,6 +620,8 @@ class MyCodeTuiApp(App[None]):
     def _on_startup_progress(self, message: StartupProgressMessage) -> None:
         if isinstance(self.screen, LoadingScreen):
             self.screen.set_progress(message.value)
+        elif self._session_switch_active and isinstance(self.screen, MainScreen):
+            self._set_status(message.value)
 
     @on(MCPTrustRequestMessage)
     def _on_mcp_trust_request(self, message: MCPTrustRequestMessage) -> None:
@@ -608,10 +718,77 @@ class MyCodeTuiApp(App[None]):
 
     @on(StartupEventMessage)
     def _on_startup_event(self, message: StartupEventMessage) -> None:
+        if self._session_switch_active:
+            self._session_switch_events.append(message.event)
+            return
         self.present_event(message.event)
+
+    @on(SessionListMessage)
+    def _on_session_list(self, message: SessionListMessage) -> None:
+        if self._shutdown_requested.is_set() or not isinstance(self.screen, MainScreen):
+            return
+        self._command_worker_active = False
+        if message.error:
+            self._show_command_notice(
+                f"/sessions failed: {message.error}",
+                level="error",
+            )
+            self._set_prompt_enabled(True)
+            self._set_status("Ready")
+            self._focus_prompt()
+            return
+
+        self._session_records = message.sessions
+        self._show_sessions(message.sessions)
+        self._set_prompt_enabled(True)
+        self._set_status("Ready")
+        self._focus_prompt()
+
+    @on(ContextStatusMessage)
+    def _on_context_status(self, message: ContextStatusMessage) -> None:
+        if self._shutdown_requested.is_set() or not isinstance(self.screen, MainScreen):
+            return
+        self._command_worker_active = False
+        if message.error or message.status is None:
+            self._show_command_notice(
+                f"/context failed: {message.error or 'unavailable'}",
+                level="error",
+            )
+        else:
+            self._show_context_status(message.status)
+        self._set_prompt_enabled(True)
+        self._set_status("Ready")
+        self._focus_prompt()
+
+    @on(CompactResultMessage)
+    def _on_compact_result(self, message: CompactResultMessage) -> None:
+        if self._shutdown_requested.is_set() or not isinstance(self.screen, MainScreen):
+            return
+        self._command_worker_active = False
+        if message.error or message.result is None:
+            self._show_command_notice(
+                f"/compact failed: {message.error or 'unavailable'}",
+                level="error",
+            )
+        else:
+            result = message.result
+            level = "info"
+            if result.status == "skipped":
+                level = "warning"
+            elif result.status == "failed":
+                level = "error"
+            self._show_command_notice(
+                format_compact_result(result),
+                level=level,
+            )
+        self._set_prompt_enabled(True)
+        self._set_status("Ready")
+        self._focus_prompt()
 
     @on(StartupSucceededMessage)
     def _on_startup_succeeded(self, message: StartupSucceededMessage) -> None:
+        old_session: AgentApplicationSession | None = None
+        switch_events: tuple[RuntimeEvent, ...] = ()
         with self._session_lock:
             try:
                 self._pending_application_sessions.remove(message.application_session)
@@ -623,6 +800,16 @@ class MyCodeTuiApp(App[None]):
                 should_close = False
             elif self._shutdown_requested.is_set():
                 should_close = True
+            elif message.replace_current:
+                old_session = self._application_session
+                self._application_session = message.application_session
+                self._turn_session_owned_by_worker = False
+                self._session_unusable = False
+                self._session_switch_active = False
+                self._startup_active = False
+                switch_events = tuple(self._session_switch_events)
+                self._session_switch_events = []
+                should_close = False
             else:
                 self._application_session = message.application_session
                 self._turn_session_owned_by_worker = False
@@ -631,6 +818,31 @@ class MyCodeTuiApp(App[None]):
             return
         if should_close:
             message.application_session.close()
+            return
+
+        if message.replace_current:
+            if old_session is not None:
+                try:
+                    old_session.close()
+                except Exception as caught:  # noqa: BLE001 - preserve new session
+                    close_warning = error_summary(caught)
+                else:
+                    close_warning = ""
+            else:
+                close_warning = ""
+            self._queued_events.extend(switch_events)
+            self.switch_screen(
+                MainScreen(
+                    workspace=self.workspace_label,
+                    model=self.model_label,
+                    history=message.history,
+                )
+            )
+            if close_warning:
+                self._show_command_notice(
+                    f"Old session cleanup warning: {close_warning}",
+                    level="warning",
+                )
             return
 
         self._startup_active = False
@@ -644,6 +856,24 @@ class MyCodeTuiApp(App[None]):
 
     @on(StartupFailedMessage)
     def _on_startup_failed(self, message: StartupFailedMessage) -> None:
+        if message.replace_current:
+            self._startup_active = False
+            self._session_switch_active = False
+            self._session_switch_events = []
+            if message.session_in_use:
+                detail = "selected session is currently in use"
+            else:
+                detail = error_summary(message.error)
+            self._show_command_notice(
+                f"Session switch failed: {detail}",
+                level="warning" if message.session_in_use else "error",
+            )
+            self._set_prompt_enabled(True)
+            self._set_status("Ready")
+            self._focus_prompt()
+            self._start_welcome_metadata_load(name="refresh-session-list")
+            return
+
         self._startup_active = False
         if message.session_in_use:
             notice = "Selected session is currently in use. Session list refreshed."
@@ -724,6 +954,155 @@ class MyCodeTuiApp(App[None]):
             )
         )
 
+    def _handle_command(self, command: ParsedCommand) -> None:
+        if command.name == "help":
+            self._show_command_help()
+            return
+        if command.name == "sessions":
+            self._begin_session_list()
+            return
+        if command.name == "new":
+            self._begin_session_switch(SessionStartRequest(mode="new"))
+            return
+        if command.name == "resume":
+            target_session_id = command.args[0]
+            if target_session_id == self._current_session_id():
+                self._show_command_notice(
+                    "already using current session",
+                    level="info",
+                )
+                return
+            self._begin_session_switch(
+                SessionStartRequest(mode="resume", session_id=target_session_id)
+            )
+            return
+        if command.name == "exit":
+            self.action_quit()
+            return
+        if command.name == "context":
+            self._begin_context_status()
+            return
+        if command.name == "compact":
+            self._begin_compact()
+            return
+        self._show_command_notice(
+            f"/{command.name} is not available yet.",
+            level="info",
+        )
+
+    def _show_command_help(self) -> None:
+        for line in format_command_help():
+            self._show_command_notice(line)
+
+    def _begin_session_list(self) -> None:
+        if self._startup_active or self._command_worker_active:
+            return
+        self._command_worker_active = True
+        self._set_prompt_enabled(False)
+        self._set_status("Loading sessions…")
+        self.run_worker(
+            self._session_list_worker,
+            name="session-list",
+            group="session-command",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _begin_context_status(self) -> None:
+        if self._startup_active or self._command_worker_active:
+            return
+        self._command_worker_active = True
+        self._set_prompt_enabled(False)
+        self._set_status("Loading context…")
+        self.run_worker(
+            self._context_status_worker,
+            name="context-status",
+            group="session-command",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _context_status_worker(self) -> None:
+        application_session = self._claim_command_session_for_worker()
+        if application_session is None:
+            self.post_message(ContextStatusMessage(error="runtime unavailable"))
+            return
+        try:
+            message = ContextStatusMessage(application_session.get_context_status())
+        except Exception as caught:  # noqa: BLE001 - UI boundary reports a summary
+            message = ContextStatusMessage(error=error_summary(caught))
+        if self._release_command_session_after_worker(application_session):
+            application_session.close()
+            return
+        self.post_message(message)
+
+    def _begin_compact(self) -> None:
+        if self._startup_active or self._command_worker_active:
+            return
+        self._command_worker_active = True
+        self._set_prompt_enabled(False)
+        self._set_status("Compacting…")
+        self.run_worker(
+            self._compact_worker,
+            name="compact-context",
+            group="session-command",
+            exclusive=True,
+            thread=True,
+            exit_on_error=False,
+        )
+
+    def _compact_worker(self) -> None:
+        application_session = self._claim_command_session_for_worker()
+        if application_session is None:
+            self.post_message(CompactResultMessage(error="runtime unavailable"))
+            return
+        try:
+            message = CompactResultMessage(application_session.compact_context())
+        except Exception as caught:  # noqa: BLE001 - UI boundary reports a summary
+            message = CompactResultMessage(error=error_summary(caught))
+        if self._release_command_session_after_worker(application_session):
+            application_session.close()
+            return
+        self.post_message(message)
+
+    def _session_list_worker(self) -> None:
+        try:
+            sessions = tuple(list_project_sessions(self.session_store, self.project))
+            message = SessionListMessage(sessions)
+        except Exception as caught:  # noqa: BLE001 - UI boundary reports a summary
+            message = SessionListMessage((), error=error_summary(caught))
+        self.post_message(message)
+
+    def _show_sessions(self, sessions: tuple[SessionRecord, ...]) -> None:
+        current_session_id = self._current_session_id()
+        for line in format_session_list(
+            sessions,
+            current_session_id=current_session_id or "",
+        ):
+            self._show_command_notice(line)
+
+    def _show_context_status(self, status: ContextStatus) -> None:
+        for line in format_context_status(status):
+            self._show_command_notice(line)
+
+    def _show_command_notice(self, content: str, *, level: str = "info") -> None:
+        if self.presenter is not None:
+            self.presenter.conversation.add_notice(
+                f"command> {content}",
+                level=level,
+            )
+
+    def _current_session_id(self) -> str | None:
+        with self._session_lock:
+            session = self._application_session
+        if session is None:
+            return None
+        record = getattr(session.active_project_session, "record", None)
+        session_id = getattr(record, "id", None)
+        return session_id if isinstance(session_id, str) else None
+
     def _activate_main_screen(self, screen: MainScreen) -> None:
         conversation = screen.query_one(ConversationView)
         self._status_bar = screen.query_one(StatusBar)
@@ -746,11 +1125,41 @@ class MyCodeTuiApp(App[None]):
         self.presenter.present(event)
 
     def submit_user_message(self, content: str) -> None:
+        if not content.strip() or self.presenter is None or self._session_unusable:
+            return
+        try:
+            command = parse_slash_command(content)
+        except CommandParseError as error:
+            self._show_command_notice(str(error), level="error")
+            return
+        if command is not None:
+            if self._active_turn_id is not None:
+                if command.name == "exit":
+                    self.action_quit()
+                else:
+                    self._show_command_notice(
+                        "Agent turn is running; wait for completion before using commands.",
+                        level="warning",
+                    )
+                return
+            if command.name != "exit" and self._startup_active:
+                self._show_command_notice(
+                    "Session startup is running; wait for it to finish.",
+                    level="warning",
+                )
+                return
+            if command.name != "exit" and self._command_worker_active:
+                self._show_command_notice(
+                    "Command is running; wait for it to finish.",
+                    level="warning",
+                )
+                return
+            self._handle_command(command)
+            return
         if (
-            not content.strip()
-            or self.presenter is None
-            or self._active_turn_id is not None
-            or self._session_unusable
+            self._active_turn_id is not None
+            or self._startup_active
+            or self._command_worker_active
         ):
             return
         self.presenter.show_user_message(content)
@@ -798,6 +1207,35 @@ class MyCodeTuiApp(App[None]):
             application_session.close()
             return
         self.post_message(TurnCompletedMessage(turn_id, outcome))
+
+    def _claim_command_session_for_worker(
+        self,
+    ) -> AgentApplicationSession | None:
+        with self._session_lock:
+            if (
+                self._shutdown_requested.is_set()
+                or self._application_session is None
+                or self._turn_session_owned_by_worker
+                or self._command_session_owned_by_worker is not None
+            ):
+                return None
+            self._command_session_owned_by_worker = self._application_session
+            return self._application_session
+
+    def _release_command_session_after_worker(
+        self,
+        application_session: AgentApplicationSession,
+    ) -> bool:
+        """Release command ownership, returning whether the worker must close."""
+        with self._session_lock:
+            if self._command_session_owned_by_worker is not application_session:
+                return False
+            self._command_session_owned_by_worker = None
+            if self._shutdown_requested.is_set():
+                if self._application_session is application_session:
+                    self._application_session = None
+                return True
+            return False
 
     def _claim_turn_session_for_worker(
         self,
@@ -853,6 +1291,14 @@ class MyCodeTuiApp(App[None]):
                 )
             self._set_status("Running…")
             return
+        if self._command_worker_active:
+            if self.presenter is not None:
+                self.presenter.conversation.add_notice(
+                    "⚠ Command is running; wait for it to finish before quitting.",
+                    level="warning",
+                )
+            self._set_status("Running…")
+            return
         self.exit()
 
     def on_unmount(self) -> None:
@@ -867,6 +1313,7 @@ class MyCodeTuiApp(App[None]):
             if (
                 self._application_session is not None
                 and not self._turn_session_owned_by_worker
+                and self._command_session_owned_by_worker is None
             ):
                 sessions.append(self._application_session)
                 self._application_session = None

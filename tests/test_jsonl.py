@@ -15,6 +15,7 @@ from mycode.adapters.jsonl import (
 from mycode.agent.events import AgentEvent
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.application.events import RuntimeEvent
+from mycode.application.agent_session import CompactResult, ContextStatus
 from mycode.application.sessions import SessionStartRequest
 from mycode.mcp.config import MCPConfig
 from mycode.mcp.models import MCPServerStatus
@@ -157,6 +158,33 @@ class FakeRuntimeApplication:
 
     def interrupt(self) -> None:
         self.interrupt_calls += 1
+
+    def get_context_status(self) -> ContextStatus:
+        return ContextStatus(
+            estimated_input_tokens=120,
+            context_window_tokens=1000,
+            max_input_tokens=900,
+            reserved_output_tokens=80,
+            safety_margin_tokens=20,
+            estimate_source="default",
+            last_provider_prompt_tokens=None,
+            source_message_count=2,
+            model_visible_message_count=2,
+            memory_entry_count=0,
+            memory_estimated_tokens=0,
+            compact_status="none",
+            compact_covered_message_count=0,
+            compressed_tool_result_count=0,
+        )
+
+    def compact_context(self) -> CompactResult:
+        status = self.get_context_status()
+        return CompactResult(
+            status="skipped",
+            reason="insufficient_history",
+            before=status,
+            after=status,
+        )
 
 
 class FatalRuntimeApplication(FakeRuntimeApplication):
@@ -415,6 +443,45 @@ def test_jsonl_machine_runtime_is_json_only_and_forwards_turn_events(
     assert error_stream.getvalue() == ""
     assert application.close_calls == 1
     assert application.interrupt_calls == 0
+
+
+def test_jsonl_context_controls_use_structured_messages_without_slash_commands(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    application = FakeRuntimeApplication([])
+    input_stream = io.StringIO(
+        '{"version":1,"type":"context_status"}\n'
+        '{"version":1,"type":"compact"}\n'
+        '{"version":1,"type":"close"}\n'
+    )
+    monkeypatch.setattr(
+        "mycode.adapters.jsonl.start_agent_application_session",
+        lambda *args, **kwargs: application,
+    )
+    output_stream = io.StringIO()
+
+    assert run_jsonl_runtime(
+        workspace_path=tmp_path,
+        mcp_config=MCPConfig(),
+        input_stream=input_stream,
+        output_stream=output_stream,
+        error_stream=io.StringIO(),
+    ) == 0
+
+    payloads = [json.loads(line) for line in output_stream.getvalue().splitlines()]
+    assert [payload["type"] for payload in payloads] == [
+        "runtime_ready",
+        "context_status",
+        "compact_result",
+        "runtime_closed",
+    ]
+    assert payloads[1]["estimated"] is True
+    assert payloads[1]["context_window_tokens"] == 1000
+    assert payloads[1]["max_input_tokens"] == 900
+    assert payloads[2]["status"] == "skipped"
+    assert payloads[2]["reason"] == "insufficient_history"
+    assert all("/context" not in line and "/compact" not in line for line in output_stream.getvalue().splitlines())
 
 
 @pytest.mark.parametrize(

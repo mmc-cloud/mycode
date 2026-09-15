@@ -1,4 +1,4 @@
-"""Textual screens for the 14.6.2 welcome and startup flow."""
+"""Textual screens for the MyCode welcome and startup flow."""
 
 from __future__ import annotations
 

@@ -9,7 +9,10 @@ from mycode.adapters.jsonl import run_jsonl_runtime
 from mycode.application.events import RuntimeEvent
 from mycode.application import (
     AgentApplicationSession,
+    CompactResult,
+    ContextStatus,
     context_budget_from_config,
+    list_project_sessions,
     run_agent_turn,
     SessionStartRequest,
     start_agent_application_session,
@@ -45,13 +48,24 @@ from mycode.persistence.session_store import (
 from mycode.presentation.cli.subagent_observer import CliSubAgentObserver
 from mycode.presentation.cli.session_menu import select_session_request
 from mycode.presentation.cli.mcp_trust import TerminalMCPTrustConfirmer
+from mycode.presentation.commands import (
+    CommandParseError,
+    ParsedCommand,
+    parse_slash_command,
+)
+from mycode.presentation.command_format import (
+    format_command_help,
+    format_compact_result,
+    format_context_status,
+    format_session_list,
+)
 from mycode.presentation.tui.app import run_tui
 from mycode.tools import (
     Workspace,
 )
 
 
-EXIT_COMMANDS = {"/exit", "/quit"}
+_CHAT_EXIT_COMMANDS = {"/exit", "/quit"}
 
 
 def build_chat_session(llm_config: LLMConfig | None = None) -> ChatSession:
@@ -94,7 +108,7 @@ def run_chat_loop(
             output_func("提示> Chat 已中断。")
             break
 
-        if content in EXIT_COMMANDS:
+        if content in _CHAT_EXIT_COMMANDS:
             break
 
         if content == "":
@@ -168,6 +182,7 @@ def run_agent_loop(
     display_mode: CliDisplayMode = "normal",
     *,
     turn_func: Callable[..., AgentRunOutcome] | None = None,
+    command_handler: Callable[[ParsedCommand], bool] | None = None,
 ) -> AgentRunOutcome | None:
     if output_chunk_func is None:
         output_chunk_func = _print_chunk
@@ -204,10 +219,22 @@ def run_agent_loop(
             output_func("")
             break
 
-        if content in EXIT_COMMANDS:
-            break
-
         if content == "":
+            continue
+
+        try:
+            command = parse_slash_command(content)
+        except CommandParseError as error:
+            output_func(f"command> {error}")
+            continue
+        if command is not None:
+            if command.name == "exit" and command_handler is None:
+                break
+            if command_handler is None:
+                output_func(f"command> /{command.name} is not available yet.")
+                continue
+            if command_handler(command):
+                break
             continue
 
         last_outcome = _run_agent_turn(
@@ -343,6 +370,94 @@ def run_agent_command(
             "已恢复完整历史并进入 Compact 冷却期"
         )
     _output_mcp_statuses(application_session, output_func)
+
+    def handle_command(command: ParsedCommand) -> bool:
+        nonlocal application_session
+
+        if command.name == "help":
+            _output_command_help(output_func)
+            return False
+        if command.name == "sessions":
+            _output_sessions(
+                store,
+                project,
+                current_session_id=application_session.active_project_session.record.id,
+                output_func=output_func,
+            )
+            return False
+        if command.name == "context":
+            try:
+                status = application_session.get_context_status()
+            except Exception as error:  # noqa: BLE001 - command boundary
+                output_func(
+                    "context> failed: "
+                    + format_model_error(error, operation="Context inspection failed")
+                )
+            else:
+                _output_context_status(status, output_func)
+            return False
+        if command.name == "compact":
+            _output_compact_result(application_session.compact_context(), output_func)
+            return False
+        if command.name == "exit":
+            return True
+        if command.name not in {"new", "resume"}:
+            output_func(f"command> /{command.name} is not available yet.")
+            return False
+
+        if command.name == "resume":
+            target_session_id = command.args[0]
+            current_session_id = application_session.active_project_session.record.id
+            if target_session_id == current_session_id:
+                output_func("session> already using current session")
+                return False
+            request = SessionStartRequest(
+                mode="resume",
+                session_id=target_session_id,
+            )
+        else:
+            request = SessionStartRequest(mode="new")
+
+        try:
+            replacement = start_agent_application_session(
+                store,
+                project,
+                request=request,
+                mcp_config=effective_mcp_config,
+                confirmer=confirmer,
+                external_observer=cli_observer,
+                llm_config=config,
+                observability_sink=observability_sink,
+            )
+        except SessionInUseError as error:
+            output_func(f"session> 当前不可用：{error}")
+            return False
+        except SessionNotFoundError as error:
+            output_func(f"session> 错误：{error}")
+            return False
+        except SessionStoreError as error:
+            output_func(f"session> 严重错误：{error}")
+            return False
+        except Exception as error:
+            output_func(
+                "错误> " + format_model_error(error, operation="Session 切换失败")
+            )
+            return False
+
+        previous = application_session
+        application_session = replacement
+        try:
+            previous.close()
+        except Exception as error:
+            output_func(
+                "session> 警告："
+                + format_model_error(error, operation="旧 Session 清理失败")
+            )
+
+        _output_session_started(application_session, output_func)
+        _output_mcp_statuses(application_session, output_func)
+        return False
+
     try:
         run_agent_loop(
             runner=application_session.runner,
@@ -355,6 +470,7 @@ def run_agent_command(
                 content,
                 event_handler=event_handler,
             ),
+            command_handler=handle_command,
         )
     except KeyboardInterrupt:
         try:
@@ -410,6 +526,46 @@ def _output_mcp_statuses(
                 f"✗ {status.alias:<12} "
                 f"{status.error_summary or status.error_type or 'unavailable'}"
             )
+
+
+def _output_command_help(output_func: Callable[[str], None]) -> None:
+    for line in format_command_help():
+        output_func(f"command> {line}")
+
+
+def _output_context_status(
+    status: ContextStatus,
+    output_func: Callable[[str], None],
+) -> None:
+    for line in format_context_status(status):
+        output_func(f"command> {line}")
+
+
+def _output_compact_result(
+    result: CompactResult,
+    output_func: Callable[[str], None],
+) -> None:
+    output_func(f"context> {format_compact_result(result)}")
+
+
+def _output_sessions(
+    store: SessionStore,
+    project: ProjectIdentity,
+    *,
+    current_session_id: str,
+    output_func: Callable[[str], None],
+) -> None:
+    try:
+        sessions = list_project_sessions(store, project, limit=10)
+    except SessionStoreError as error:
+        output_func(f"session> 严重错误：{error}")
+        return
+
+    for line in format_session_list(
+        sessions,
+        current_session_id=current_session_id,
+    ):
+        output_func(f"command> {line}")
 
 
 def _run_agent_turn(
@@ -476,7 +632,7 @@ def main(argv: list[str] | None = None) -> None:
     args = sys.argv[1:] if argv is None else argv
 
     if args == []:
-        print("mycode-project 已就绪。")
+        print("MyCode 已就绪。")
         return
 
     parser = _build_cli_parser()
@@ -551,7 +707,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mycode",
         add_help=False,
-        description="轻量级 coding agent，以启动命令时的当前目录作为工作区。",
+        description="可扩展终端 coding agent，以启动命令时的当前目录作为工作区。",
         epilog=(
             "示例：\n"
             "  mycode agent\n"
@@ -583,10 +739,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "tui",
         add_help=False,
         help="启动 Textual 终端用户界面",
-        description=(
-            "启动 MyCode Textual 终端用户界面。\n"
-            "14.6.2 提供 Welcome、Session 启动和主界面展示；不执行 Agent Turn。"
-        ),
+        description="启动 MyCode Textual TUI，支持 Session、Agent Turn、Permission 和交互式命令。",
     )
     _add_help_argument(tui_parser)
 

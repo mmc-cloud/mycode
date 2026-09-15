@@ -1,51 +1,103 @@
 # MyCode
 
-MyCode 是一个使用 Python 实现的轻量级 coding agent。它以当前目录为工作区，通过 OpenAI-compatible 模型完成代码理解、文件修改、命令执行、会话管理和受控的 SubAgent 协作。
+MyCode 是一个使用 Python 实现、面向个人开发者的可扩展终端 Coding Agent。
 
-这是一个个人学习和工程实践项目，不建议未经审查直接用于生产环境。
+An extensible terminal coding agent built with Python.
 
-## 主要能力
+它以启动命令时的当前目录作为工作区，通过 OpenAI-compatible Chat Completions 模型完成代码理解、文件修改、命令执行、会话管理和受控的 SubAgent 协作。这是一个个人项目，按“能力依赖 + 风险边界”逐步实现，不建议未经审查直接用于生产环境。
 
-- OpenAI-compatible Chat Completions 流式调用和结构化 Tool Calling
-- 工作区内的文件读取、搜索、写入和编辑
-- 带路径边界、风险分级和确认机制的命令执行
-- 按项目保存、选择、恢复和删除会话
-- 上下文管理、历史压缩和持久记忆
-- 受限的 SubAgent 探索、验证与审查
-- 通过 MCP stdio 或 Streamable HTTP 接入外部工具
-- 多级 CLI 运行信息
+## Features / 主要能力
 
-## 环境要求
+- Agent Loop 与结构化 Tool Calling
+- 工作区内的文件查找、读取、写入和编辑
+- 受路径边界和风险分级约束的命令执行
+- Permission 与人工确认
+- 上下文预算、历史压缩、会话持久化与跨会话记忆
+- SubAgent 委派：explorer / tester / reviewer
+- 通过 MCP 接入外部工具
+- Skill：可复用的任务流程包
+- CLI 与 Textual 终端界面
 
-- 当前已验证的运行环境：Windows + PowerShell
+## Installation / 安装
+
+要求：
+
 - Python 3.11 或更高版本
 - [uv](https://docs.astral.sh/uv/)
-- 一个支持 Chat Completions 的 OpenAI-compatible 模型服务及其 API Key
+- 一个支持 OpenAI-compatible Chat Completions 的模型服务及其 API Key
 
-## 安装
-
-下载或克隆仓库后，在 MyCode 仓库根目录执行：
+使用 uv 安装：
 
 ```powershell
-uv tool install .
+uv tool install mycode
 ```
 
-安装成功后，`mycode` 命令可以在其他目录中使用：
+安装后 `mycode` 可以在任意目录使用。从源码安装见 [Development](#development--开发与测试)。
+
+## Quick Start / 快速开始
+
+MyCode 以启动命令时的当前目录作为 Agent 工作区，所以先进入你想让 Agent 操作的项目：
 
 ```powershell
-mycode
+cd D:\path\to\your-project
 ```
 
-## 配置模型
+配置模型连接，这三项必填，取值见 [Configuration](#configuration--配置)：
 
-MyCode 支持用户级和项目级模型配置：
+```dotenv
+MYCODE_API_KEY=your-api-key
+MYCODE_BASE_URL=https://your-provider.example/v1
+MYCODE_MODEL=your-chat-completions-model
+```
+
+启动：
+
+```powershell
+mycode agent
+```
+
+当前 CLI 没有 `--workspace PATH` 参数，切换工作区需要先进入目标目录再启动。建议只在受信任、并且已经用 Git 管理的项目中运行。
+
+## Usage / 常用命令
+
+| 命令                       | 说明                                                                     |
+| -------------------------- | ------------------------------------------------------------------------ |
+| `mycode agent`           | 在当前目录启动 coding agent                                              |
+| `mycode chat`            | 启动不带 coding tools 的普通模型对话                                     |
+| `mycode tui`             | 启动 Textual 终端界面                                                    |
+| `mycode runtime --jsonl` | 启动机器可消费的 JSONL runtime；stdout 只输出 JSONL，诊断信息写到 stderr |
+| `mycode --help`          | 查看命令列表；`mycode <子命令> --help` 查看子命令帮助                  |
+
+`mycode agent` 的会话选项（三者互斥）：
+
+- `--new`：跳过菜单，直接创建新会话。
+- `--continue`：跳过菜单，续接当前项目最近使用的会话；没有历史会话时新建。
+- `--resume SESSION_ID`：跳过菜单，续接指定的未删除会话。已永久删除的会话无法恢复。
+
+输出选项同样互斥：`--verbose` 显示更完整的运行信息，`--debug` 显示调试级运行信息。
+
+不指定会话选项时，如果当前项目已有历史会话，CLI 会显示交互式菜单，可以选择历史会话、新建会话、永久删除会话或退出；没有历史会话时直接新建，不显示空菜单。
+
+在 `agent` 和 `tui` 的交互会话里可以使用 slash command：`/help`、`/new`、`/sessions`、`/resume <session_id>`、`/context`、`/compact`、`/exit`（别名 `/quit`）。
+
+会话和记忆保存在用户目录下的 `.mycode`，并按工作区路径区分项目，同名目录不会互相覆盖：
 
 ```text
-用户级：%USERPROFILE%\.mycode\.env
+%USERPROFILE%\.mycode\projects\<workspace-basename>-<12-char-hash>\sessions\<session-id>\
+%USERPROFILE%\.mycode\projects\<workspace-basename>-<12-char-hash>\MEMORY.md
+%USERPROFILE%\.mycode\MEMORY.md
+```
+
+## Configuration / 配置
+
+模型连接写在 `.env` 文件中，支持用户级和项目级两级：
+
+```text
+用户级（Windows）：%USERPROFILE%\.mycode\.env
 项目级：<workspace>\.mycode\.env
 ```
 
-`mycode agent` 按 `process environment > project > user > defaults` 逐字段取值；空字符串不构成有效覆盖。项目级路径严格使用 Agent 已确定的 workspace root，不向父目录搜索。项目根目录的 `<workspace>\.env` 仍不会读取，只有 `<workspace>\.mycode\.env` 是项目配置入口。`mycode chat` 暂无 workspace 语义，因此只使用进程环境、用户级配置和默认值。
+逐字段优先级为 `process environment > project > user > defaults`，空字符串不构成有效覆盖。项目级只需要写要覆盖的字段，其余回退到用户级配置；临时覆盖用进程环境变量。项目根目录的 `<workspace>\.env` 不会被读取。
 
 Windows PowerShell 首次配置：
 
@@ -58,19 +110,31 @@ if (-not (Test-Path $mycodeConfigFile)) {
 }
 ```
 
-然后编辑该文件。以下三项均为必填，必须将占位值替换为支持 OpenAI-compatible Chat Completions 的模型服务地址、模型名称和凭证：
+然后编辑该文件。必填三项：`MYCODE_API_KEY`、`MYCODE_BASE_URL`、`MYCODE_MODEL`。缺少任意一项时 MyCode 会拒绝启动并指出缺少的配置。
 
-```dotenv
-MYCODE_API_KEY=your-api-key
-MYCODE_BASE_URL=https://your-provider.example/v1
-MYCODE_MODEL=your-chat-completions-model
+常用可选项：
+
+- `MYCODE_COMPACT_MODEL`、`MYCODE_SUBAGENT_MODEL`：Compact 和 SubAgent 使用的模型，留空时继承 `MYCODE_MODEL`。
+- `LLM_CONTEXT_WINDOW_TOKENS`、`LLM_RESERVED_OUTPUT_TOKENS`、`LLM_CONTEXT_SAFETY_MARGIN_TOKENS`、`LLM_MEMORY_CONTEXT_TOKENS`：上下文预算，需要按模型实际的上下文窗口和输出上限设置。
+- `LLM_STREAM_INCLUDE_USAGE`：要求兼容的流式模型服务返回 token 用量。
+- `LLM_THINKING_ENABLED`、`LLM_REASONING_EFFORT`、`LLM_MAX_OUTPUT_TOKENS`：可选的推理配置，模型服务不支持时保持留空。
+
+完整字段和注释见 [`.env.example`](.env.example)。
+
+`mycode chat` 没有 workspace 语义，只使用进程环境、用户级配置和默认值。
+
+项目级 secret 放在 `<workspace>\.mycode\.env`，该文件已被 `.env` 的 Git ignore 规则排除；不要提交真实 API Key 或 token。
+
+## MCP / Skills
+
+### MCP
+
+MCP 用于把外部工具接入同一个 Agent Loop，支持 `stdio` 和 `streamable_http` 两种 transport，配置分用户级和项目级：
+
+```text
+用户级：%USERPROFILE%\.mycode\mcp.json
+项目级：<workspace>\.mycode\mcp.json
 ```
-
-缺少其中任意一项时，MyCode 都会拒绝启动并指出缺少的配置。完整配置项及说明参见 [`.env.example`](.env.example)。项目可以只覆盖少数字段，其余字段回退到用户级配置。项目 secret 应放在 `<workspace>\.mycode\.env`，该文件已由现有 `.env` Git ignore 规则排除；不要提交真实 API Key 或 token。
-
-## 配置 MCP 工具
-
-可选 MCP 配置位于用户级 `%USERPROFILE%\.mycode\mcp.json` 和项目级 `<workspace>\.mycode\mcp.json`。两份文件按 Server alias 合并：不同 alias 全部保留，同名 alias 由项目级覆盖；任一实际存在的文件无效都会报告配置错误。两份文件都缺少时 MCP 保持关闭。每个 transport 必须显式声明；secret 放在用户级或项目级 `.mycode\.env`，配置中只引用 `${ENV_VAR}`：
 
 ```json
 {
@@ -90,83 +154,70 @@ MYCODE_MODEL=your-chat-completions-model
 }
 ```
 
-MCP secret 使用与 Agent 模型配置一致的 `process environment > project .mycode/.env > user .mycode/.env` 优先级，空值不会清空较低层的有效值。`mcp.json` 可以纳入 Git，`.mycode/skills/` 也仍是项目资产；不要忽略整个 `.mycode/` 目录。
+secret 不写进 `mcp.json`，而是放在 `.mycode\.env` 里用 `${ENV_VAR}` 引用。用户级配置视为你本人的主动配置；项目级 MCP 会在启动时要求一次信任确认，确认前不会建立连接。MCP 工具注册后仍然走 MyCode 的 JSON Schema 校验、Permission 和确认链，与内置工具一致。
 
-用户级 `mcp.json` 视为用户主动配置，stdio 与 Streamable HTTP 都默认可信。自动从项目 `mcp.json` 发现的所有 Server 都必须先通过独立的 `MCP trust>` 整体确认；这同时保护 stdio 本地进程和 HTTP 网络连接、header secret 发送。确认默认拒绝且只有 `y/yes` 才批准。拒绝会过滤整个 project MCP 层，只保留 user MCP；若项目 Server 覆盖了同名 user alias，该 alias 会回退到用户配置。显式通过 Python API 注入的 `mcp_config=` 视为调用方已批准，不触发项目级确认。
+### Skills
 
-批准状态原子写入用户目录 `%USERPROFILE%\.mycode\mcp-trust.json`，格式为 `{"version": 1, "projects": {"<ProjectIdentity.key>": "<SHA-256>"}}`。canonical JSON 指纹覆盖整份项目 MCP：stdio 包含 alias、transport、解析前后 command/args、未解析 env 定义与 connect/tool timeout；HTTP 包含 alias、transport、解析前后 URL、未解析 headers 定义与两个 timeout。集合或任一执行字段变化都会重新确认。文件只保存 digest，不保存 URL、command、参数、header、env 或 secret；旧的 stdio-only digest 无法授权后来加入的 HTTP。信任文件缺失表示未信任；JSON/schema 损坏会 fail closed、警告并重新确认；用户已批准但写入失败时，本次仍启用并警告下次会再次询问。
+Skill 是可复用的任务流程包，由 `SKILL.md` 和可选的参考文件、脚本组成，按 `builtin -> user -> project` 顺序发现，同名时项目级覆盖用户级、用户级覆盖内置。内置 Skill 目前是 `database-recovery`。
 
-统一确认会用安全 repr 展示 stdio 的未解析 command/args 和 env key。HTTP 展示未解析 URL 模板的安全形式、从解析后 URL 提取的 `scheme://host[:port]` destination，以及 header key；不会显示 URL userinfo、query、fragment、resolved header value 或 token。确认发生在构造实际 effective config 与 `MCPManager.start()` 之前，未信任的项目 HTTP 不会进入 client、DNS、初始化或 discovery 路径。
-
-启动 `mycode agent` 时会并行连接各 Server、一次性分页发现工具并显示各自状态；单个 Server 失败不会阻止 Agent 启动。失败状态会显示经过安全归类的简短摘要，例如连接超时、命令不存在或 HTTP 401/403，不显示 header、token、query 或响应正文。本 Runtime 内工具快照固定，修改配置后需退出并重启。模型侧工具名使用 `mcp__<server_alias>__<safe_remote_name>`，不合法字符或超长名称会附加稳定短 hash，协议调用仍使用 Server 的原始工具名。
-
-MCP 工具仍经过 MyCode 的 JSON Schema、Permission 与确认链。`destructiveHint=true` 映射为 write/high；明确 `readOnlyHint=true` 且非 destructive 时映射为 read/low，`openWorldHint` 不会把明确只读工具改写为 write；缺失或未知信息保守走既有确认。所有 annotations 都只是风险提示，不是可信授权。退出时 Manager 会限时等待连接清理；Python 线程不能被强杀，超时会保留线程引用并记录结构化失败状态，而不会假称关闭成功。
-
-## 在目标项目中运行
-
-MyCode 将启动命令时的**当前目录**作为 Agent 工作区。安装命令后，先进入想让 Agent 操作的项目：
-
-```powershell
-cd D:\path\to\your-project
-mycode agent
+```text
+用户级：%USERPROFILE%\.mycode\skills\
+项目级：<workspace>\.mycode\skills\
 ```
 
-当前 CLI 没有 `--workspace PATH` 参数。切换工作区时，需要先进入目标目录再启动；建议只在受信任且已经使用 Git 的项目中运行。
+## Safety / 安全说明
 
-### 查看命令帮助
-
-```powershell
-mycode --help
-mycode agent --help
-```
-
-帮助命令也可以简写为 `-h`。`mycode agent` 启动 coding agent，`mycode chat` 启动不带 coding tools 的普通模型对话。会话默认保存在 `%USERPROFILE%\.mycode\projects\<workspace-basename>-<12-char-hash>\`，并按工作区路径区分项目；每个会话的数据位于该项目目录的 `sessions\<session-id>\` 下。
-
-### Agent 会话启动方式
-
-直接运行 `mycode agent` 时，如果当前项目存在历史会话，CLI 会显示交互式菜单，供你选择历史会话、创建新会话、永久删除会话或退出；如果当前项目没有历史会话，则自动创建新会话，不显示空菜单。
-
-也可以使用会话选项跳过菜单：
-
-- `mycode agent --new`：直接创建新会话。
-- `mycode agent --continue`：续接当前项目最近使用的会话；没有历史会话时创建新会话。
-- `mycode agent --resume SESSION_ID`：续接指定的未删除会话。
-
-`--resume` 只用于续接仍然存在的会话，不支持恢复已经永久删除的会话。上述三个会话选项互斥，不能同时使用。
-
-## 安全边界
-
-MyCode 能够修改文件和执行命令。使用前请注意：
+MyCode 能够修改文件和执行命令，使用前请注意：
 
 - 先提交或备份重要修改，并确认当前目录就是目标工作区。
 - 路径和命令策略会允许、拒绝或要求人工确认工具调用，但不能替代系统级沙箱。
-- Agent 完成后使用 `git status` 和 `git diff` 检查实际改动。
+- 命令执行使用结构化参数、不经过 shell；需要人工确认的操作会明确提示。
+- Agent 完成后用 `git status` 和 `git diff` 检查实际改动。
+- MCP Server、文件和网页内容都按不可信外部输入处理，其中的指令不能覆盖 System Prompt、Permission 规则和运行时控制。
 - 不要在源码、测试、提示词或 Git 历史中写入真实密钥。
 
-## 运行测试
+## Development / 开发与测试
 
-在 MyCode 仓库根目录执行：
+从源码运行：
+
+```powershell
+git clone https://github.com/mmc-cloud/mycode.git
+cd mycode
+uv sync
+uv run mycode agent
+```
+
+把本地 checkout 安装成全局命令：
+
+```powershell
+uv tool install .
+```
+
+运行测试：
 
 ```powershell
 uv run pytest
 ```
 
-当前公开版本已在 Windows、Python 3.11 环境中验证。
-
-## 项目结构
+项目结构：
 
 ```text
-mycode/          核心 Agent、CLI、工具、会话、上下文和 SubAgent 实现
-tests/           可公开的核心测试
+mycode/          核心 Agent、CLI/TUI、工具、会话、上下文、MCP、Skill 和 SubAgent 实现
+tests/           核心测试
 .env.example     用户级或项目级模型配置模板
 pyproject.toml   包信息、依赖、CLI 入口和测试配置
 uv.lock          锁定的依赖版本
 ```
 
-## 当前限制
+## Current Limitations / 当前限制
 
-- 当前以 CLI 交互为主，不包含 IDE 插件或图形界面。
-- 源码包含部分 POSIX 兼容实现，但 macOS/Linux 尚未经过实际验证，目前不作为受支持平台。
-- 不同 OpenAI-compatible 服务对流式 usage、thinking 和 reasoning 字段的支持可能不同。
-- Agent 的输出和工具决策仍需要人工审查，不能替代代码评审和测试。
-- MCP 第一版不支持 OAuth、Resources、Prompts、Sampling、热加载、复杂管理命令或原生 Image/Audio ToolResult。
+- 主要验证环境是 Windows + PowerShell；macOS/Linux 尚未充分实际验证，目前不作为受支持平台。
+- 需要 Python 3.11 或更高版本。
+- 不同 OpenAI-compatible Provider 对流式 usage、thinking 和 reasoning 字段的支持可能存在差异，协议行为不完全一致。
+- Agent 可以修改文件和执行命令，建议在 Git 管理的项目中运行并检查 diff；输出和工具决策仍需人工审查。
+- MCP 第一版不支持 OAuth、Resources、Prompts、Sampling、热加载或原生 Image/Audio ToolResult。
+- 当前以终端交互为主，不包含 IDE 插件或图形界面。
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

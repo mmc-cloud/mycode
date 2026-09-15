@@ -166,6 +166,7 @@ class ConversationCompactor:
         tools: list[dict[str, object]] | None = None,
         memory_message: Message | None = None,
         observability_turn: int | None = None,
+        force: bool = False,
     ) -> PreparedCompactContext:
         non_system_messages = _non_system_messages(conversation)
         message_count = len(non_system_messages)
@@ -197,7 +198,7 @@ class ConversationCompactor:
         trigger_tokens = math.ceil(
             budget.max_input_tokens * self.policy.trigger_ratio
         )
-        if current_estimate.estimated_input_tokens < trigger_tokens:
+        if not force and current_estimate.estimated_input_tokens < trigger_tokens:
             return self._prepared_view(
                 conversation,
                 boundary=boundary,
@@ -318,6 +319,67 @@ class ConversationCompactor:
             status="compacted",
             message_count=message_count,
             attempt_token_usage=attempt_usage,
+        )
+
+    def preview(
+        self,
+        conversation: Conversation,
+        budget: ContextBudget,
+        *,
+        token_estimator: TokenEstimator,
+        tools: list[dict[str, object]] | None = None,
+        memory_message: Message | None = None,
+    ) -> PreparedCompactContext:
+        """Build the current Compact view without calling the summary model.
+
+        This is intentionally read-only. It exposes the active persisted
+        boundary for context inspection while leaving cooldown, breaker, and
+        persistence state untouched.
+        """
+        non_system_messages = _non_system_messages(conversation)
+        message_count = len(non_system_messages)
+        boundary = self.state.boundary
+        if boundary is not None and not _boundary_is_valid(
+            boundary,
+            non_system_messages,
+        ):
+            return self._prepared_view(
+                conversation,
+                boundary=None,
+                status="invalid_boundary",
+                message_count=message_count,
+            )
+
+        current_view = _conversation_for_boundary(conversation, boundary)
+        current_estimate = estimate_conversation(
+            _with_optional_memory(current_view, memory_message),
+            budget,
+            tools=tools,
+            token_estimator=token_estimator,
+        )
+        trigger_tokens = math.ceil(budget.max_input_tokens * self.policy.trigger_ratio)
+        if current_estimate.estimated_input_tokens < trigger_tokens:
+            status = "active" if boundary is not None else "not_needed"
+        elif message_count < self.state.retry_after_message_count:
+            status = (
+                "circuit_open"
+                if self.state.consecutive_failure_count
+                >= self.policy.breaker_failure_threshold
+                else "cooldown"
+            )
+        elif _compaction_candidate(
+            non_system_messages,
+            boundary=boundary,
+            recent_turns_to_keep=self.policy.recent_turns_to_keep,
+        ) is None:
+            status = "insufficient_history"
+        else:
+            status = "eligible"
+        return self._prepared_view(
+            conversation,
+            boundary=boundary,
+            status=status,
+            message_count=message_count,
         )
 
     def _emit_model_response(

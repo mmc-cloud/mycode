@@ -4,11 +4,13 @@ import pytest
 
 from mycode.application import build_agent_runner
 from mycode.application import context_budget_from_config
+from mycode.application.agent_session import ContextStatus
 from mycode.cli import build_chat_session
 from mycode.cli import main
 from mycode.cli import run_agent_command
 from mycode.cli import run_agent_loop
 from mycode.cli import run_chat_loop
+from mycode.cli import _output_context_status
 from mycode.event_format import summarize_tool_arguments
 from mycode.agent.events import (
     AgentEvent,
@@ -154,7 +156,7 @@ def test_main_prints_greeting(capsys) -> None:
 
     captured = capsys.readouterr()
 
-    assert captured.out == "mycode-project 已就绪。\n"
+    assert captured.out == "MyCode 已就绪。\n"
 
 
 @pytest.mark.parametrize("help_flag", ["-h", "--help"])
@@ -165,7 +167,7 @@ def test_main_prints_top_level_help(help_flag, capsys) -> None:
     captured = capsys.readouterr()
 
     assert error.value.code == 0
-    assert "轻量级 coding agent" in captured.out
+    assert "可扩展终端 coding agent" in captured.out
     assert "agent" in captured.out
     assert "chat" in captured.out
     assert "mycode <子命令> --help" in captured.out
@@ -1531,6 +1533,235 @@ def test_run_agent_command_uses_same_io_for_confirmer(tmp_path, monkeypatch) -> 
     assert outputs[1:] == ["输入 /exit 或 /quit 退出。"]
 
 
+def test_agent_commands_help_sessions_and_context_commands(
+    tmp_path, monkeypatch
+) -> None:
+    runners: list[FakeRunner] = []
+
+    def fake_build_agent_runner(**kwargs):
+        runner = FakeRunner(event_batches=[])
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "mycode.application.agent_session.build_agent_runner",
+        fake_build_agent_runner,
+    )
+    inputs = iter(
+        ["/help", "/sessions", "/context", "/compact", "/new", "/sessions", "/exit"]
+    )
+    outputs: list[str] = []
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: next(inputs),
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert len(runners) == 2
+    assert any("/help" in output for output in outputs)
+    assert any("/quit" in output and "/exit" in output for output in outputs)
+    assert "command> Context" in outputs
+    assert any(output.startswith("context> compact failed:") for output in outputs)
+    assert not any("not available yet" in output for output in outputs)
+    session_lines = [output for output in outputs if output.startswith("command> ")]
+    assert any("sessions in current project" in output for output in session_lines)
+    assert sum(output.startswith("command> * ") for output in session_lines) == 2
+
+
+def test_cli_context_status_uses_max_input_and_shows_memory_none() -> None:
+    outputs: list[str] = []
+
+    _output_context_status(
+        ContextStatus(
+            estimated_input_tokens=120,
+            context_window_tokens=1000,
+            max_input_tokens=900,
+            reserved_output_tokens=80,
+            safety_margin_tokens=20,
+            estimate_source="default",
+            last_provider_prompt_tokens=None,
+            source_message_count=2,
+            model_visible_message_count=2,
+            memory_entry_count=0,
+            memory_estimated_tokens=1420,
+            compact_status="none",
+            compact_covered_message_count=0,
+            compressed_tool_result_count=0,
+        ),
+        outputs.append,
+    )
+
+    assert "command> estimated input: 120 / 900 tokens (13.3%)" in outputs
+    assert "command> context window: 1,000" in outputs
+    assert "command> memory: none" in outputs
+
+
+def test_agent_resume_switches_session_and_current_session_noop(
+    tmp_path, monkeypatch
+) -> None:
+    store = SessionStore(tmp_path / "projects")
+    project = ProjectIdentity.from_workspace(tmp_path)
+    store.create_session(project, session_id="target", title="Target session")
+    build_calls = 0
+
+    def fake_build_agent_runner(**kwargs):
+        nonlocal build_calls
+        build_calls += 1
+        return FakeRunner(event_batches=[])
+
+    monkeypatch.setattr(
+        "mycode.application.agent_session.build_agent_runner",
+        fake_build_agent_runner,
+    )
+    inputs = iter(["/resume target", "/sessions", "/exit"])
+    outputs: list[str] = []
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: next(inputs),
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=store,
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert build_calls == 2
+    assert any("已恢复 target" in output for output in outputs)
+    assert any(output.startswith("command> * target  Target session") for output in outputs)
+
+    current_outputs: list[str] = []
+    current_inputs = iter(["/resume target", "/exit"])
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: next(current_inputs),
+        output_func=current_outputs.append,
+        session_request=SessionStartRequest(mode="resume", session_id="target"),
+        session_store=store,
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert "session> already using current session" in current_outputs
+    assert build_calls == 3
+
+
+def test_agent_resume_failure_keeps_current_session_for_next_turn(
+    tmp_path, monkeypatch
+) -> None:
+    runners: list[FakeRunner] = []
+
+    def fake_build_agent_runner(**kwargs):
+        runner = FakeRunner(
+            event_batches=[
+                [AgentEvent(type="stop", stop_reason="final_answer")],
+            ]
+        )
+        runners.append(runner)
+        return runner
+
+    monkeypatch.setattr(
+        "mycode.application.agent_session.build_agent_runner",
+        fake_build_agent_runner,
+    )
+    inputs = iter(["/resume missing", "still here", "/exit"])
+    outputs: list[str] = []
+    store = SessionStore(tmp_path / "projects")
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: next(inputs),
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=store,
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert any("Session not found in current project: missing" in output for output in outputs)
+    assert runners[0].seen_messages == ["still here"]
+    assert len(store.list_sessions(ProjectIdentity.from_workspace(tmp_path))) == 1
+
+
+def test_agent_new_keeps_replacement_when_old_session_cleanup_fails(
+    tmp_path, monkeypatch
+) -> None:
+    class FakeApplicationSession:
+        def __init__(self, session_id: str, runner: FakeRunner, *, close_error=None):
+            self.runner = runner
+            self.compact_state_recovered = False
+            self.mcp_statuses = ()
+            self.active_project_session = type(
+                "ActiveSession",
+                (),
+                {
+                    "created": session_id == "replacement",
+                    "record": type(
+                        "SessionRecord",
+                        (),
+                        {"id": session_id, "title": f"{session_id} title"},
+                    )(),
+                },
+            )()
+            self.close_error = close_error
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_error is not None:
+                raise self.close_error
+
+        def interrupt(self) -> None:
+            pass
+
+        def run_turn(self, content, *, event_handler=None):
+            assert self.close_calls == 0
+            self.runner.seen_messages.append(content)
+            return AgentRunOutcome.from_stop_reason("final_answer")
+
+    old_runner = FakeRunner(event_batches=[])
+    replacement_runner = FakeRunner(
+        event_batches=[
+            [AgentEvent(type="stop", stop_reason="final_answer")],
+        ]
+    )
+    old_session = FakeApplicationSession(
+        "old",
+        old_runner,
+        close_error=RuntimeError("old cleanup failed"),
+    )
+    replacement = FakeApplicationSession("replacement", replacement_runner)
+    starts = iter([old_session, replacement])
+
+    monkeypatch.setattr(
+        "mycode.cli.start_agent_application_session",
+        lambda *args, **kwargs: next(starts),
+    )
+    inputs = iter(["/new", "continue with replacement", "/exit"])
+    outputs: list[str] = []
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: next(inputs),
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert old_runner.seen_messages == []
+    assert replacement_runner.seen_messages == ["continue with replacement"]
+    assert old_session.close_calls == 1
+    assert replacement.close_calls == 1
+    assert any("旧 Session 清理失败" in output for output in outputs)
+
+
 def test_run_agent_command_retries_default_menu_after_session_race(
     tmp_path,
     monkeypatch,
@@ -1892,6 +2123,8 @@ class FakeRunner:
     def __init__(self, event_batches: list[list[AgentEvent]]) -> None:
         self.event_batches = event_batches
         self.seen_messages: list[str] = []
+        self.context_budget = ContextBudget()
+        self.last_token_usage = None
 
     def run(self, user_message: str):
         self.seen_messages.append(user_message)
@@ -1900,3 +2133,11 @@ class FakeRunner:
             raise RuntimeError("FakeRunner has no event batches left")
 
         yield from self.event_batches.pop(0)
+
+    def inspect_context(self):
+        from mycode.context.budget import build_model_context
+
+        return build_model_context(Conversation(), self.context_budget)
+
+    def compact_context(self):
+        return self.inspect_context()

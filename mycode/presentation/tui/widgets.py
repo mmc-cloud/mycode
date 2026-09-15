@@ -21,7 +21,7 @@ SPLASH_LOGO = r"""        ╭──────────╮
 |_|  |_|\__, |\____\___/ \__,_|\___|
         |___/
 
-        Lightweight Coding Agent"""
+        Extensible Terminal Coding Agent"""
 
 
 @dataclass

@@ -29,7 +29,7 @@ An extensible terminal coding agent built with Python.
 使用 uv 安装：
 
 ```powershell
-uv tool install mycode
+uv tool install mycode-coding-agent
 ```
 
 安装后 `mycode` 可以在任意目录使用。从源码安装见 [Development](#development--开发与测试)。

@@ -1,5 +1,5 @@
 [project]
-name = "mycode"
+name = "mycode-coding-agent"
 version = "0.1.0"
 description = "A terminal coding agent with tool calling, context management, subagents, MCP, and skills."
 readme = "README.md"

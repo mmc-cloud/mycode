@@ -16,17 +16,17 @@ from mycode.agent.events import (
     AgentProgressSnapshot,
     AgentToolCall,
 )
-from mycode.application.agent_session import AgentApplicationSession, start_agent_application_session
+from mycode.application import (
+    AgentApplicationSession,
+    ApplicationStartupWarning,
+    create_application_environment,
+    prepare_application_session_factory,
+)
 from mycode.application.events import RuntimeEvent
 from mycode.application.sessions import SessionStartRequest
 from mycode.config import LLMConfig
-from mycode.mcp import (
-    MCPConfig,
-    MCPConfigError,
-    MCPServerStatus,
-    load_mcp_config_layers,
-    resolve_project_mcp_trust,
-)
+from mycode.mcp.config import MCPConfig
+from mycode.mcp.models import MCPServerStatus
 from mycode.mcp.trust import MCPTrustRequest, MCPTrustServer, MCPTrustWarning
 from mycode.permissions import (
     ConfirmationRequest,
@@ -39,9 +39,7 @@ from mycode.persistence.session_store import (
     SessionStore,
     SessionStoreError,
 )
-from mycode.project import ProjectIdentity
-from mycode.tools import ToolResult
-from mycode.tools.workspace import Workspace
+from mycode.tools.base import ToolResult
 
 
 JSONL_PROTOCOL_VERSION = 1
@@ -253,29 +251,38 @@ def run_jsonl_runtime(
         output_stream=sys.stdout if output_stream is None else output_stream,
         error_stream=sys.stderr if error_stream is None else error_stream,
     )
-    workspace = Workspace(Path.cwd() if workspace_path is None else workspace_path)
-    project = ProjectIdentity.from_workspace(workspace.root)
-    store = SessionStore() if session_store is None else session_store
+    environment = create_application_environment(
+        workspace_path,
+        session_store=session_store,
+    )
     request = (
         SessionStartRequest(mode="continue")
         if session_request is None
         else session_request
     )
 
-    effective_mcp_config = mcp_config
-    if effective_mcp_config is None:
-        effective_mcp_config = _resolve_machine_mcp_config(channel, workspace, project)
-
     confirmer = JsonlConfirmer(channel)
-    try:
-        application_session = start_agent_application_session(
-            store,
-            project,
-            request=request,
-            mcp_config=effective_mcp_config,
-            confirmer=confirmer,
-            llm_config=llm_config,
+    trust_confirmer = JsonlMCPTrustConfirmer(channel)
+
+    def handle_startup_warning(warning: ApplicationStartupWarning) -> None:
+        channel.emit(
+            {
+                "type": "runtime_error",
+                "code": warning.code,
+                "message": warning.message,
+            }
         )
+
+    try:
+        factory = prepare_application_session_factory(
+            environment,
+            llm_config=llm_config,
+            mcp_config=mcp_config,
+            confirmer=confirmer,
+            mcp_trust_confirmer=trust_confirmer,
+            warning_handler=handle_startup_warning,
+        )
+        application_session = factory.open_session(request)
     except (SessionNotFoundError, SessionInUseError, SessionStoreError) as error:
         channel.emit(
             {
@@ -307,41 +314,6 @@ def run_jsonl_runtime(
         channel.diagnostic(f"runtime failed: {type(error).__name__}: {error}")
         _interrupt_application_session(channel, application_session)
         return 1
-
-
-def _resolve_machine_mcp_config(
-    channel: JsonlChannel,
-    workspace: Workspace,
-    project: ProjectIdentity,
-) -> MCPConfig:
-    try:
-        loaded = load_mcp_config_layers(workspace_root=workspace.root)
-    except MCPConfigError as error:
-        channel.emit(
-            {
-                "type": "runtime_error",
-                "code": "mcp_config_error",
-                "message": str(error),
-            }
-        )
-        return MCPConfig()
-
-    try:
-        return resolve_project_mcp_trust(
-            loaded,
-            project,
-            confirmer=JsonlMCPTrustConfirmer(channel),
-        ).config
-    except Exception as error:  # noqa: BLE001 - trust startup boundary
-        channel.diagnostic(f"mcp trust resolution failed: {type(error).__name__}: {error}")
-        channel.emit(
-            {
-                "type": "runtime_error",
-                "code": "mcp_trust_failed",
-                "message": "MCP trust resolution failed.",
-            }
-        )
-        return MCPConfig()
 
 
 def _run_message_loop(

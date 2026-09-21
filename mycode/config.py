@@ -6,6 +6,8 @@ from typing import Literal
 
 from dotenv import dotenv_values
 
+from mycode import startup_profile
+
 MYCODE_CONFIG_DIR_NAME = ".mycode"
 MYCODE_ENV_FILE_NAME = ".env"
 DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 128000
@@ -139,99 +141,100 @@ def load_llm_config(
     *,
     workspace_root: str | Path | None = None,
 ) -> LLMConfig:
-    values = _RedactedConfigValues(
-        load_layered_environment(
-            env_file,
-            workspace_root=workspace_root,
-        )
-    )
-
-    api_key = _required_env_value(
-        "MYCODE_API_KEY",
-        values,
-    )
-    base_url = _required_env_value(
-        "MYCODE_BASE_URL",
-        values,
-    )
-    model = _required_env_value(
-        "MYCODE_MODEL",
-        values,
-    )
-    compact_model = _env_value(
-        "MYCODE_COMPACT_MODEL",
-        model,
-        values,
-    )
-    subagent_model = _env_value(
-        "MYCODE_SUBAGENT_MODEL",
-        model,
-        values,
-    )
-    context_window_tokens = _int_env_value(
-        "LLM_CONTEXT_WINDOW_TOKENS",
-        DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
-        values,
-        minimum=1,
-    )
-    reserved_output_tokens = _int_env_value(
-        "LLM_RESERVED_OUTPUT_TOKENS",
-        DEFAULT_LLM_RESERVED_OUTPUT_TOKENS,
-        values,
-        minimum=0,
-    )
-    context_safety_margin_tokens = _int_env_value(
-        "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
-        DEFAULT_LLM_CONTEXT_SAFETY_MARGIN_TOKENS,
-        values,
-        minimum=0,
-    )
-    memory_context_tokens = _int_env_value(
-        "LLM_MEMORY_CONTEXT_TOKENS",
-        DEFAULT_LLM_MEMORY_CONTEXT_TOKENS,
-        values,
-        minimum=0,
-    )
-    stream_include_usage = _bool_env_value(
-        "LLM_STREAM_INCLUDE_USAGE",
-        DEFAULT_LLM_STREAM_INCLUDE_USAGE,
-        values,
-    )
-    thinking_enabled = _optional_bool_env_value(
-        "LLM_THINKING_ENABLED",
-        values,
-    )
-    reasoning_effort = _optional_reasoning_effort_env_value(
-        "LLM_REASONING_EFFORT",
-        values,
-    )
-    max_output_tokens = _optional_int_env_value(
-        "LLM_MAX_OUTPUT_TOKENS",
-        values,
-        minimum=1,
-    )
-
-    if reserved_output_tokens + context_safety_margin_tokens >= context_window_tokens:
-        raise ValueError(
-            "LLM_RESERVED_OUTPUT_TOKENS and LLM_CONTEXT_SAFETY_MARGIN_TOKENS "
-            "must leave at least 1 input token."
+    with startup_profile.span("config.llm"):
+        values = _RedactedConfigValues(
+            load_layered_environment(
+                env_file,
+                workspace_root=workspace_root,
+            )
         )
 
-    return LLMConfig(
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        compact_model=compact_model,
-        subagent_model=subagent_model,
-        context_window_tokens=context_window_tokens,
-        reserved_output_tokens=reserved_output_tokens,
-        context_safety_margin_tokens=context_safety_margin_tokens,
-        memory_context_tokens=memory_context_tokens,
-        stream_include_usage=stream_include_usage,
-        thinking_enabled=thinking_enabled,
-        reasoning_effort=reasoning_effort,
-        max_output_tokens=max_output_tokens,
-    )
+        api_key = _required_env_value(
+            "MYCODE_API_KEY",
+            values,
+        )
+        base_url = _required_env_value(
+            "MYCODE_BASE_URL",
+            values,
+        )
+        model = _required_env_value(
+            "MYCODE_MODEL",
+            values,
+        )
+        compact_model = _env_value(
+            "MYCODE_COMPACT_MODEL",
+            model,
+            values,
+        )
+        subagent_model = _env_value(
+            "MYCODE_SUBAGENT_MODEL",
+            model,
+            values,
+        )
+        context_window_tokens = _int_env_value(
+            "LLM_CONTEXT_WINDOW_TOKENS",
+            DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
+            values,
+            minimum=1,
+        )
+        reserved_output_tokens = _int_env_value(
+            "LLM_RESERVED_OUTPUT_TOKENS",
+            DEFAULT_LLM_RESERVED_OUTPUT_TOKENS,
+            values,
+            minimum=0,
+        )
+        context_safety_margin_tokens = _int_env_value(
+            "LLM_CONTEXT_SAFETY_MARGIN_TOKENS",
+            DEFAULT_LLM_CONTEXT_SAFETY_MARGIN_TOKENS,
+            values,
+            minimum=0,
+        )
+        memory_context_tokens = _int_env_value(
+            "LLM_MEMORY_CONTEXT_TOKENS",
+            DEFAULT_LLM_MEMORY_CONTEXT_TOKENS,
+            values,
+            minimum=0,
+        )
+        stream_include_usage = _bool_env_value(
+            "LLM_STREAM_INCLUDE_USAGE",
+            DEFAULT_LLM_STREAM_INCLUDE_USAGE,
+            values,
+        )
+        thinking_enabled = _optional_bool_env_value(
+            "LLM_THINKING_ENABLED",
+            values,
+        )
+        reasoning_effort = _optional_reasoning_effort_env_value(
+            "LLM_REASONING_EFFORT",
+            values,
+        )
+        max_output_tokens = _optional_int_env_value(
+            "LLM_MAX_OUTPUT_TOKENS",
+            values,
+            minimum=1,
+        )
+
+        if reserved_output_tokens + context_safety_margin_tokens >= context_window_tokens:
+            raise ValueError(
+                "LLM_RESERVED_OUTPUT_TOKENS and LLM_CONTEXT_SAFETY_MARGIN_TOKENS "
+                "must leave at least 1 input token."
+            )
+
+        return LLMConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            compact_model=compact_model,
+            subagent_model=subagent_model,
+            context_window_tokens=context_window_tokens,
+            reserved_output_tokens=reserved_output_tokens,
+            context_safety_margin_tokens=context_safety_margin_tokens,
+            memory_context_tokens=memory_context_tokens,
+            stream_include_usage=stream_include_usage,
+            thinking_enabled=thinking_enabled,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
+        )
 
 
 def _required_env_value(

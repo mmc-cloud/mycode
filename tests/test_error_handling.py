@@ -19,10 +19,28 @@ from openai import (
 
 from mycode.error_handling import (
     MAX_MODEL_RETRY_DELAY_SECONDS,
-    classify_model_error,
-    extract_provider_diagnostic,
-    format_model_error,
+    classify_model_error as classify_generic_model_error,
+    extract_provider_diagnostic as extract_generic_provider_diagnostic,
+    format_model_error as format_generic_model_error,
 )
+from mycode.model_errors import ModelProviderError, safe_error_summary
+from mycode.providers.openai_errors import normalize_openai_error
+
+
+def _provider_error(error: Exception) -> Exception:
+    return normalize_openai_error(error)
+
+
+def classify_model_error(error: Exception):
+    return classify_generic_model_error(_provider_error(error))
+
+
+def format_model_error(error: Exception, *, operation: str) -> str:
+    return format_generic_model_error(_provider_error(error), operation=operation)
+
+
+def extract_provider_diagnostic(error: Exception):
+    return extract_generic_provider_diagnostic(_provider_error(error))
 
 
 def request() -> httpx.Request:
@@ -187,6 +205,72 @@ def test_http_408_is_retryable_timeout() -> None:
     assert "HTTP 408" in classified.message
 
 
+def test_unrecognized_openai_status_error_is_normalized() -> None:
+    error = APIStatusError(
+        "unexpected provider status",
+        response=response(418),
+        body={"error": {"type": "unexpected_status"}},
+    )
+
+    normalized = normalize_openai_error(error)
+
+    assert isinstance(normalized, ModelProviderError)
+    assert normalized.code == "unknown"
+    assert normalized.retryable is None
+    assert normalized.provider_error_type == "APIStatusError"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "Bearer bearer-secret-123",
+        "api_key=api-secret-123",
+        "sk-secret-token-123",
+        "Cookie: session=secret-cookie-123",
+    ],
+)
+def test_provider_error_summary_redacts_secrets(secret: str) -> None:
+    error = APIStatusError(
+        f"provider rejected {secret}",
+        response=response(418),
+        body=None,
+    )
+
+    normalized = normalize_openai_error(error)
+
+    assert isinstance(normalized, ModelProviderError)
+    assert "[redacted]" in str(normalized)
+    assert "secret" not in str(normalized)
+
+
+@pytest.mark.parametrize("error", [AttributeError("bug"), AssertionError("bug")])
+def test_programming_errors_are_not_normalized(error: Exception) -> None:
+    assert normalize_openai_error(error) is error
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "Bearer cutoff-bearer-token",
+        "api_key=cutoff-api-secret",
+        "sk-cutoffsecretvalue",
+        "Cookie: session=cutoff-cookie",
+    ],
+)
+def test_safe_error_summary_redacts_a_secret_that_crosses_the_truncation_cutoff(
+    secret: str,
+) -> None:
+    """A long prefix must not push redaction past the 500-character cutoff."""
+    error = Exception("x" * 480 + " " + secret + " tail" * 40)
+
+    summary = safe_error_summary(error)
+
+    assert "[redacted]" in summary
+    assert len(summary) <= 500
+    for fragment in secret.split("=")[-1].split(":")[-1].replace("Bearer ", "").split():
+        assert fragment not in summary
+
+
 def test_bad_request_format_includes_safe_provider_diagnostic() -> None:
     error = BadRequestError(
         "bad request",
@@ -324,7 +408,7 @@ def test_rate_limit_retry_after_seconds_is_capped() -> None:
 
 
 def test_rate_limit_retry_after_http_date_is_capped(monkeypatch) -> None:
-    monkeypatch.setattr("mycode.error_handling.time", lambda: 1000.0)
+    monkeypatch.setattr("mycode.providers.openai_errors.time", lambda: 1000.0)
     retry_at = datetime.fromtimestamp(1040.0, tz=timezone.utc)
     error = RateLimitError(
         "too many requests",

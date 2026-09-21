@@ -4,13 +4,20 @@ from mycode.application.agent_session import (
     AgentApplicationSession,
     CompactResult,
     ContextStatus,
-    start_agent_application_session,
 )
 from mycode.application.events import RuntimeEvent, RuntimeEventType
 from mycode.application.runtime import (
     build_agent_runner,
     context_budget_from_config,
     run_agent_turn,
+)
+from mycode.application.startup import (
+    ApplicationEnvironment,
+    ApplicationSessionFactory,
+    ApplicationStartupWarning,
+    create_application_environment,
+    prepare_application_session_factory,
+    resolve_application_llm_config,
 )
 from mycode.application.sessions import (
     ActiveProjectSession,
@@ -22,6 +29,9 @@ from mycode.application.sessions import (
 
 __all__ = [
     "ActiveProjectSession",
+    "ApplicationEnvironment",
+    "ApplicationSessionFactory",
+    "ApplicationStartupWarning",
     "AgentApplicationSession",
     "CompactResult",
     "ContextStatus",
@@ -30,9 +40,11 @@ __all__ = [
     "SessionStartRequest",
     "build_agent_runner",
     "context_budget_from_config",
+    "create_application_environment",
     "delete_project_session",
     "list_project_sessions",
     "run_agent_turn",
-    "start_agent_application_session",
+    "prepare_application_session_factory",
+    "resolve_application_llm_config",
     "start_project_session",
 ]

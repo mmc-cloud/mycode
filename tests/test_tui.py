@@ -28,7 +28,7 @@ from mycode.application.sessions import SessionStartRequest
 from mycode.cli import main
 from mycode.config import LLMConfig
 from mycode.conversation import Conversation
-from mycode.mcp import MCPConfig
+from mycode.mcp.config import MCPConfig
 from mycode.mcp.models import MCPServerStatus
 from mycode.mcp.trust import MCPTrustRequest, MCPTrustServer
 from mycode.permissions import (
@@ -51,11 +51,43 @@ from mycode.presentation.tui.screens import (
     PermissionScreen,
     WelcomeScreen,
 )
-from mycode.presentation.tui.widgets import ConversationView, HeaderBar, StatusBar
-from mycode.tools import ToolResult
+from mycode.presentation.commands import COMMAND_SPECS
+from mycode.presentation.tui.widgets import (
+    CommandPicker,
+    ConversationView,
+    HeaderBar,
+    PromptTextArea,
+    StatusBar,
+    filter_command_specs,
+)
+from mycode.startup_profile import (
+    STARTUP_PROFILE_ENV_VAR,
+    STARTUP_PROFILE_FILE_ENV_VAR,
+)
+from mycode.tools.base import ToolResult
 from mycode.messages import Message
 from textual.css.query import NoMatches
+from textual.events import Key, Paste
+from textual.widget import Widget
 from textual.widgets import OptionList
+from textual._xterm_parser import XTermParser
+
+
+async def _wait_for_child(pilot, screen, selector: str) -> Widget:
+    """Wait until ``selector`` is mounted on ``screen``, then return it.
+
+    Pushing or switching a screen is asynchronous: the screen becomes current
+    before its children are composed, so querying right after a timed
+    ``pilot.pause(delay)`` can raise ``NoMatches`` on a busy machine. Waiting
+    for the child itself is what makes the assertion meaningful.
+    """
+    for _ in range(40):
+        await pilot.pause(0.02)
+        try:
+            return screen.query_one(selector)
+        except NoMatches:
+            continue
+    raise AssertionError(f"{selector} was never mounted on {screen!r}")
 
 
 def run_async(coroutine):
@@ -261,7 +293,7 @@ def test_new_starts_application_session_in_worker_and_replays_history(monkeypatc
         captured["thread"] = get_ident()
         return fake
 
-    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", fake_start)
 
     async def exercise() -> None:
         app = _app(tmp_path)
@@ -283,6 +315,33 @@ def test_new_starts_application_session_in_worker_and_replays_history(monkeypatc
     run_async(exercise())
 
 
+def test_tui_startup_profiling_is_written_to_the_profile_file(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    profile_path = tmp_path / "startup-profile.log"
+    monkeypatch.setenv(STARTUP_PROFILE_ENV_VAR, "1")
+    monkeypatch.setenv(STARTUP_PROFILE_FILE_ENV_VAR, str(profile_path))
+    fake = _fake_session()
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
+        lambda *args, **kwargs: fake,
+    )
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+
+    run_async(exercise())
+
+    lines = profile_path.read_text(encoding="utf-8").splitlines()
+    assert any("[startup] session.list: " in line for line in lines)
+    assert any(
+        line.startswith("[startup] runtime.ready: ") and line.endswith("ms total")
+        for line in lines
+    )
+
+
 @pytest.mark.parametrize("option_key, expected", [("continue", "continue"), ("new", "new")])
 def test_welcome_selection_builds_expected_request(monkeypatch, tmp_path, option_key, expected) -> None:
     fake = _fake_session()
@@ -292,7 +351,7 @@ def test_welcome_selection_builds_expected_request(monkeypatch, tmp_path, option
         captured.append(kwargs["request"])
         return fake
 
-    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", fake_start)
 
     async def exercise() -> None:
         app = _app(tmp_path)
@@ -319,7 +378,7 @@ def test_session_in_use_returns_to_welcome_and_refreshes(monkeypatch, tmp_path) 
         store.create_session(project, session_id="refreshed-1", title="Refreshed session")
         raise SessionInUseError("Session is in use by another owner.")
 
-    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", fake_start)
 
     async def exercise() -> None:
         app = _app(tmp_path, store=store)
@@ -332,7 +391,10 @@ def test_session_in_use_returns_to_welcome_and_refreshes(monkeypatch, tmp_path) 
                 await pilot.pause(0.02)
                 if not isinstance(app.screen, WelcomeScreen):
                     continue
-                notice = str(app.screen.query_one("#welcome-notice").render())
+                notice_widget = await _wait_for_child(
+                    pilot, app.screen, "#welcome-notice"
+                )
+                notice = str(notice_widget.render())
                 options = app.screen.query_one("#session-options")
                 if (
                     "currently in use" in notice
@@ -358,7 +420,7 @@ def test_startup_session_created_after_shutdown_is_closed(monkeypatch, tmp_path)
         release_start.wait()
         return fake
 
-    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", fake_start)
 
     async def exercise() -> None:
         app = _app(tmp_path)
@@ -401,9 +463,7 @@ def test_startup_exception_after_session_creation_closes_and_releases_session(
         raise RuntimeError("history load failed")
 
     fake.active_project_session.load_history = fail_load_history
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -419,9 +479,52 @@ def test_startup_exception_after_session_creation_closes_and_releases_session(
                 assert app._pending_application_sessions == []
                 assert app._application_session is None
             assert isinstance(app.screen, WelcomeScreen)
-            assert "history load failed" in str(
-                app.screen.query_one("#welcome-error").render()
-            )
+            error_widget = await _wait_for_child(pilot, app.screen, "#welcome-error")
+            assert "history load failed" in str(error_widget.render())
+
+    run_async(exercise())
+
+
+def test_startup_cleanup_failure_preserves_primary_error_and_recovers_ui(
+    monkeypatch, tmp_path
+) -> None:
+    class CleanupFailingSession(_FakeApplicationSession):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("cleanup failed")
+
+    fake = CleanupFailingSession(_fake_session().history)
+
+    def fail_load_history():
+        raise RuntimeError("history load failed")
+
+    fake.active_project_session.load_history = fail_load_history
+    monkeypatch.setattr(
+        "mycode.application.startup.start_agent_application_session",
+        lambda *args, **kwargs: fake,
+    )
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _wait_for_welcome(app, pilot)
+            app.screen.query_one("#session-options").focus()
+            await pilot.press("enter")
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if not app._startup_active and fake.close_count:
+                    break
+
+            assert fake.close_count == 1
+            assert app._startup_active is False
+            with app._session_lock:
+                assert app._pending_application_sessions == []
+                assert app._application_session is None
+            assert isinstance(app.screen, WelcomeScreen)
+            error_widget = await _wait_for_child(pilot, app.screen, "#welcome-error")
+            rendered_error = str(error_widget.render())
+            assert "history load failed" in rendered_error
+            assert "cleanup failed" in rendered_error
 
     run_async(exercise())
 
@@ -439,9 +542,7 @@ def test_startup_exception_after_shutdown_claim_does_not_double_close(
         raise RuntimeError("history load failed after shutdown")
 
     fake.active_project_session.load_history = fail_load_history_after_shutdown
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -630,7 +731,7 @@ def test_permission_modal_maps_scopes_and_hides_secret_values(
         return outcome
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", fake_start)
 
     async def exercise() -> None:
         app = _app(tmp_path)
@@ -640,17 +741,20 @@ def test_permission_modal_maps_scopes_and_hides_secret_values(
             for _ in range(40):
                 await pilot.pause(0.02)
                 if isinstance(app.screen, PermissionScreen):
-                    try:
-                        app.screen.query_one(f"#{button_id}")
-                    except NoMatches:
-                        continue
                     break
             assert isinstance(app.screen, PermissionScreen)
-            details = str(app.screen.query_one("#permission-details").render())
+            permission_screen = app.screen
+            details_widget = await _wait_for_child(
+                pilot, permission_screen, "#permission-details"
+            )
+            details = str(details_widget.render())
             assert "command_display: echo safe" in details
             assert "SECRET_VALUE" not in details
 
-            app.screen.query_one(f"#{button_id}").press()
+            decision_button = await _wait_for_child(
+                pilot, permission_screen, f"#{button_id}"
+            )
+            decision_button.press()
             await pilot.pause()
             for _ in range(40):
                 await pilot.pause(0.02)
@@ -692,9 +796,7 @@ def test_stale_session_refresh_cannot_replace_loading_screen(
         return fake
 
     monkeypatch.setattr(tui_app, "list_project_sessions", controlled_list)
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         controlled_start,
     )
 
@@ -746,9 +848,7 @@ def test_mcp_trust_modal_bridges_worker_and_hides_secret_values(
     fake = _fake_session()
     decisions: list[bool] = []
 
-    monkeypatch.setattr(
-        tui_app,
-        "load_mcp_config_layers",
+    monkeypatch.setattr("mycode.application.startup.load_mcp_config_layers",
         lambda **kwargs: object(),
     )
 
@@ -769,10 +869,8 @@ def test_mcp_trust_modal_bridges_worker_and_hides_secret_values(
         decisions.append(decision)
         return SimpleNamespace(config=MCPConfig())
 
-    monkeypatch.setattr(tui_app, "resolve_project_mcp_trust", fake_resolve)
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.resolve_project_mcp_trust", fake_resolve)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -788,12 +886,19 @@ def test_mcp_trust_modal_bridges_worker_and_hides_secret_values(
             await pilot.press("enter")
             await pilot.pause(0.15)
             assert isinstance(app.screen, MCPTrustScreen)
-            details = str(app.screen.query_one("#mcp-trust-details").render())
+            trust_screen = app.screen
+            details_widget = await _wait_for_child(
+                pilot, trust_screen, "#mcp-trust-details"
+            )
+            details = str(details_widget.render())
             assert "API_TOKEN" in details
             assert "SECRET_VALUE" not in details
-            await pilot.click(
-                "#mcp-trust-approve" if approved else "#mcp-trust-reject"
+            decision_button = await _wait_for_child(
+                pilot,
+                trust_screen,
+                "#mcp-trust-approve" if approved else "#mcp-trust-reject",
             )
+            await pilot.click(decision_button)
             await pilot.pause(0.2)
             assert decisions == [approved]
             assert isinstance(app.screen, MainScreen)
@@ -802,9 +907,7 @@ def test_mcp_trust_modal_bridges_worker_and_hides_secret_values(
 
 
 def test_startup_failure_returns_to_welcome_without_traceback(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("startup boom")),
     )
 
@@ -816,8 +919,10 @@ def test_startup_failure_returns_to_welcome_without_traceback(monkeypatch, tmp_p
             await pilot.press("enter")
             await pilot.pause(0.2)
             assert isinstance(app.screen, WelcomeScreen)
-            assert "RuntimeError" in str(app.screen.query_one("#welcome-error").render())
-            assert "startup boom" in str(app.screen.query_one("#welcome-error").render())
+            error_widget = await _wait_for_child(pilot, app.screen, "#welcome-error")
+            rendered_error = str(error_widget.render())
+            assert "RuntimeError" in rendered_error
+            assert "startup boom" in rendered_error
 
     run_async(exercise())
 
@@ -828,10 +933,443 @@ def test_main_input_only_adds_user_message_and_clears_input(tmp_path) -> None:
         async with app.run_test() as pilot:
             await _open_main(app, pilot)
             await pilot.click("#prompt")
-            await pilot.press("h", "i", "enter")
+            await pilot.press("h", "i", "ctrl+enter")
             conversation = app.screen.query_one(ConversationView)
             assert "hi" in conversation.transcript_text
-            assert app.screen.query_one("#prompt").value == ""
+            assert app.screen.query_one("#prompt", PromptTextArea).text == ""
+
+    run_async(exercise())
+
+
+def _prompt_and_picker(app: MyCodeTuiApp) -> tuple[PromptTextArea, CommandPicker]:
+    return (
+        app.screen.query_one("#prompt", PromptTextArea),
+        app.screen.query_one("#command-picker", CommandPicker),
+    )
+
+
+def _capturing_app(monkeypatch, tmp_path, stop_reason: str = "final_answer"):
+    """Build an app whose fake session records every submitted turn content."""
+    fake = _fake_session()
+    calls: list[str] = []
+
+    def fake_run_turn(content, *, turn_id=None, event_handler=None):
+        del turn_id, event_handler
+        calls.append(content)
+        return AgentRunOutcome.from_stop_reason(stop_reason)
+
+    fake.run_turn = fake_run_turn
+    monkeypatch.setattr(
+        "mycode.application.startup.start_agent_application_session",
+        lambda *args, **kwargs: fake,
+    )
+    return _app(tmp_path), calls
+
+
+_TURN_WAIT_ITERATIONS = 150
+"""Wait budget for a fake turn, in ``pilot.pause(0.02)`` steps.
+
+A turn runs on a worker thread, so the composer is only re-enabled once that
+thread finishes and its completion message is processed. 0.8s was too tight
+under load, which made the prompt tests fail for timing rather than behaviour.
+"""
+
+
+async def _submit_and_wait(app: MyCodeTuiApp, pilot, calls: list[str]) -> None:
+    await pilot.press("ctrl+enter")
+    for _ in range(_TURN_WAIT_ITERATIONS):
+        await pilot.pause(0.02)
+        if calls and app._active_turn_id is None:
+            break
+
+
+def test_prompt_enter_inserts_newline_and_ctrl_enter_submits_multiline(
+    monkeypatch, tmp_path
+) -> None:
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, _ = _prompt_and_picker(app)
+            await pilot.click("#prompt")
+            await pilot.press("a", "enter", "b", "enter", "c")
+            assert prompt.text == "a\nb\nc"
+            assert calls == []
+
+            await _submit_and_wait(app, pilot, calls)
+            assert calls == ["a\nb\nc"]
+            assert prompt.text == ""
+
+    run_async(exercise())
+
+
+def test_prompt_submits_on_the_lf_byte_that_consoles_report(monkeypatch, tmp_path) -> None:
+    """Drive the composer with the bytes a real terminal sends.
+
+    Textual's Windows console driver only reads a key's character, so
+    ``Ctrl+Enter`` arrives as the LF byte there and Textual names it
+    ``ctrl+j``. This test goes through the real ANSI parser instead of
+    ``pilot.press`` so a rename or a dropped fallback key fails here.
+    """
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    def terminal_events(data: str) -> list:
+        return [
+            event
+            for event in XTermParser().feed(data)
+            if isinstance(event, (Key, Paste))
+        ]
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, _ = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+
+            for event in terminal_events("first\rsecond"):
+                app.post_message(event)
+            await pilot.pause()
+            assert prompt.text == "first\nsecond"
+            assert calls == []
+
+            for event in terminal_events("\n"):
+                app.post_message(event)
+            for _ in range(_TURN_WAIT_ITERATIONS):
+                await pilot.pause(0.02)
+                if calls:
+                    break
+            assert calls == ["first\nsecond"]
+            assert prompt.text == ""
+
+    run_async(exercise())
+
+
+def test_prompt_keeps_large_multiline_paste_intact(monkeypatch, tmp_path) -> None:
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+    pasted = "\n".join(f"line {index} " + "x" * 40 for index in range(120))
+    assert len(pasted) > 5120
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, _ = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+            app.post_message(Paste(pasted))
+            await pilot.pause()
+            assert prompt.text == pasted
+            assert calls == []
+            # The composer stays a bounded multi-line box and scrolls inside.
+            assert prompt.size.height < pasted.count("\n") + 1
+            assert prompt.max_scroll_y > 0
+
+            await _submit_and_wait(app, pilot, calls)
+            assert calls == [pasted]
+            assert prompt.text == ""
+
+    run_async(exercise())
+
+
+def test_prompt_inserts_multiline_paste_as_one_edit(tmp_path) -> None:
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+            app.post_message(Paste("first\nsecond\n/context\n正文"))
+            await pilot.pause()
+            assert prompt.text == "first\nsecond\n/context\n正文"
+            assert picker.is_open is False
+            assert prompt.picker_state is None
+
+    run_async(exercise())
+
+
+def test_pasted_single_line_slash_does_not_open_the_picker(tmp_path) -> None:
+    """Typing ``/co`` opens the picker; pasting the same text must not.
+
+    The picker is discovery only, so a paste that happens to look like a
+    command query must not hijack it.
+    """
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+            await pilot.press("/", "c", "o")
+            await pilot.pause()
+            assert picker.is_open is True
+
+            prompt.clear()
+            await pilot.pause()
+            app.post_message(Paste("/co"))
+            await pilot.pause()
+            assert prompt.text == "/co"
+            assert picker.is_open is False
+            assert prompt.picker_state is None
+
+    run_async(exercise())
+
+
+def test_pasted_command_text_still_runs_through_the_parser(
+    monkeypatch, tmp_path
+) -> None:
+    """A pasted ``/context`` skips the picker but keeps its command meaning.
+
+    The picker never decides semantics: the text reaches
+    ``parse_slash_command()`` on submit, which still runs the command.
+    """
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+            app.post_message(Paste("/context"))
+            await pilot.pause()
+            assert prompt.text == "/context"
+            assert picker.is_open is False
+            assert prompt.picker_state is None
+
+            await pilot.press("ctrl+enter")
+            for _ in range(_TURN_WAIT_ITERATIONS):
+                await pilot.pause(0.02)
+                transcript = app.screen.query_one(ConversationView).transcript_text
+                if "estimated input" in transcript:
+                    break
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "estimated input: 120 / 900 tokens" in transcript
+            assert calls == []
+            assert prompt.text == ""
+
+    run_async(exercise())
+
+
+def test_multiline_slash_text_reaches_the_agent_as_a_prompt(
+    monkeypatch, tmp_path
+) -> None:
+    """``/context`` plus a body is prompt text, not a command with an argument.
+
+    The composer closing the picker is not enough: what matters is the final
+    submission semantics, so this asserts the Agent received the whole text and
+    that ``/context`` did not run.
+    """
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+    content = "/context\n这里是正文"
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+            app.post_message(Paste(content))
+            await pilot.pause()
+            assert prompt.text == content
+            assert picker.is_open is False
+
+            await _submit_and_wait(app, pilot, calls)
+
+            assert calls == [content]
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "context window" not in transcript
+            assert prompt.text == ""
+
+    run_async(exercise())
+
+
+def test_slash_picker_filters_navigates_and_closes(tmp_path) -> None:
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            assert picker.is_open is False
+
+            await pilot.press("/")
+            await pilot.pause()
+            assert picker.is_open is True
+            assert [spec.name for spec in prompt.picker_state.specs] == [
+                spec.name for spec in COMMAND_SPECS
+            ]
+
+            await pilot.press("r", "e", "s")
+            await pilot.pause()
+            assert [spec.name for spec in prompt.picker_state.specs] == ["resume"]
+
+            await pilot.press("escape")
+            await pilot.pause()
+            assert picker.is_open is False
+            assert prompt.text == "/res"
+
+            prompt.clear()
+            await pilot.pause()
+            await pilot.press("/")
+            await pilot.pause()
+            assert picker.is_open is True
+
+            await pilot.press("c", "o")
+            await pilot.pause()
+            assert [spec.name for spec in prompt.picker_state.specs] == [
+                "context",
+                "compact",
+            ]
+
+            await pilot.press("down")
+            await pilot.pause()
+            assert prompt.picker_state.highlighted == 1
+
+    run_async(exercise())
+
+
+def test_slash_picker_runs_argumentless_command_immediately(
+    monkeypatch, tmp_path
+) -> None:
+    """A command that needs no argument runs as soon as it is chosen."""
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            await pilot.click("#prompt")
+            await pilot.press("/", "h", "e", "l")
+            await pilot.pause()
+            assert picker.is_open is True
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            assert prompt.text == ""
+            assert picker.is_open is False
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "available commands:" in transcript
+            assert calls == []
+
+    run_async(exercise())
+
+
+def test_slash_picker_fills_argument_command_for_further_input(
+    monkeypatch, tmp_path
+) -> None:
+    """A command that needs an argument is only filled in, not run."""
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            await pilot.click("#prompt")
+            await pilot.press("/", "r", "e", "s")
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert prompt.text == "/resume "
+            assert "\n" not in prompt.text
+            assert picker.is_open is False
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "Invalid arguments" not in transcript
+
+            await pilot.press("a", "b", "c")
+            await pilot.pause()
+            assert prompt.text == "/resume abc"
+
+    run_async(exercise())
+
+
+def test_only_commands_with_arguments_are_filled_in_instead_of_run() -> None:
+    """The picker's two behaviours come from one command property."""
+    assert [spec.name for spec in COMMAND_SPECS if spec.requires_arguments] == [
+        "resume"
+    ]
+
+
+def test_command_specs_are_the_only_command_source() -> None:
+    assert filter_command_specs("") == COMMAND_SPECS
+    assert [spec.name for spec in filter_command_specs("CO")] == ["context", "compact"]
+    assert [spec.name for spec in filter_command_specs("q")] == ["exit"]
+    assert [spec.name for spec in filter_command_specs("nope")] == []
+
+
+def test_unregistered_slash_command_stays_a_normal_prompt(
+    monkeypatch, tmp_path
+) -> None:
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            await pilot.click("#prompt")
+            await pilot.press("/", "n", "o", "p", "e")
+            await pilot.pause()
+            assert picker.is_open is False
+            assert prompt.picker_state is None
+
+            await _submit_and_wait(app, pilot, calls)
+            assert calls == ["/nope"]
+
+    run_async(exercise())
+
+
+def test_registered_command_selected_from_picker_still_uses_the_parser(
+    monkeypatch, tmp_path
+) -> None:
+    app, calls = _capturing_app(monkeypatch, tmp_path)
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            await pilot.click("#prompt")
+            await pilot.press("/", "r", "e", "s")
+            await pilot.pause()
+            assert [spec.name for spec in prompt.picker_state.specs] == ["resume"]
+
+            await pilot.press("enter")
+            await pilot.pause()
+            assert prompt.text == "/resume "
+            assert picker.is_open is False
+
+            await _submit_and_wait(app, pilot, calls)
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "Invalid arguments for /resume" in transcript
+            assert "usage: /resume <session_id>" in transcript
+            assert calls == []
+
+    run_async(exercise())
+
+
+def test_context_overflow_turn_restores_an_usable_prompt(
+    monkeypatch, tmp_path
+) -> None:
+    app, calls = _capturing_app(monkeypatch, tmp_path, stop_reason="context_overflow")
+
+    async def exercise() -> None:
+        async with app.run_test() as pilot:
+            await _open_main_with_session(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+            await pilot.click("#prompt")
+            await pilot.press("o", "v", "e", "r", "f", "l", "o", "w")
+            await _submit_and_wait(app, pilot, calls)
+
+            assert calls == ["overflow"]
+            assert prompt.disabled is False
+            assert app.focused is prompt
+            assert prompt.text == ""
+            assert picker.is_open is False
+
+            await pilot.press("a", "g", "a", "i", "n")
+            assert prompt.text == "again"
 
     run_async(exercise())
 
@@ -842,9 +1380,7 @@ def test_tui_commands_use_shared_help_and_do_not_enter_agent(
     fake = _fake_session()
     run_calls: list[str] = []
     fake.run_turn = lambda content, **kwargs: run_calls.append(content)
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -887,10 +1423,15 @@ def test_tui_commands_use_shared_help_and_do_not_enter_agent(
     run_async(exercise())
 
 
-def test_tui_compact_worker_owns_session_until_unmount_cleanup(
+def test_tui_compact_worker_shutdown_cleanup_survives_close_failure(
     monkeypatch, tmp_path
 ) -> None:
-    fake = _fake_session()
+    class CleanupFailingSession(_FakeApplicationSession):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("cleanup failed")
+
+    fake = CleanupFailingSession(_fake_session().history)
     started = Event()
     release = Event()
     original_status = fake.get_context_status()
@@ -906,9 +1447,7 @@ def test_tui_compact_worker_owns_session_until_unmount_cleanup(
         )
 
     fake.compact_context = blocking_compact
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -956,9 +1495,7 @@ def test_tui_new_switches_after_target_session_is_ready(monkeypatch, tmp_path) -
         title="Target session",
     )
     starts = iter([current, target])
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: next(starts),
     )
 
@@ -1004,7 +1541,7 @@ def test_tui_resume_failure_keeps_current_session_usable(monkeypatch, tmp_path) 
             return current
         raise SessionNotFoundError("Session not found in current project: missing")
 
-    monkeypatch.setattr(tui_app, "start_agent_application_session", fake_start)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", fake_start)
 
     async def exercise() -> None:
         app = _app(tmp_path)
@@ -1068,9 +1605,7 @@ def test_input_runs_application_session_in_worker_and_enforces_one_active_turn(
         return outcome
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1087,6 +1622,7 @@ def test_input_runs_application_session_in_worker_and_enforces_one_active_turn(
                         break
                 assert isinstance(app.screen, MainScreen)
 
+                prompt = app.screen.query_one("#prompt", PromptTextArea)
                 presenter_threads: list[int] = []
                 original_present = app.presenter.present
 
@@ -1097,7 +1633,7 @@ def test_input_runs_application_session_in_worker_and_enforces_one_active_turn(
                 app.presenter.present = present_on_ui_thread
 
                 await pilot.click("#prompt")
-                await pilot.press("h", "i", "enter")
+                await pilot.press("h", "i", "ctrl+enter")
                 for _ in range(40):
                     await pilot.pause(0.02)
                     if turn_started.is_set():
@@ -1106,6 +1642,12 @@ def test_input_runs_application_session_in_worker_and_enforces_one_active_turn(
                 assert calls[0][0] == "hi"
                 assert calls[0][1] != app._thread_id
                 assert app.screen.query_one("#prompt").disabled is True
+                assert app.focused is not prompt
+
+                await pilot.press("ctrl+enter")
+                await pilot.pause()
+                assert [content for content, _ in calls] == ["hi"]
+                assert prompt.text == ""
 
                 app.submit_user_message("second")
                 assert [content for content, _ in calls] == ["hi"]
@@ -1120,6 +1662,7 @@ def test_input_runs_application_session_in_worker_and_enforces_one_active_turn(
                         break
                 assert app._active_turn_id is None
                 assert app.screen.query_one("#prompt").disabled is False
+                assert app.focused is prompt
                 assert str(app.screen.query_one(StatusBar).render()) == "Ready"
                 assert "answer" in app.screen.query_one(ConversationView).transcript_text
                 assert presenter_threads
@@ -1146,9 +1689,7 @@ def test_runtime_failure_finishes_turn_and_allows_next_turn(monkeypatch, tmp_pat
         return outcome
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1193,9 +1734,7 @@ def test_turn_exception_interrupts_session_and_blocks_future_submit(
 
     fake.interrupt = interrupt
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1236,9 +1775,7 @@ def test_active_turn_shutdown_defers_session_cleanup_to_turn_worker(
         return AgentRunOutcome.from_stop_reason("final_answer")
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1291,9 +1828,7 @@ def test_shutdown_before_turn_worker_claim_closes_session_once(
         return AgentRunOutcome.from_stop_reason("final_answer")
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1341,6 +1876,34 @@ def test_shutdown_before_turn_worker_claim_closes_session_once(
     run_async(exercise())
 
 
+def test_unmount_cleanup_continues_after_one_session_close_fails(tmp_path) -> None:
+    class CleanupFailingSession(_FakeApplicationSession):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("cleanup failed")
+
+    first = CleanupFailingSession(_fake_session().history, session_id="first")
+    second = _FakeApplicationSession(_fake_session().history, session_id="second")
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _wait_for_welcome(app, pilot)
+            with app._session_lock:
+                app._pending_application_sessions.append(first)
+                app._application_session = second
+
+            app.on_unmount()
+
+            assert first.close_count == 1
+            assert second.close_count == 1
+            with app._session_lock:
+                assert app._pending_application_sessions == []
+                assert app._application_session is None
+
+    run_async(exercise())
+
+
 def test_shutdown_after_worker_release_closes_session_once_before_completion(
     monkeypatch, tmp_path
 ) -> None:
@@ -1356,9 +1919,7 @@ def test_shutdown_after_worker_release_closes_session_once_before_completion(
         return AgentRunOutcome.from_stop_reason("final_answer")
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1622,9 +2183,7 @@ def test_completed_turn_restores_prompt_focus(monkeypatch, tmp_path) -> None:
         return AgentRunOutcome.from_stop_reason("final_answer")
 
     fake.run_turn = fake_run_turn
-    monkeypatch.setattr(
-        tui_app,
-        "start_agent_application_session",
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: fake,
     )
 
@@ -1646,7 +2205,7 @@ def test_completed_turn_restores_prompt_focus(monkeypatch, tmp_path) -> None:
 
 def test_successful_session_is_closed_on_normal_app_exit(monkeypatch, tmp_path) -> None:
     fake = _fake_session()
-    monkeypatch.setattr(tui_app, "start_agent_application_session", lambda *args, **kwargs: fake)
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", lambda *args, **kwargs: fake)
 
     async def exercise() -> None:
         app = _app(tmp_path)
@@ -1821,13 +2380,17 @@ def test_concurrent_permission_requests_are_serialized(tmp_path) -> None:
                     break
             assert "Waiting for permission" in str(status.render())
 
-            app.screen.query_one("#permission-deny").press()
+            deny_button = await _wait_for_child(pilot, app.screen, "#permission-deny")
+            deny_button.press()
             await pilot.pause()
             await pilot.pause()
             assert isinstance(app.screen, PermissionScreen)
             assert _permission_modal_count(app) == 1
 
-            app.screen.query_one("#permission-allow-once").press()
+            allow_button = await _wait_for_child(
+                pilot, app.screen, "#permission-allow-once"
+            )
+            allow_button.press()
             for _ in range(40):
                 await pilot.pause(0.02)
                 if first._event.is_set() and second._event.is_set():
@@ -1885,7 +2448,8 @@ def test_main_and_subagent_permissions_share_one_queue(tmp_path) -> None:
             # Deny the main agent request; the queued SubAgent request shows next.
             modal = app.screen
             assert isinstance(modal, PermissionScreen)
-            modal.query_one("#permission-deny").press()
+            deny_button = await _wait_for_child(pilot, modal, "#permission-deny")
+            deny_button.press()
             for _ in range(40):
                 await pilot.pause(0.02)
                 if (
@@ -1897,8 +2461,14 @@ def test_main_and_subagent_permissions_share_one_queue(tmp_path) -> None:
             assert isinstance(app.screen, PermissionScreen)
             assert _permission_modal_count(app) == 1
 
+            # The replacement modal becomes current before its children are
+            # composed, so wait for the button rather than the screen swap.
             next_modal = app.screen
-            next_modal.query_one("#permission-allow-once").press()
+            assert next_modal is not modal
+            allow_button = await _wait_for_child(
+                pilot, next_modal, "#permission-allow-once"
+            )
+            allow_button.press()
             for _ in range(40):
                 await pilot.pause(0.02)
                 if not main_thread.is_alive() and not sub_thread.is_alive():
@@ -2078,8 +2648,7 @@ def test_session_title_refresh_reaches_header(monkeypatch, tmp_path) -> None:
         load_history=lambda: fake.history,
         record=record,
     )
-    monkeypatch.setattr(
-        tui_app, "start_agent_application_session", lambda *args, **kwargs: fake
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", lambda *args, **kwargs: fake
     )
 
     async def exercise() -> None:
@@ -2095,5 +2664,70 @@ def test_session_title_refresh_reaches_header(monkeypatch, tmp_path) -> None:
                 if "Auto generated title" in str(header.render()):
                     break
             assert "Auto generated title" in str(header.render())
+
+    run_async(exercise())
+
+
+def test_tui_replacement_keeps_new_session_when_old_cleanup_fails(tmp_path) -> None:
+    class FailingCloseSession(_FakeApplicationSession):
+        def close(self) -> None:
+            super().close()
+            raise RuntimeError("old cleanup failed")
+
+    old = FailingCloseSession(
+        Conversation.from_messages([Message(role="user", content="old")]),
+        session_id="old",
+    )
+    replacement = _FakeApplicationSession(
+        Conversation.from_messages([Message(role="user", content="new")]),
+        session_id="replacement",
+    )
+    turns: list[str] = []
+
+    def run_turn(content, *, turn_id=None, event_handler=None):
+        del turn_id, event_handler
+        turns.append(content)
+        return AgentRunOutcome.from_stop_reason("final_answer")
+
+    replacement.run_turn = run_turn
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main(app, pilot)
+            with app._session_lock:
+                app._application_session = old
+                app._pending_application_sessions.append(replacement)
+            app.post_message(
+                tui_app.StartupSucceededMessage(
+                    replacement,
+                    (("user", "new"),),
+                    replace_current=True,
+                )
+            )
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if (
+                    app._application_session is replacement
+                    and "Old session cleanup warning"
+                    in app.screen.query_one(ConversationView).transcript_text
+                ):
+                    break
+
+            assert isinstance(app.screen, MainScreen)
+            assert app._application_session is replacement
+            assert old.close_count == 1
+            assert replacement.close_count == 0
+            assert "Old session cleanup warning" in app.screen.query_one(
+                ConversationView
+            ).transcript_text
+
+            app.submit_user_message("use replacement")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if app._active_turn_id is None:
+                    break
+            assert turns == ["use replacement"]
+            assert replacement.close_count == 0
 
     run_async(exercise())

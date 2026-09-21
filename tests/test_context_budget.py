@@ -7,7 +7,6 @@ from mycode.context.budget import (
     ContextBudget,
     MemoryContextStats,
     TokenEstimator,
-    TokenUsage,
     build_model_context as _build_model_context,
     budget_model_context,
     estimate_conversation as _estimate_conversation,
@@ -16,6 +15,29 @@ from mycode.context.budget import (
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_events import TokenUsage
+
+
+def _expected_wire_message(message: Message) -> dict[str, object]:
+    """Frozen pre-refactor request shape for estimate regression assertions."""
+    expected: dict[str, object] = {"role": message.role, "content": message.content}
+    if message.tool_calls:
+        expected["tool_calls"] = [
+            {
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": json.dumps(call.arguments, ensure_ascii=False),
+                },
+            }
+            for call in message.tool_calls
+        ]
+    if message.tool_call_id is not None:
+        expected["tool_call_id"] = message.tool_call_id
+    if message.reasoning_state != "absent":
+        expected["reasoning_content"] = message.reasoning_content
+    return expected
 
 
 UNIT_TOKEN_ESTIMATOR = TokenEstimator(
@@ -93,7 +115,7 @@ def test_estimate_message_counts_role_and_content() -> None:
     assert estimate.tool_call_id_chars == 0
     assert estimate.serialization_overhead_chars > 0
     assert estimate.total_chars == len(
-        json.dumps(message.to_model_dict(), ensure_ascii=False)
+        json.dumps(_expected_wire_message(message), ensure_ascii=False)
     )
 
 
@@ -115,10 +137,10 @@ def test_estimate_message_counts_tool_call_arguments() -> None:
     assert estimate.role == "assistant"
     assert estimate.content_chars == 0
     assert estimate.tool_call_chars == len(
-        json.dumps(message.to_model_dict()["tool_calls"], ensure_ascii=False)
+        json.dumps(_expected_wire_message(message)["tool_calls"], ensure_ascii=False)
     )
     assert estimate.total_chars == len(
-        json.dumps(message.to_model_dict(), ensure_ascii=False)
+        json.dumps(_expected_wire_message(message), ensure_ascii=False)
     )
 
 
@@ -139,7 +161,7 @@ def test_estimate_message_counts_reasoning_content() -> None:
 
     assert estimate.reasoning_chars == len("private synthetic reasoning")
     assert estimate.total_chars == len(
-        json.dumps(message.to_model_dict(), ensure_ascii=False)
+        json.dumps(_expected_wire_message(message), ensure_ascii=False)
     )
 
 
@@ -160,7 +182,7 @@ def test_estimate_message_counts_present_empty_reasoning_as_zero_chars() -> None
 
     assert estimate.reasoning_chars == 0
     assert estimate.total_chars == len(
-        json.dumps(message.to_model_dict(), ensure_ascii=False)
+        json.dumps(_expected_wire_message(message), ensure_ascii=False)
     )
 
 
@@ -183,7 +205,7 @@ def test_estimate_message_counts_unicode_characters_not_bytes() -> None:
     assert len("你好") == 2
     assert len("你好".encode("utf-8")) == 6
     assert estimate.tool_call_chars == len(
-        json.dumps(message.to_model_dict()["tool_calls"], ensure_ascii=False)
+        json.dumps(_expected_wire_message(message)["tool_calls"], ensure_ascii=False)
     )
 
 
@@ -258,7 +280,7 @@ def test_estimate_message_counts_tool_result_id() -> None:
     assert estimate.content_chars == len("OK\n1 | hello")
     assert estimate.tool_call_id_chars == len("call_123")
     assert estimate.total_chars == len(
-        json.dumps(message.to_model_dict(), ensure_ascii=False)
+        json.dumps(_expected_wire_message(message), ensure_ascii=False)
     )
 
 
@@ -282,7 +304,7 @@ def test_estimate_conversation_sums_message_estimates() -> None:
         serialized_message_chars + estimate.message_list_overhead_chars
     )
     assert estimate.message_chars == len(
-        json.dumps(conversation.to_model_messages(), ensure_ascii=False)
+        json.dumps([_expected_wire_message(message) for message in conversation.get_messages()], ensure_ascii=False)
     )
     assert estimate.tool_schema_chars == 0
     assert estimate.total_chars == estimate.message_chars
@@ -310,7 +332,7 @@ def test_estimate_conversation_counts_tool_schema_overhead() -> None:
     )
 
     assert estimate.message_chars == len(
-        json.dumps(conversation.to_model_messages(), ensure_ascii=False)
+        json.dumps([_expected_wire_message(message) for message in conversation.get_messages()], ensure_ascii=False)
     )
     assert estimate.tool_schema_chars == len(
         json.dumps(

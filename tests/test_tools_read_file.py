@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from mycode.tools import ReadFileArgs, ReadFileTool, Workspace
+from mycode.tools.read_file import ReadFileArgs, ReadFileTool
+from mycode.tools.workspace import Workspace
 
 
 def test_read_file_reads_text_file_with_line_numbers(tmp_path: Path) -> None:

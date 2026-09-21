@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from contextlib import contextmanager
 import hashlib
 import json
@@ -5,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from mycode.agent.events import AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentToolCall
 import mycode.context.artifacts as artifacts_module
 from mycode.context.artifacts import (
     ARTIFACT_IO_CHUNK_BYTES,
@@ -24,12 +25,14 @@ from mycode.context.budget import (
     parse_tool_result_content,
 )
 from mycode.conversation import Conversation
-from mycode.llm import FakeLLMClient
+from mycode.llm_contracts import FakeLLMClient
 from mycode.messages import Message
+from mycode.model_events import ModelResponse, ModelStreamEvent
 from mycode.project import ProjectIdentity
 from mycode.agent.runner import AgentRunner
 from mycode.persistence.session_store import SessionStore
-from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
+from mycode.tools.registry import ToolRegistry
 
 
 def test_artifact_store_externalizes_large_result_with_hash_and_safe_reference(
@@ -342,11 +345,10 @@ def test_runner_persists_artifact_reference_instead_of_large_tool_body(
     client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="done"),
+            ModelResponse(content="done"),
         ],
     )
     store = ToolResultArtifactStore(
@@ -397,9 +399,9 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
     )
     client = RecordingArtifactLLMClient(
         [
-            AgentModelResponse(tool_calls=[first_call], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=[second_call], stop_reason="tool_calls"),
-            AgentModelResponse(content="done"),
+            ModelResponse(tool_calls=[first_call]),
+            ModelResponse(tool_calls=[second_call]),
+            ModelResponse(content="done"),
         ]
     )
     conversation = Conversation.from_messages(
@@ -477,7 +479,7 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
 
     resume_client = RecordingArtifactLLMClient(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call-read-old",
@@ -489,9 +491,8 @@ def test_runner_separates_canonical_artifact_refs_from_latest_model_view_and_res
                         },
                     )
                 ],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="resumed"),
+            ModelResponse(content="resumed"),
         ]
     )
     resumed_conversation = Conversation.from_messages(
@@ -546,10 +547,10 @@ def test_runner_keeps_two_recent_tool_result_groups_without_changing_canonical(
     ]
     client = RecordingArtifactLLMClient(
         [
-            AgentModelResponse(tool_calls=[calls[0]], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=calls[1:3], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=[calls[3]], stop_reason="tool_calls"),
-            AgentModelResponse(content="done"),
+            ModelResponse(tool_calls=[calls[0]]),
+            ModelResponse(tool_calls=calls[1:3]),
+            ModelResponse(tool_calls=[calls[3]]),
+            ModelResponse(content="done"),
         ]
     )
     runner = AgentRunner(
@@ -611,8 +612,8 @@ def test_runner_downgrades_latest_group_without_reprojecting(
     )
     client = RecordingArtifactLLMClient(
         [
-            AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls"),
-            AgentModelResponse(content="done"),
+            ModelResponse(tool_calls=[tool_call]),
+            ModelResponse(content="done"),
         ]
     )
     runner = AgentRunner(
@@ -662,11 +663,10 @@ def test_runner_reports_safe_artifact_failure_and_does_not_persist_body(
     client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="done"),
+            ModelResponse(content="done"),
         ],
     )
 
@@ -717,12 +717,11 @@ def test_runner_emits_artifact_warning_without_leaking_it(
     client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="done"),
-            AgentModelResponse(content="next done"),
+            ModelResponse(content="done"),
+            ModelResponse(content="next done"),
         ],
     )
 
@@ -788,7 +787,7 @@ class HugeTool(LargeTool):
 
 
 class RecordingArtifactLLMClient(FakeLLMClient):
-    def __init__(self, tool_responses: list[AgentModelResponse]) -> None:
+    def __init__(self, tool_responses: list[ModelResponse]) -> None:
         super().__init__(responses=[], tool_responses=tool_responses)
         self.seen_conversations: list[Conversation] = []
 
@@ -796,7 +795,7 @@ class RecordingArtifactLLMClient(FakeLLMClient):
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ):
+    ) -> Iterator[ModelStreamEvent]:
         self.seen_conversations.append(
             Conversation.from_messages(conversation.get_messages())
         )
@@ -838,8 +837,8 @@ def test_turn_local_full_is_released_after_next_build(tmp_path, monkeypatch, fin
     monkeypatch.setattr(ContextBuilder, "build", build)
     call = AgentToolCall(id="fresh", name="large_tool", arguments={"text": "one"})
     client = RecordingArtifactLLMClient([
-        AgentModelResponse(tool_calls=[call], stop_reason="tool_calls"),
-        AgentModelResponse(content="done"),
+        ModelResponse(tool_calls=[call]),
+        ModelResponse(content="done"),
     ])
     client.responses = ["checkpoint"]
     runner = AgentRunner(
@@ -883,10 +882,10 @@ def test_empty_response_retry_reuses_turn_local_full_only_within_turn(
         arguments={"text": "one"},
     )
     client = RecordingArtifactLLMClient([
-        AgentModelResponse(tool_calls=[call], stop_reason="tool_calls"),
-        AgentModelResponse(content=""),
-        AgentModelResponse(content="recovered final"),
-        AgentModelResponse(content="next final"),
+        ModelResponse(tool_calls=[call]),
+        ModelResponse(content=""),
+        ModelResponse(content="recovered final"),
+        ModelResponse(content="next final"),
     ])
     runner = AgentRunner(
         llm_client=client,
@@ -945,7 +944,7 @@ def test_turn_local_is_cleared_when_run_is_abandoned(tmp_path, monkeypatch, inte
     call = AgentToolCall(id="abandoned", name="large_tool", arguments={"text": "value"})
     runner = AgentRunner(
         llm_client=RecordingArtifactLLMClient([
-            AgentModelResponse(tool_calls=[call], stop_reason="tool_calls"),
+            ModelResponse(tool_calls=[call]),
         ]),
         tool_registry=ToolRegistry.from_tools([LargeTool()]),
         tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 50),

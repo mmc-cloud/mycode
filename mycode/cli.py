@@ -1,44 +1,35 @@
+# Imported first on purpose: it starts the startup-profiling clock before the
+# heavier CLI dependencies are imported.
+from mycode import startup_profile
+
 import argparse
 import sys
 from collections.abc import Callable
 from pathlib import Path
-from uuid import uuid4
 
 from mycode.agent.events import AgentEvent
 from mycode.adapters.jsonl import run_jsonl_runtime
 from mycode.application.events import RuntimeEvent
 from mycode.application import (
     AgentApplicationSession,
+    ApplicationStartupWarning,
     CompactResult,
     ContextStatus,
-    context_budget_from_config,
+    create_application_environment,
     list_project_sessions,
+    prepare_application_session_factory,
     run_agent_turn,
     SessionStartRequest,
-    start_agent_application_session,
 )
 from mycode.presentation.cli.confirmer import TerminalConfirmer
 from mycode.presentation.cli.presenter import CliDisplayMode, CliPresenter
-from mycode.config import LLMConfig, load_llm_config
-from mycode.context.compact import ConversationCompactor
-from mycode.context.budget import (
-    ContextBudgetExceededError,
-    format_model_context_stats,
-)
+from mycode.config import LLMConfig
 from mycode.error_handling import error_summary, format_model_error
-from mycode.conversation import Conversation
-from mycode.mcp import (
-    MCPConfig,
-    MCPConfigError,
-    load_mcp_config_layers,
-    resolve_project_mcp_trust,
-)
+from mycode.mcp.config import MCPConfig
 from mycode.observability import ObservationSink
-from mycode.llm import OpenAICompatibleLLMClient
 from mycode.project import ProjectIdentity
 from mycode.agent.runner import AgentRunner
 from mycode.agent.outcome import AgentRunOutcome
-from mycode.session import ChatSession
 from mycode.persistence.session_store import (
     SessionInUseError,
     SessionNotFoundError,
@@ -60,118 +51,6 @@ from mycode.presentation.command_format import (
     format_session_list,
 )
 from mycode.presentation.tui.app import run_tui
-from mycode.tools import (
-    Workspace,
-)
-
-
-_CHAT_EXIT_COMMANDS = {"/exit", "/quit"}
-
-
-def build_chat_session(llm_config: LLMConfig | None = None) -> ChatSession:
-    config = load_llm_config() if llm_config is None else llm_config
-    session_id = uuid4().hex
-    client = OpenAICompatibleLLMClient(config=config, session_id=session_id)
-    summary_client = OpenAICompatibleLLMClient(
-        config=config,
-        model=config.compact_model,
-        thinking_enabled=False,
-        session_id=session_id,
-    )
-
-    return ChatSession(
-        llm_client=client,
-        context_budget=context_budget_from_config(config),
-        compactor=ConversationCompactor(llm_client=summary_client),
-    )
-
-
-def run_chat_loop(
-    session: ChatSession,
-    input_func: Callable[[str], str] = input,
-    output_func: Callable[[str], None] = print,
-    output_chunk_func: Callable[[str], None] | None = None,
-) -> None:
-    if output_chunk_func is None:
-        output_chunk_func = _print_chunk
-
-    output_func("输入 /exit 或 /quit 退出。")
-
-    while True:
-        try:
-            content = input_func("you> ").strip()
-        except EOFError:
-            output_func("")
-            break
-        except KeyboardInterrupt:
-            output_func("")
-            output_func("提示> Chat 已中断。")
-            break
-
-        if content in _CHAT_EXIT_COMMANDS:
-            break
-
-        if content == "":
-            continue
-
-        try:
-            chunks = iter(session.stream_user_message(content))
-        except ContextBudgetExceededError as error:
-            output_func(
-                "context> "
-                + format_model_context_stats(
-                    error.context,
-                    previous_prompt_tokens=(
-                        session.last_token_usage.prompt_tokens
-                        if session.last_token_usage is not None
-                        else None
-                    ),
-                )
-            )
-            output_func(f"error> {error}")
-            continue
-        except KeyboardInterrupt:
-            output_func("")
-            output_func("提示> Chat 已中断。")
-            break
-        except Exception as error:
-            output_func(
-                "错误> "
-                + format_model_error(error, operation="模型请求准备失败")
-            )
-            continue
-
-        context = session.last_model_context
-        if context is not None:
-            output_func(
-                "context> "
-                + format_model_context_stats(
-                    context,
-                    previous_prompt_tokens=(
-                        session.last_token_usage.prompt_tokens
-                        if session.last_token_usage is not None
-                        else None
-                    ),
-                )
-            )
-
-        output_chunk_func("assistant> ")
-        try:
-            for chunk in chunks:
-                output_chunk_func(chunk)
-        except KeyboardInterrupt:
-            output_func("")
-            output_func("提示> Chat 已中断。")
-            break
-        except Exception as error:
-            output_func("")
-            output_func(
-                "错误> "
-                + format_model_error(error, operation="模型流式请求失败")
-            )
-            continue
-
-        output_func("")
 
 
 def run_agent_loop(
@@ -262,14 +141,12 @@ def run_agent_command(
     mcp_config: MCPConfig | None = None,
     observability_sink: ObservationSink | None = None,
 ) -> None:
-    workspace = Workspace(Path.cwd() if workspace_path is None else workspace_path)
-    project = ProjectIdentity.from_workspace(workspace.root)
-    config = (
-        load_llm_config(workspace_root=workspace.root)
-        if llm_config is None
-        else llm_config
+    environment = create_application_environment(
+        workspace_path,
+        session_store=session_store,
     )
-    store = SessionStore() if session_store is None else session_store
+    project = environment.project
+    store = environment.session_store
     effective_request = session_request
     try:
         if effective_request is None:
@@ -288,46 +165,43 @@ def run_agent_command(
     if effective_request is None:
         return
 
-    try:
-        if mcp_config is None:
-            loaded_mcp_config = load_mcp_config_layers(
-                workspace_root=workspace.root
-            )
-            trust_confirmer = TerminalMCPTrustConfirmer(
-                input_func=input_func,
-                output_func=output_func,
-            )
-            trust_resolution = resolve_project_mcp_trust(
-                loaded_mcp_config,
-                project,
-                confirmer=trust_confirmer,
-            )
-            effective_mcp_config = trust_resolution.config
-        else:
-            effective_mcp_config = mcp_config
-    except MCPConfigError as error:
-        output_func("MCP servers:")
-        output_func(f"✗ config      {error}")
-        effective_mcp_config = MCPConfig()
-
     confirmer = TerminalConfirmer(
         input_func=input_func,
         output_func=output_func,
     )
     cli_observer = CliSubAgentObserver(output=output_func, mode=display_mode)
+    trust_confirmer = TerminalMCPTrustConfirmer(
+        input_func=input_func,
+        output_func=output_func,
+    )
+
+    def handle_startup_warning(warning: ApplicationStartupWarning) -> None:
+        if warning.code == "mcp_config_error":
+            output_func("MCP servers:")
+            output_func(f"✗ config      {warning.message}")
+
+    try:
+        factory = prepare_application_session_factory(
+            environment,
+            llm_config=llm_config,
+            mcp_config=mcp_config,
+            mcp_trust_confirmer=trust_confirmer,
+            confirmer=confirmer,
+            external_observer=cli_observer,
+            observability_sink=observability_sink,
+            warning_handler=handle_startup_warning,
+        )
+    except Exception as error:
+        output_func("")
+        output_func(
+            "错误> " + format_model_error(error, operation="Agent 启动失败")
+        )
+        return
+
     interactive_session_selection = session_request is None
     while True:
         try:
-            application_session = start_agent_application_session(
-                store,
-                project,
-                request=effective_request,
-                mcp_config=effective_mcp_config,
-                confirmer=confirmer,
-                external_observer=cli_observer,
-                llm_config=config,
-                observability_sink=observability_sink,
-            )
+            application_session = factory.open_session(effective_request)
         except SessionInUseError as error:
             if not interactive_session_selection:
                 output_func(f"session> 错误：{error}")
@@ -363,6 +237,7 @@ def run_agent_command(
             return
         break
 
+    startup_profile.total("runtime.ready")
     _output_session_started(application_session, output_func)
     if application_session.compact_state_recovered:
         output_func(
@@ -419,16 +294,7 @@ def run_agent_command(
             request = SessionStartRequest(mode="new")
 
         try:
-            replacement = start_agent_application_session(
-                store,
-                project,
-                request=request,
-                mcp_config=effective_mcp_config,
-                confirmer=confirmer,
-                external_observer=cli_observer,
-                llm_config=config,
-                observability_sink=observability_sink,
-            )
+            replacement = factory.open_session(request)
         except SessionInUseError as error:
             output_func(f"session> 当前不可用：{error}")
             return False
@@ -473,28 +339,46 @@ def run_agent_command(
             command_handler=handle_command,
         )
     except KeyboardInterrupt:
-        try:
-            application_session.interrupt()
-        except SessionStoreError as lifecycle_error:
-            output_func(f"session> 警告：{lifecycle_error}")
+        _try_cleanup_application_session(
+            application_session.interrupt,
+            output_func=output_func,
+        )
         output_func("")
         output_func("提示> Agent 已中断，当前进度已保存。")
     except Exception as error:
-        try:
-            application_session.interrupt()
-        except SessionStoreError as lifecycle_error:
-            output_func(f"session> 警告：{lifecycle_error}")
+        _try_cleanup_application_session(
+            application_session.interrupt,
+            output_func=output_func,
+        )
         output_func("")
         output_func(
             "错误> " + format_model_error(error, operation="Agent 运行失败")
         )
     else:
-        application_session.close()
+        _try_cleanup_application_session(
+            application_session.close,
+            output_func=output_func,
+        )
     finally:
-        try:
-            application_session.interrupt()
-        except SessionStoreError as lifecycle_error:
-            output_func(f"session> 警告：{lifecycle_error}")
+        _try_cleanup_application_session(
+            application_session.interrupt,
+            output_func=output_func,
+        )
+
+
+def _try_cleanup_application_session(
+    cleanup: Callable[[], None],
+    *,
+    output_func: Callable[[str], None],
+) -> None:
+    """Report a lifecycle cleanup failure without replacing the primary result."""
+    try:
+        cleanup()
+    except Exception as lifecycle_error:  # noqa: BLE001 - CLI cleanup boundary
+        output_func(
+            "session> 警告："
+            + format_model_error(lifecycle_error, operation="Session 清理失败")
+        )
 
 
 def _output_session_started(
@@ -629,6 +513,7 @@ def _print_chunk(content: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    startup_profile.total("cli.import")
     args = sys.argv[1:] if argv is None else argv
 
     if args == []:
@@ -637,16 +522,6 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = _build_cli_parser()
     options = parser.parse_args(args)
-
-    if options.command == "chat":
-        try:
-            run_chat_loop(build_chat_session())
-        except KeyboardInterrupt:
-            print("")
-            print("提示> Chat 已中断。")
-        except Exception as error:
-            print(f"错误> Chat 启动失败：{error_summary(error)}")
-        return
 
     if options.command == "runtime":
         runtime_request: SessionStartRequest | None = None
@@ -726,14 +601,6 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         metavar="COMMAND",
         required=True,
     )
-
-    chat_parser = subparsers.add_parser(
-        "chat",
-        add_help=False,
-        help="启动不带 coding tools 的普通模型对话",
-        description="启动不带文件、命令等 coding tools 的普通模型对话。",
-    )
-    _add_help_argument(chat_parser)
 
     tui_parser = subparsers.add_parser(
         "tui",

@@ -5,7 +5,9 @@ from mycode.permissions import (
     ConfirmationResult,
     PermissionDecision,
 )
-from mycode.tools import ToolRegistry, Workspace, WriteFileArgs, WriteFileTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
+from mycode.tools.write_file import WriteFileArgs, WriteFileTool
 
 
 def test_write_file_schema_describes_arguments(tmp_path: Path) -> None:

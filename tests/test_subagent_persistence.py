@@ -8,10 +8,11 @@ import threading
 
 import pytest
 
-from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentToolCall
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.messages import Message
+from mycode.model_events import ModelResponse, ModelStreamEvent
 from mycode.project import ProjectIdentity
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
 from mycode.persistence.session_store import SessionStore
@@ -32,26 +33,24 @@ from mycode.subagents.snapshots import (
     SubAgentSnapshotMetadata,
 )
 from mycode.tools.workspace import Workspace
-from mycode.tools import ToolRegistry
+from mycode.tools.registry import ToolRegistry
 
 
-def _stream_response(response: AgentModelResponse) -> Iterator[AgentEvent]:
+def _stream_response(response: ModelResponse) -> Iterator[ModelStreamEvent]:
     if response.reasoning_content is not None:
-        yield AgentEvent(
+        yield ModelStreamEvent(
             type="reasoning_delta",
             reasoning_content=response.reasoning_content,
         )
     if response.tool_calls and response.reasoning_state != "absent":
-        yield AgentEvent(
+        yield ModelStreamEvent(
             type="reasoning_state",
             reasoning_state=response.reasoning_state,
         )
-    if response.stop_reason == "model_error":
-        yield AgentEvent(type="error", error=response.content)
-    elif response.content:
-        yield AgentEvent(type="text_delta", content=response.content)
+    if response.content:
+        yield ModelStreamEvent(type="text_delta", content=response.content)
     for tool_call in response.tool_calls:
-        yield AgentEvent(type="tool_call", tool_call=tool_call)
+        yield ModelStreamEvent(type="tool_call", tool_call=tool_call)
 
 
 def test_observer_runtime_jsonl_safe_audit_and_multiple_runs(tmp_path):
@@ -68,10 +67,10 @@ def test_observer_runtime_jsonl_safe_audit_and_multiple_runs(tmp_path):
         ))
         for run_id in ("first", "second"):
             client = ScriptedSubAgentLLM([
-                AgentModelResponse(tool_calls=[
+                ModelResponse(tool_calls=[
                     AgentToolCall(id="read", name="read_file", arguments={"path": "README.md"}),
                     AgentToolCall(id="unknown", name="PRIVATE_TOOL_NAME", arguments={"PRIVATE_KEY": "PRIVATE ARGUMENT VALUE"}),
-                ], stop_reason="tool_calls"),
+                ]),
                 _explorer_submission("Safe persisted summary."),
             ])
             result = _runtime(workspace, tmp_path, client, run_id=run_id).execute(
@@ -138,8 +137,8 @@ def _runtime(
     )
 
 
-def _explorer_submission(summary: str) -> AgentModelResponse:
-    return AgentModelResponse(
+def _explorer_submission(summary: str) -> ModelResponse:
+    return ModelResponse(
         tool_calls=[
             AgentToolCall(
                 id="submit",
@@ -153,14 +152,13 @@ def _explorer_submission(summary: str) -> AgentModelResponse:
                 },
             )
         ],
-        stop_reason="tool_calls",
     )
 
 
 class ScriptedSubAgentLLM:
     last_token_usage = None
 
-    def __init__(self, responses: list[AgentModelResponse]) -> None:
+    def __init__(self, responses: list[ModelResponse]) -> None:
         self.responses = list(responses)
 
     def complete(self, conversation: Conversation) -> Message:
@@ -174,7 +172,7 @@ class ScriptedSubAgentLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
+    ) -> Iterator[ModelStreamEvent]:
         yield from _stream_response(self.responses.pop(0))
 
 
@@ -195,7 +193,7 @@ class BarrierExplorerLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
+    ) -> Iterator[ModelStreamEvent]:
         self.barrier.wait(timeout=3)
         yield from _stream_response(_explorer_submission("Parallel persisted summary."))
 
@@ -217,7 +215,7 @@ class SystemExitingSubAgentLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
+    ) -> Iterator[ModelStreamEvent]:
         raise SystemExit(self.exit_code)
         yield
 

@@ -5,7 +5,9 @@ import sys
 import pytest
 
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
-from mycode.tools import RunValidationTool, ToolRegistry, Workspace
+from mycode.tools.run_validation import RunValidationTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 from mycode.tools.validation_command import analyze_validation_command
 
 

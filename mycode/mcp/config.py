@@ -14,6 +14,7 @@ from pydantic import (
     field_validator,
 )
 
+from mycode import startup_profile
 from mycode.config import (
     MYCODE_CONFIG_DIR_NAME,
     load_layered_environment,
@@ -134,26 +135,29 @@ def load_mcp_config_layers(
     environ: Mapping[str, str] | None = None,
     workspace_root: str | Path | None = None,
 ) -> MCPLoadedConfig:
-    user_path = default_mcp_config_file() if config_file is None else Path(config_file)
-    user_config = _load_mcp_config_file(user_path)
-    project_config = (
-        MCPConfig()
-        if workspace_root is None
-        else _load_mcp_config_file(project_mcp_config_file(workspace_root))
-    )
-    environment = load_layered_environment(
-        env_file,
-        workspace_root=workspace_root,
-        environ=environ,
-    )
-    resolved_user_config = _resolve_config_secrets(user_config, environment)
-    resolved_project_config = _resolve_config_secrets(project_config, environment)
-    return MCPLoadedConfig(
-        user=resolved_user_config,
-        project=resolved_project_config,
-        merged=merge_mcp_configs(resolved_user_config, resolved_project_config),
-        project_unresolved=project_config,
-    )
+    with startup_profile.span("mcp.config"):
+        user_path = (
+            default_mcp_config_file() if config_file is None else Path(config_file)
+        )
+        user_config = _load_mcp_config_file(user_path)
+        project_config = (
+            MCPConfig()
+            if workspace_root is None
+            else _load_mcp_config_file(project_mcp_config_file(workspace_root))
+        )
+        environment = load_layered_environment(
+            env_file,
+            workspace_root=workspace_root,
+            environ=environ,
+        )
+        resolved_user_config = _resolve_config_secrets(user_config, environment)
+        resolved_project_config = _resolve_config_secrets(project_config, environment)
+        return MCPLoadedConfig(
+            user=resolved_user_config,
+            project=resolved_project_config,
+            merged=merge_mcp_configs(resolved_user_config, resolved_project_config),
+            project_unresolved=project_config,
+        )
 
 
 def merge_mcp_configs(user: MCPConfig, project: MCPConfig) -> MCPConfig:

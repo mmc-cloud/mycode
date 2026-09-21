@@ -6,12 +6,14 @@ import time
 
 import pytest
 
-from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentToolCall
 from mycode.context.budget import ContextBudget
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
 from mycode.memory import MemoryStore
 from mycode.messages import Message
+from mycode.model_events import ModelResponse, ModelStreamEvent
+from mycode.model_projection import project_model_messages
 from mycode.permissions import (
     ConfirmationRequest,
     ConfirmationResult,
@@ -30,27 +32,25 @@ from mycode.subagents.runtime import (
     SubAgentRuntime,
     _collect_agent_events,
 )
-from mycode.tools import ToolRegistry
+from mycode.tools.registry import ToolRegistry
 from mycode.tools.workspace import Workspace
 
 
-def _stream_response(response: AgentModelResponse) -> Iterator[AgentEvent]:
+def _stream_response(response: ModelResponse) -> Iterator[ModelStreamEvent]:
     if response.reasoning_content is not None:
-        yield AgentEvent(
+        yield ModelStreamEvent(
             type="reasoning_delta",
             reasoning_content=response.reasoning_content,
         )
     if response.tool_calls and response.reasoning_state != "absent":
-        yield AgentEvent(
+        yield ModelStreamEvent(
             type="reasoning_state",
             reasoning_state=response.reasoning_state,
         )
-    if response.stop_reason == "model_error":
-        yield AgentEvent(type="error", error=response.content)
-    elif response.content:
-        yield AgentEvent(type="text_delta", content=response.content)
+    if response.content:
+        yield ModelStreamEvent(type="text_delta", content=response.content)
     for tool_call in response.tool_calls:
-        yield AgentEvent(type="tool_call", tool_call=tool_call)
+        yield ModelStreamEvent(type="tool_call", tool_call=tool_call)
 
 
 def test_runtime_completes_explorer_with_independent_context(tmp_path: Path) -> None:
@@ -99,7 +99,7 @@ def test_runtime_collector_keeps_only_the_terminal_turn_content(
     (workspace / "AGENTS.md").write_text("project instructions", encoding="utf-8")
     client = RecordingToolLLM(
         [
-            AgentModelResponse(
+            ModelResponse(
                 content="early investigation notes",
                 tool_calls=[
                     AgentToolCall(
@@ -108,9 +108,8 @@ def test_runtime_collector_keeps_only_the_terminal_turn_content(
                         arguments={"path": "AGENTS.md"},
                     )
                 ],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="terminal answer only"),
+            ModelResponse(content="terminal answer only"),
         ]
     )
     runtime = _runtime(workspace, lambda: client, tmp_path=tmp_path)
@@ -187,7 +186,7 @@ def test_runtime_uses_neutral_near_limit_prompt(
     (workspace / "README.md").write_text("hello", encoding="utf-8")
     client = RecordingToolLLM(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id=f"call_read_{role}",
@@ -195,9 +194,8 @@ def test_runtime_uses_neutral_near_limit_prompt(
                         arguments={"path": "README.md"},
                     )
                 ],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="ordinary answer"),
+            ModelResponse(content="ordinary answer"),
         ]
     )
     runtime = _runtime(
@@ -350,7 +348,7 @@ def test_runtime_keeps_instruction_and_memory_snapshot_fixed_during_run(
 
     client = RecordingToolLLM(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call_read",
@@ -358,7 +356,6 @@ def test_runtime_keeps_instruction_and_memory_snapshot_fixed_during_run(
                         arguments={"path": "AGENTS.md"},
                     )
                 ],
-                stop_reason="tool_calls",
             ),
             _explorer_submission("snapshot stayed fixed"),
         ],
@@ -398,7 +395,7 @@ def test_tester_result_uses_real_validation_execution_and_confirmation_state(
     command = [sys.executable, "-m", "compileall", "-q", "."]
     client = RecordingToolLLM(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call_validation",
@@ -406,7 +403,6 @@ def test_tester_result_uses_real_validation_execution_and_confirmation_state(
                         arguments={"command": command},
                     )
                 ],
-                stop_reason="tool_calls",
             ),
             _tester_submission(status="passed", summary="Compilation passed."),
         ]
@@ -454,7 +450,7 @@ def test_parallel_testers_serialize_confirmation_interaction(
     clients = [
         RecordingToolLLM(
             [
-                AgentModelResponse(
+                ModelResponse(
                     tool_calls=[
                         AgentToolCall(
                             id=f"validation-{index}",
@@ -462,7 +458,6 @@ def test_parallel_testers_serialize_confirmation_interaction(
                             arguments={"command": command},
                         )
                     ],
-                    stop_reason="tool_calls",
                 ),
                 _tester_submission(
                     status="passed",
@@ -547,7 +542,7 @@ def test_submit_result_barrier_skips_validation_from_same_model_response(
     confirmer = ApprovingConfirmer()
     client = RecordingToolLLM(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call_stale_validation",
@@ -562,7 +557,6 @@ def test_submit_result_barrier_skips_validation_from_same_model_response(
                         blocked_reason="The task only requested static information.",
                     ),
                 ],
-                stop_reason="tool_calls",
             )
         ]
     )
@@ -597,7 +591,7 @@ def test_multiple_submit_calls_are_rejected_as_a_batch_then_can_retry(
     second = _explorer_submit_call("second invalid batch result")
     client = RecordingToolLLM(
         [
-            AgentModelResponse(tool_calls=[first, second], stop_reason="tool_calls"),
+            ModelResponse(tool_calls=[first, second]),
             _explorer_submission("single corrected result"),
         ]
     )
@@ -621,7 +615,7 @@ def test_runtime_marks_keyboard_interrupt_without_resuming_old_run(
     workspace.mkdir()
     client = RecordingToolLLM(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call_validation",
@@ -631,7 +625,6 @@ def test_runtime_marks_keyboard_interrupt_without_resuming_old_run(
                         },
                     )
                 ],
-                stop_reason="tool_calls",
             )
         ]
     )
@@ -685,7 +678,7 @@ def test_runtime_marks_system_exit_before_propagating_it(
 def test_runtime_treats_plain_model_answer_as_invalid_result(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    client = RecordingToolLLM([AgentModelResponse(content="ordinary answer")])
+    client = RecordingToolLLM([ModelResponse(content="ordinary answer")])
     runtime = _runtime(workspace, lambda: client, tmp_path=tmp_path)
 
     execution = runtime.execute(
@@ -712,7 +705,7 @@ def test_runtime_distinguishes_max_turns_model_error_repetition_and_overflow(
     )
 
     max_turns_client = RecordingToolLLM(
-        [AgentModelResponse(tool_calls=[read_call], stop_reason="tool_calls")]
+        [ModelResponse(tool_calls=[read_call])]
     )
     max_turns = _runtime(
         workspace,
@@ -724,7 +717,8 @@ def test_runtime_distinguishes_max_turns_model_error_repetition_and_overflow(
     assert max_turns.result.stop_reason == "max_turns"
 
     model_error_client = RecordingToolLLM(
-        [AgentModelResponse(content="provider unavailable", stop_reason="model_error")]
+        [],
+        stream_events=[[ModelStreamEvent(type="error", error="provider unavailable")]],
     )
     model_error = _runtime(
         workspace,
@@ -736,8 +730,8 @@ def test_runtime_distinguishes_max_turns_model_error_repetition_and_overflow(
 
     repeated_client = RecordingToolLLM(
         [
-            AgentModelResponse(tool_calls=[read_call], stop_reason="tool_calls"),
-            AgentModelResponse(
+            ModelResponse(tool_calls=[read_call]),
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call_read_two",
@@ -745,7 +739,6 @@ def test_runtime_distinguishes_max_turns_model_error_repetition_and_overflow(
                         arguments={"path": "README.md"},
                     )
                 ],
-                stop_reason="tool_calls",
             ),
         ]
     )
@@ -839,10 +832,9 @@ def _runtime(
     )
 
 
-def _explorer_submission(summary: str) -> AgentModelResponse:
-    return AgentModelResponse(
+def _explorer_submission(summary: str) -> ModelResponse:
+    return ModelResponse(
         tool_calls=[_explorer_submit_call(summary)],
-        stop_reason="tool_calls",
     )
 
 
@@ -866,8 +858,8 @@ def _tester_submission(
     summary: str,
     failure_summary: str | None = None,
     blocked_reason: str | None = None,
-) -> AgentModelResponse:
-    return AgentModelResponse(
+) -> ModelResponse:
+    return ModelResponse(
         tool_calls=[
             _tester_submit_call(
                 status=status,
@@ -876,7 +868,6 @@ def _tester_submission(
                 blocked_reason=blocked_reason,
             )
         ],
-        stop_reason="tool_calls",
     )
 
 
@@ -908,11 +899,13 @@ class RecordingToolLLM:
 
     def __init__(
         self,
-        responses: list[AgentModelResponse],
+        responses: list[ModelResponse],
         *,
+        stream_events: list[list[ModelStreamEvent]] | None = None,
         before_first_response=None,
     ) -> None:
         self.responses = list(responses)
+        self.stream_events = [] if stream_events is None else stream_events
         self.before_first_response = before_first_response
         self.seen_conversations: list[list[dict[str, object]]] = []
         self.seen_tools: list[list[dict[str, object]]] = []
@@ -927,13 +920,16 @@ class RecordingToolLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
-        self.seen_conversations.append(conversation.to_model_messages())
+    ) -> Iterator[ModelStreamEvent]:
+        self.seen_conversations.append(project_model_messages(conversation.get_messages()))
         self.seen_tools.append(tools)
         if self.before_first_response is not None:
             callback = self.before_first_response
             self.before_first_response = None
             callback()
+        if self.stream_events:
+            yield from self.stream_events.pop(0)
+            return
         if not self.responses:
             raise RuntimeError("No fake SubAgent response remains.")
         yield from _stream_response(self.responses.pop(0))
@@ -964,7 +960,7 @@ class RoleAwareBarrierLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
+    ) -> Iterator[ModelStreamEvent]:
         names = {str(tool["name"]) for tool in tools}
         if "run_validation" in names:
             role = "tester"
@@ -975,7 +971,7 @@ class RoleAwareBarrierLLM:
             )
         elif "inspect_changes" in names:
             role = "reviewer"
-            response = AgentModelResponse(
+            response = ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="reviewer-submit",
@@ -989,7 +985,6 @@ class RoleAwareBarrierLLM:
                         },
                     )
                 ],
-                stop_reason="tool_calls",
             )
         else:
             role = "explorer"
@@ -998,7 +993,7 @@ class RoleAwareBarrierLLM:
             )
 
         with self.seen_lock:
-            self.seen_by_role[role] = conversation.to_model_messages()
+            self.seen_by_role[role] = project_model_messages(conversation.get_messages())
         self.barrier.wait(timeout=3)
         yield from _stream_response(response)
 
@@ -1054,7 +1049,7 @@ class SystemExitingLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
+    ) -> Iterator[ModelStreamEvent]:
         raise SystemExit(self.exit_code)
         yield
 
@@ -1088,8 +1083,8 @@ def test_subagent_retention_restores_recent_and_isolates_artifact_roots(tmp_path
         calls = [AgentToolCall(id=f"read-{name}", name="read_file", arguments={"path": name})
                  for name in ("a.txt", "b.txt")]
         client = RecordingToolLLM([
-            AgentModelResponse(tool_calls=[calls[0]], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=[calls[1]], stop_reason="tool_calls"),
+            ModelResponse(tool_calls=[calls[0]]),
+            ModelResponse(tool_calls=[calls[1]]),
             _explorer_submission("inspected evidence"),
         ])
         runtime = _runtime(workspace, lambda: client, tmp_path=tmp_path,

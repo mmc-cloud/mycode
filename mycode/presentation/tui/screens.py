@@ -8,7 +8,7 @@ from textual.css.query import NoMatches
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Input, LoadingIndicator, OptionList, Static
+from textual.widgets import Button, LoadingIndicator, OptionList, Static
 from textual.widgets.option_list import Option
 
 from mycode.application.sessions import SessionStartRequest
@@ -17,8 +17,10 @@ from mycode.permissions import ConfirmationRequest, ConfirmationResult
 from mycode.persistence.session_store import SessionRecord
 from mycode.presentation.tui.widgets import (
     SPLASH_LOGO,
+    CommandPicker,
     ConversationView,
     HeaderBar,
+    PromptTextArea,
     StatusBar,
 )
 
@@ -148,17 +150,32 @@ class MainScreen(Screen[None]):
         yield HeaderBar(self.workspace, self.model, id="header")
         yield ConversationView(id="conversation")
         yield StatusBar("Runtime Ready", id="status")
-        yield Input(placeholder="Ask MyCode...", id="prompt")
+        yield CommandPicker(id="command-picker")
+        yield PromptTextArea(
+            placeholder="Ask MyCode...  (Ctrl+J / Ctrl+Enter to send, / for commands)",
+            id="prompt",
+        )
 
     def on_mount(self) -> None:
         self.app._activate_main_screen(self)
-        self.query_one(Input).focus()
+        self.query_one(PromptTextArea).focus()
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        content = event.value
-        event.input.value = ""
-        if content.strip():
-            self.app.submit_user_message(content)
+    def on_prompt_text_area_submitted(
+        self, event: PromptTextArea.Submitted
+    ) -> None:
+        """Route a submitted prompt to the existing Agent/command entry point.
+
+        The composer clears itself before posting, and the submitted text is
+        parsed again by ``parse_slash_command()`` inside the app, so the picker
+        never becomes a second command-validation path.
+        """
+        if event.text.strip():
+            self.app.submit_user_message(event.text)
+
+    def on_prompt_text_area_picker_changed(
+        self, event: PromptTextArea.PickerChanged
+    ) -> None:
+        self.query_one(CommandPicker).render_state(event.state)
 
 
 class MCPTrustScreen(ModalScreen[bool]):

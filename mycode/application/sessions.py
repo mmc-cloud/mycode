@@ -5,6 +5,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from mycode import startup_profile
 from mycode.context.compact import CompactState
 from mycode.conversation import Conversation
 from mycode.messages import Message
@@ -108,7 +109,8 @@ def list_project_sessions(
     *,
     limit: int = DEFAULT_SESSION_LIST_LIMIT,
 ) -> list[SessionRecord]:
-    return store.list_sessions(project, limit=limit)
+    with startup_profile.span("session.list"):
+        return store.list_sessions(project, limit=limit)
 
 
 def delete_project_session(

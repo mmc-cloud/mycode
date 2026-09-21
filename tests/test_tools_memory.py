@@ -3,7 +3,7 @@ from pathlib import Path
 from mycode.memory import MemoryStore
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
 from mycode.persistence.session_store import ProjectIdentity
-from mycode.tools import ToolRegistry
+from mycode.tools.registry import ToolRegistry
 from mycode.tools.memory import (
     DeleteMemoryTool,
     ListMemoriesTool,

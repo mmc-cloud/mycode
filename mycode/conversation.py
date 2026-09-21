@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from mycode.agent.events import AgentToolCall
+from mycode.model_events import ModelToolCall
 from mycode.messages import Message
 from mycode.reasoning import ReasoningState
 
@@ -44,7 +44,7 @@ class Conversation:
     def add_assistant_tool_calls(
         self,
         content: str,
-        tool_calls: list[AgentToolCall],
+        tool_calls: list[ModelToolCall],
         *,
         reasoning_content: str | None = None,
         reasoning_state: ReasoningState = "absent",
@@ -70,9 +70,6 @@ class Conversation:
 
     def get_messages(self) -> list[Message]:
         return list(self._messages)
-
-    def to_model_messages(self) -> list[dict[str, object]]:
-        return [message.to_model_dict() for message in self._messages]
 
     def clear(self) -> None:
         self._messages.clear()

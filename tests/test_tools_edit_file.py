@@ -1,7 +1,9 @@
 from pathlib import Path
 
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
-from mycode.tools import EditFileArgs, EditFileTool, ToolRegistry, Workspace
+from mycode.tools.edit_file import EditFileArgs, EditFileTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 
 
 def test_edit_file_schema_describes_arguments(tmp_path: Path) -> None:

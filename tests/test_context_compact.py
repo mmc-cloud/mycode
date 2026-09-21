@@ -4,13 +4,12 @@ import json
 
 import pytest
 
-from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentToolCall
 from mycode.context.budget import (
     ContextBudget,
     ContextBudgetExceededError,
     MemoryContextStats,
     TokenEstimator,
-    TokenUsage,
     estimate_conversation,
     format_model_context_stats,
 )
@@ -24,11 +23,12 @@ from mycode.context.compact import (
     ConversationCompactor,
 )
 from mycode.conversation import Conversation
+from mycode.model_events import ModelResponse, ModelStreamEvent, TokenUsage
 from mycode.messages import Message
+from mycode.model_projection import project_model_messages
 from mycode.agent.runner import AgentRunner
 from mycode.application.agent_session import AgentApplicationSession
-from mycode.session import ChatSession
-from mycode.tools import ToolRegistry
+from mycode.tools.registry import ToolRegistry
 
 
 def context_budget(max_input_tokens: int) -> ContextBudget:
@@ -637,101 +637,10 @@ def test_agent_runner_preserves_summary_and_stops_when_active_summary_overflows(
     assert summary_client.seen_conversations == []
 
 
-def test_chat_session_preserves_summary_and_raises_when_active_summary_overflows() -> None:
-    summary_client = RecordingSummaryClient(
-        responses=[summary_json("unused")],
-    )
-    main_client = RecordingChatClient()
-    boundary = CompactBoundary(
-        boundary_id="oversized-chat-summary",
-        covered_message_count=2,
-        covered_turn_count=1,
-        summary=CompactSummary(
-            objective="S" * 1800,
-            progress=(),
-            decisions=(),
-            constraints=(),
-            open_items=(),
-            references=(),
-        ),
-        source_estimated_tokens=1000,
-        created_at=datetime(2026, 7, 26, tzinfo=timezone.utc),
-    )
-    session = ChatSession(
-        llm_client=main_client,
-        conversation=Conversation.from_messages(
-            [
-                Message(role="system", content="system prompt"),
-                Message(role="user", content="old request " * 120),
-                Message(role="assistant", content="old reply " * 120),
-                Message(role="user", content="current request"),
-            ]
-        ),
-        context_budget=context_budget(400),
-        compactor=ConversationCompactor(
-            llm_client=summary_client,
-            state=CompactState(boundary=boundary),
-        ),
-    )
-
-    with pytest.raises(ContextBudgetExceededError) as error:
-        session.send_user_message("latest request")
-
-    assert main_client.seen_conversations == []
-    context = session.last_model_context
-    assert context is error.value.context
-    assert context.estimate.over_budget is True
-    assert context.compact_stats is not None
-    assert context.compact_stats.status == "insufficient_history"
-    assert context.compact_stats.summary_visible is True
-    assert any(COMPACT_SUMMARY_MARKER in message.content for message in context.messages)
-    assert context.source_message_count == 5
-    assert session.compactor.state.boundary == boundary
-    assert summary_client.seen_conversations == []
-
-
-def test_chat_session_uses_same_compact_summary_plus_recent_tail_model() -> None:
-    summary_client = RecordingSummaryClient(
-        responses=[summary_json("chat compact")]
-    )
-    main_client = RecordingChatClient()
-    history = Conversation.from_messages(
-        [
-            Message(role="user", content="old request " * 50),
-            Message(role="assistant", content="old reply " * 50),
-            Message(role="user", content="recent request"),
-            Message(role="assistant", content="recent reply"),
-        ]
-    )
-    session = ChatSession(
-        llm_client=main_client,
-        conversation=history,
-        context_budget=context_budget(2000),
-        compactor=ConversationCompactor(
-            llm_client=summary_client,
-            policy=CompactPolicy(
-                trigger_ratio=0.01,
-                recent_turns_to_keep=2,
-            ),
-        ),
-    )
-
-    reply = session.send_user_message("current request")
-
-    assert reply.content == "chat done"
-    assert COMPACT_SUMMARY_MARKER in main_client.seen_conversations[0][0]["content"]
-    assert history.get_messages()[0].content.startswith("old request")
-    assert history.get_messages()[-1] == Message(
-        role="assistant",
-        content="chat done",
-    )
-
-
-@pytest.mark.parametrize("entry", ["agent", "chat", "chat_stream"])
 @pytest.mark.parametrize(
     "status", ["not_needed", "compacted", "active", "failed", "cooldown", "circuit_open"]
 )
-def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tmp_path) -> None:
+def test_shared_pipeline_preserves_compact_states(status, monkeypatch, tmp_path) -> None:
     import mycode.context.builder as builder_module
 
     summary_client = RecordingSummaryClient(
@@ -782,27 +691,16 @@ def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tm
     monkeypatch.setattr(builder_module, "budget_model_context", budget)
     history = conversation_with_tool_turn()
     original = history.get_messages()
-    if entry == "agent":
-        client = RecordingAgentClient(
-            usage=TokenUsage(prompt_tokens=50, completion_tokens=10, total_tokens=60)
-        )
-        from mycode.context.artifacts import ToolResultArtifactStore
-        owner = AgentRunner(
-            llm_client=client, tool_registry=ToolRegistry(), conversation=history,
-            compactor=compactor, context_budget=context_budget(2000),
-            tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 10),
-        )
-        assert list(owner.run("next"))[-1].stop_reason == "final_answer"
-    else:
-        client = RecordingChatClient()
-        owner = ChatSession(
-            llm_client=client, conversation=history,
-            compactor=compactor, context_budget=context_budget(2000),
-        )
-        if entry == "chat_stream":
-            assert "".join(owner.stream_user_message("next")) == "chat done"
-        else:
-            assert owner.send_user_message("next").content == "chat done"
+    client = RecordingAgentClient(
+        usage=TokenUsage(prompt_tokens=50, completion_tokens=10, total_tokens=60)
+    )
+    from mycode.context.artifacts import ToolResultArtifactStore
+    owner = AgentRunner(
+        llm_client=client, tool_registry=ToolRegistry(), conversation=history,
+        compactor=compactor, context_budget=context_budget(2000),
+        tool_result_artifact_store=ToolResultArtifactStore(tmp_path / "a", 10),
+    )
+    assert list(owner.run("next"))[-1].stop_reason == "final_answer"
 
     context = owner.last_model_context
     assert stages == ["compact", "budget"]
@@ -810,14 +708,12 @@ def test_shared_pipeline_preserves_compact_states(entry, status, monkeypatch, tm
     assert context.compact_stats.status == status
     assert context.estimate.estimated_input_tokens <= context.estimate.max_input_tokens
     assert client.seen_conversations == [
-        Conversation.from_messages(list(context.messages)).to_model_messages()
+        project_model_messages(context.messages)
     ]
     has_summary = any(COMPACT_SUMMARY_MARKER in m.content for m in context.messages)
     assert has_summary == (status in {"compacted", "active", "cooldown", "circuit_open"})
     assert history.get_messages()[:len(original)] == original
     assert len(summary_client.seen_conversations) == (1 if status in {"compacted", "failed"} else 0)
-    if entry != "agent":
-        assert owner.last_compact_token_usage == prepared_results[0].attempt_token_usage
 
 
 @pytest.mark.parametrize("omit_memory", [False, True])
@@ -917,7 +813,7 @@ class RecordingSummaryClient:
         self.seen_conversations: list[list[dict[str, object]]] = []
 
     def complete(self, conversation: Conversation) -> Message:
-        self.seen_conversations.append(conversation.to_model_messages())
+        self.seen_conversations.append(project_model_messages(conversation.get_messages()))
         self.last_token_usage = (
             self.token_usages.pop(0) if self.token_usages else None
         )
@@ -939,24 +835,10 @@ class RecordingAgentClient:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
-        self.seen_conversations.append(conversation.to_model_messages())
+    ) -> Iterator[ModelStreamEvent]:
+        self.seen_conversations.append(project_model_messages(conversation.get_messages()))
         self.last_token_usage = self.usage
-        yield AgentEvent(type="text_delta", content="done")
-
-
-class RecordingChatClient:
-    def __init__(self) -> None:
-        self.last_token_usage = None
-        self.seen_conversations: list[list[dict[str, object]]] = []
-
-    def complete(self, conversation: Conversation) -> Message:
-        self.seen_conversations.append(conversation.to_model_messages())
-        return Message(role="assistant", content="chat done")
-
-    def stream_complete(self, conversation: Conversation) -> Iterator[str]:
-        self.seen_conversations.append(conversation.to_model_messages())
-        yield "chat done"
+        yield ModelStreamEvent(type="text_delta", content="done")
 
 
 @pytest.mark.parametrize("reuse", [False, True])

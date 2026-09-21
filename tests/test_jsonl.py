@@ -243,7 +243,7 @@ def run_fake_runtime(
     input_text: str,
 ):
     monkeypatch.setattr(
-        "mycode.adapters.jsonl.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: application,
     )
     output_stream = io.StringIO()
@@ -416,7 +416,7 @@ def test_jsonl_machine_runtime_is_json_only_and_forwards_turn_events(
     seen_turns: list[tuple[str, str]] = []
     application = FakeRuntimeApplication(seen_turns)
     monkeypatch.setattr(
-        "mycode.adapters.jsonl.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: application,
     )
 
@@ -456,7 +456,7 @@ def test_jsonl_context_controls_use_structured_messages_without_slash_commands(
         '{"version":1,"type":"close"}\n'
     )
     monkeypatch.setattr(
-        "mycode.adapters.jsonl.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: application,
     )
     output_stream = io.StringIO()
@@ -508,7 +508,7 @@ def test_machine_runtime_never_opens_session_menu(
         return application
 
     monkeypatch.setattr(
-        "mycode.adapters.jsonl.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         fake_start,
     )
     output_stream = io.StringIO()
@@ -672,7 +672,7 @@ def test_jsonl_protocol_errors_are_structured_and_runtime_continues(
 ) -> None:
     application = FakeRuntimeApplication([])
     monkeypatch.setattr(
-        "mycode.adapters.jsonl.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: application,
     )
     input_stream = io.StringIO(

@@ -1,7 +1,8 @@
 from pathlib import Path
 
 from mycode.permissions import PermissionRequest
-from mycode.tools import PathPermissionPolicy, Workspace
+from mycode.tools.path_permissions import PathPermissionPolicy
+from mycode.tools.workspace import Workspace
 
 
 def test_path_permission_policy_allows_normal_workspace_path(tmp_path: Path) -> None:

@@ -8,7 +8,7 @@ from mycode.agent.events import (
     AgentProgressSnapshot,
     AgentToolCall,
 )
-from mycode.tools import ToolResult
+from mycode.tools.base import ToolResult
 
 
 def test_agent_tool_call_stores_model_requested_tool() -> None:

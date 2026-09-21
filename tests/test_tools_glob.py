@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from mycode.tools import GlobArgs, GlobTool, Workspace
+from mycode.tools.glob import GlobArgs, GlobTool
+from mycode.tools.workspace import Workspace
 
 
 def test_glob_finds_files_by_pattern(tmp_path: Path) -> None:

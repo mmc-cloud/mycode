@@ -8,7 +8,8 @@ from mycode.mcp.config import MCPConfig, MCPLoadedConfig
 from mycode.mcp.models import MCPServerStatus
 from mycode.application.sessions import SessionStartRequest
 from mycode.persistence.session_store import SessionStore
-from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
+from mycode.tools.registry import ToolRegistry
 
 
 class ExternalArgs(ToolArgs):
@@ -83,7 +84,7 @@ def test_agent_command_loads_mcp_config_for_workspace(tmp_path, monkeypatch) -> 
             project_unresolved=empty,
         )
 
-    monkeypatch.setattr("mycode.cli.load_mcp_config_layers", fake_load_mcp_config)
+    monkeypatch.setattr("mycode.application.startup.load_mcp_config_layers", fake_load_mcp_config)
     monkeypatch.setattr("mycode.cli.run_agent_loop", lambda **kwargs: None)
 
     run_agent_command(
@@ -129,7 +130,7 @@ def test_rejected_project_mcp_never_reaches_manager_start(tmp_path, monkeypatch)
         ),
         project_unresolved=project,
     )
-    monkeypatch.setattr("mycode.cli.load_mcp_config_layers", lambda **kwargs: loaded)
+    monkeypatch.setattr("mycode.application.startup.load_mcp_config_layers", lambda **kwargs: loaded)
     monkeypatch.setattr(
         "mycode.mcp.trust.default_mcp_trust_file",
         lambda: tmp_path / "mcp-trust.json",
@@ -210,11 +211,11 @@ def test_explicit_mcp_config_bypasses_project_trust(tmp_path, monkeypatch) -> No
 
     monkeypatch.setattr("mycode.application.agent_session.MCPManager", CapturingManager)
     monkeypatch.setattr(
-        "mycode.cli.load_mcp_config_layers",
+        "mycode.application.startup.load_mcp_config_layers",
         lambda **kwargs: pytest.fail("explicit config must bypass auto loading"),
     )
     monkeypatch.setattr(
-        "mycode.cli.resolve_project_mcp_trust",
+        "mycode.application.startup.resolve_project_mcp_trust",
         lambda *args, **kwargs: pytest.fail("explicit config must bypass trust"),
     )
     monkeypatch.setattr("mycode.cli.run_agent_loop", lambda **kwargs: None)

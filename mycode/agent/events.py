@@ -2,7 +2,8 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from mycode.reasoning import ReasoningState, normalize_reasoning
-from mycode.tools import ToolResult
+from mycode.model_events import ModelToolCall
+from mycode.tools.base import ToolResult
 
 
 AgentStopReason = Literal[
@@ -35,11 +36,7 @@ AgentEventType = Literal[
 AgentWarningType = Literal["artifact_externalization"]
 
 
-@dataclass(frozen=True)
-class AgentToolCall:
-    id: str
-    name: str
-    arguments: dict[str, object]
+AgentToolCall = ModelToolCall
 
 
 @dataclass(frozen=True)

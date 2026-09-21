@@ -5,7 +5,11 @@ from pathlib import Path
 import re
 from typing import Protocol
 
-from mycode.context.budget import MemoryContextStats, TokenEstimator
+from mycode.context.budget import (
+    MemoryContextStats,
+    TokenEstimator,
+    estimate_canonical_message_size,
+)
 from mycode.memory import MemoryDocument, MemoryEntry, MemoryScope, MemoryStore
 from mycode.messages import Message
 
@@ -237,9 +241,11 @@ def _estimate_message_tokens(
     message: Message,
     token_estimator: TokenEstimator,
 ) -> int:
-    serialized = json.dumps(message.to_model_dict(), ensure_ascii=False)
+    serialized_chars, non_ascii_chars, _tool_call_chars = (
+        estimate_canonical_message_size(message)
+    )
     estimate = token_estimator.estimate(
-        total_chars=len(serialized),
-        non_ascii_chars=sum(1 for character in serialized if ord(character) > 127),
+        total_chars=serialized_chars,
+        non_ascii_chars=non_ascii_chars,
     )
     return estimate.estimated_tokens

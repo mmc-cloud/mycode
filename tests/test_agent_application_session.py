@@ -18,7 +18,8 @@ from mycode.persistence.session_store import SessionStore
 from mycode.project import ProjectIdentity
 from mycode.subagents.observability import CompositeSubAgentObserver
 from mycode.subagents.persistence import SessionSubAgentObserver
-from mycode.tools import ToolArgs, ToolRegistry, ToolResult, PydanticTool
+from mycode.tools.base import ToolArgs, ToolResult, PydanticTool
+from mycode.tools.registry import ToolRegistry
 from mycode.messages import Message
 
 

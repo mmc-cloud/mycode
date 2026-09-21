@@ -1,5 +1,5 @@
 from mycode.subagents.contracts import ExplorerResult
-from mycode.tools import ToolRegistry
+from mycode.tools.registry import ToolRegistry
 from mycode.tools.submit_result import SubmitResultTool
 
 

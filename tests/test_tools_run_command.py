@@ -8,7 +8,9 @@ import time
 import pytest
 
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
-from mycode.tools import RunCommandArgs, RunCommandTool, ToolRegistry, Workspace
+from mycode.tools.run_command import RunCommandArgs, RunCommandTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 
 
 def test_run_command_schema_describes_arguments(tmp_path: Path) -> None:

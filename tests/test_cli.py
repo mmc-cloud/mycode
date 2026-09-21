@@ -1,15 +1,14 @@
 from contextlib import nullcontext
+from pathlib import Path
 
 import pytest
 
 from mycode.application import build_agent_runner
 from mycode.application import context_budget_from_config
 from mycode.application.agent_session import ContextStatus
-from mycode.cli import build_chat_session
 from mycode.cli import main
 from mycode.cli import run_agent_command
 from mycode.cli import run_agent_loop
-from mycode.cli import run_chat_loop
 from mycode.cli import _output_context_status
 from mycode.event_format import summarize_tool_arguments
 from mycode.agent.events import (
@@ -21,12 +20,10 @@ from mycode.agent.events import (
 from mycode.context.budget import ContextBudget
 from mycode.config import LLMConfig
 from mycode.conversation import Conversation
-from mycode.llm import FakeLLMClient
 from mycode.instructions import InstructionBundle, InstructionSource
 from mycode.messages import Message
 from mycode.mcp.config import MCPConfig
 from mycode.agent.outcome import AgentRunOutcome
-from mycode.session import ChatSession
 from mycode.application.sessions import SessionStartRequest, start_project_session
 from mycode.persistence.session_store import (
     ProjectIdentity,
@@ -40,7 +37,7 @@ from mycode.subagents.limits import (
     DEFAULT_MAX_DELEGATIONS_PER_PARENT_RUN,
 )
 from mycode.subagents.observability import CompositeSubAgentObserver
-from mycode.tools import ToolResult
+from mycode.tools.base import ToolResult
 
 
 def context_budget(max_input_tokens: int) -> ContextBudget:
@@ -50,18 +47,6 @@ def context_budget(max_input_tokens: int) -> ContextBudget:
         safety_margin_tokens=0,
     )
 
-
-class FailingChatLLMClient:
-    def __init__(self, *, stream_chunks: list[str]) -> None:
-        self.stream_chunks = stream_chunks
-        self.last_token_usage = None
-        self.last_reasoning_char_count = 0
-
-    def stream_complete(self, conversation: Conversation):
-        yield from self.stream_chunks
-        raise RuntimeError("Request timed out.")
-
-
 def configured_llm() -> LLMConfig:
     return LLMConfig(
         api_key="test-key",
@@ -70,18 +55,6 @@ def configured_llm() -> LLMConfig:
     )
 
 
-def test_build_chat_session_keeps_user_only_config_scope(monkeypatch) -> None:
-    calls: list[dict[str, object]] = []
-
-    def fake_load_llm_config(**kwargs):
-        calls.append(kwargs)
-        return configured_llm()
-
-    monkeypatch.setattr("mycode.cli.load_llm_config", fake_load_llm_config)
-
-    build_chat_session()
-
-    assert calls == [{}]
 
 
 def test_build_agent_runner_loads_config_for_workspace(tmp_path, monkeypatch) -> None:
@@ -115,42 +88,6 @@ def test_context_budget_from_config_uses_token_window_and_reserves() -> None:
     assert budget.safety_margin_tokens == 8000
     assert budget.max_input_tokens == 176000
 
-
-def test_build_chat_session_routes_main_and_compact_models(monkeypatch) -> None:
-    config = LLMConfig(
-        api_key="test-key",
-        base_url="https://example.com",
-        model="main-model",
-        compact_model="compact-model",
-        thinking_enabled=True,
-        reasoning_effort="max",
-    )
-    uuid_calls = 0
-
-    class FakeUUID:
-        hex = "chat-session-123"
-
-    def fake_uuid4():
-        nonlocal uuid_calls
-        uuid_calls += 1
-        return FakeUUID()
-
-    monkeypatch.setattr("mycode.cli.uuid4", fake_uuid4)
-
-    session = build_chat_session(config)
-
-    assert uuid_calls == 1
-    assert session.llm_client.model == "main-model"
-    assert session.llm_client.thinking_enabled is True
-    assert session.llm_client.reasoning_effort == "max"
-    assert session.llm_client.session_id == "chat-session-123"
-    assert session.compactor is not None
-    assert session.compactor.llm_client.model == "compact-model"
-    assert session.compactor.llm_client.thinking_enabled is False
-    assert session.compactor.llm_client.session_id == session.llm_client.session_id
-    assert session.compactor.llm_client.session_id
-
-
 def test_main_prints_greeting(capsys) -> None:
     main([])
 
@@ -169,22 +106,20 @@ def test_main_prints_top_level_help(help_flag, capsys) -> None:
     assert error.value.code == 0
     assert "可扩展终端 coding agent" in captured.out
     assert "agent" in captured.out
-    assert "chat" in captured.out
+    assert "tui" in captured.out
+    assert "runtime" in captured.out
+    assert "chat" not in captured.out
     assert "mycode <子命令> --help" in captured.out
     assert "mycode agent --help" in captured.out
     assert captured.err == ""
 
 
-@pytest.mark.parametrize("command", ["agent", "chat", "runtime"])
+@pytest.mark.parametrize("command", ["agent", "runtime"])
 def test_main_prints_subcommand_help_without_starting_runtime(
     command,
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setattr(
-        "mycode.cli.build_chat_session",
-        lambda: pytest.fail("help must not build a chat session"),
-    )
     monkeypatch.setattr(
         "mycode.cli.run_agent_command",
         lambda **kwargs: pytest.fail("help must not start the agent"),
@@ -266,11 +201,6 @@ def test_main_agent_uses_agent_command(monkeypatch) -> None:
 @pytest.mark.parametrize(
     ("command", "target", "expected"),
     [
-        (
-            ["chat"],
-            "mycode.cli.build_chat_session",
-            "错误> Chat 启动失败：configuration unavailable\n",
-        ),
         (
             ["agent"],
             "mycode.cli.run_agent_command",
@@ -374,204 +304,20 @@ def test_tool_argument_summary_hides_search_and_unknown_values() -> None:
     assert "PRIVATE UNKNOWN VALUE" not in unknown_summary
 
 
-def test_run_chat_loop_sends_multiple_messages_to_same_session() -> None:
-    session = ChatSession(
-        llm_client=FakeLLMClient(
-            responses=["first reply", "second reply"],
-            stream_chunk_size=6,
-        )
-    )
-    inputs = iter(["hello", "again", "/exit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=session,
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert outputs[0] == "输入 /exit 或 /quit 退出。"
-    context_outputs = [output for output in outputs if output.startswith("context> ")]
-    assert len(context_outputs) == 2
-    assert all("/ 115,712 tokens" in output for output in context_outputs)
-    assert all("estimate" in output for output in context_outputs)
-    assert [output for output in outputs if not output.startswith("context> ")] == [
-        "输入 /exit 或 /quit 退出。",
-        "assistant> ",
-        "first ",
-        "reply",
-        "",
-        "assistant> ",
-        "second",
-        " reply",
-        "",
-    ]
-    assert session.conversation.get_messages() == [
-        Message(role="user", content="hello"),
-        Message(role="assistant", content="first reply"),
-        Message(role="user", content="again"),
-        Message(role="assistant", content="second reply"),
-    ]
 
 
-def test_run_chat_loop_skips_empty_input() -> None:
-    session = ChatSession(llm_client=FakeLLMClient(responses=["reply"]))
-    inputs = iter(["", "hello", "/exit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=session,
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert outputs[0] == "输入 /exit 或 /quit 退出。"
-    assert outputs[1].startswith("context> ")
-    assert "/ 115,712 tokens" in outputs[1]
-    assert outputs[2:] == [
-        "assistant> ",
-        "reply",
-        "",
-    ]
 
 
-def test_run_chat_loop_exits_without_calling_llm() -> None:
-    session = ChatSession(llm_client=FakeLLMClient(responses=[]))
-    inputs = iter(["/quit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=session,
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert outputs == ["输入 /exit 或 /quit 退出。"]
-    assert session.conversation.get_messages() == []
 
 
-def test_run_chat_loop_outputs_context_notice_before_assistant_text() -> None:
-    session = ChatSession(
-        llm_client=FakeLLMClient(responses=["reply"]),
-        conversation=Conversation.from_messages(
-            [
-                Message(role="user", content="old request " * 20),
-                Message(role="assistant", content="old reply " * 20),
-            ]
-        ),
-        context_budget=context_budget(100),
-    )
-    inputs = iter(["current", "/exit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=session,
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert outputs[0] == "输入 /exit 或 /quit 退出。"
-    assert outputs[1].startswith("context> ~20 / 100 tokens (20.0% used")
-    assert "messages=1/3" in outputs[1]
-    assert "trimmed=2" in outputs[1]
-    assert outputs[2:] == ["assistant> ", "reply", ""]
 
 
-@pytest.mark.parametrize("stream_chunks", [[], ["partial reply"]])
-def test_run_chat_loop_reports_stream_failure_and_continues(
-    stream_chunks: list[str],
-) -> None:
-    session = ChatSession(
-        llm_client=FailingChatLLMClient(stream_chunks=stream_chunks)
-    )
-    inputs = iter(["hello", "/exit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=session,
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert [output for output in outputs if not output.startswith("context> ")] == [
-        "输入 /exit 或 /quit 退出。",
-        "assistant> ",
-        *stream_chunks,
-        "",
-        "错误> 模型流式请求失败：Request timed out.",
-    ]
-    assert session.conversation.get_messages() == [
-        Message(role="user", content="hello")
-    ]
 
 
-def test_run_chat_loop_reports_request_preparation_failure_and_continues() -> None:
-    class FailingChatSession:
-        last_model_context = None
-        last_token_usage = None
-
-        def stream_user_message(self, content: str):
-            raise RuntimeError("compact request failed\ninternal detail")
-
-    inputs = iter(["hello", "/exit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=FailingChatSession(),
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert outputs == [
-        "输入 /exit 或 /quit 退出。",
-        "错误> 模型请求准备失败：compact request failed",
-    ]
 
 
-def test_run_chat_loop_reports_keyboard_interrupt_without_traceback() -> None:
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=ChatSession(llm_client=FakeLLMClient(responses=[])),
-        input_func=lambda prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
-        output_func=outputs.append,
-    )
-
-    assert outputs == [
-        "输入 /exit 或 /quit 退出。",
-        "",
-        "提示> Chat 已中断。",
-    ]
 
 
-def test_run_chat_loop_reports_context_overflow_without_calling_model() -> None:
-    client = FakeLLMClient(responses=["unused"])
-    session = ChatSession(
-        llm_client=client,
-        context_budget=context_budget(60),
-    )
-    inputs = iter(["中" * 100, "/exit"])
-    outputs: list[str] = []
-
-    run_chat_loop(
-        session=session,
-        input_func=lambda prompt: next(inputs),
-        output_func=outputs.append,
-        output_chunk_func=outputs.append,
-    )
-
-    assert outputs[0] == "输入 /exit 或 /quit 退出。"
-    assert outputs[1].startswith("context> ~160 / 60 tokens (266.7% used")
-    assert "messages=1/1" in outputs[1]
-    assert "over_budget=True" in outputs[1]
-    assert outputs[2].startswith("error> Model context exceeds")
-    assert client.responses == ["unused"]
 
 
 def test_run_agent_loop_streams_text_and_events() -> None:
@@ -1739,7 +1485,7 @@ def test_agent_new_keeps_replacement_when_old_session_cleanup_fails(
     starts = iter([old_session, replacement])
 
     monkeypatch.setattr(
-        "mycode.cli.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         lambda *args, **kwargs: next(starts),
     )
     inputs = iter(["/new", "continue with replacement", "/exit"])
@@ -1822,7 +1568,7 @@ def test_run_agent_command_retries_default_menu_after_session_race(
         fake_select_session_request,
     )
     monkeypatch.setattr(
-        "mycode.cli.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         fake_start_agent_application_session,
     )
     monkeypatch.setattr(
@@ -1868,7 +1614,7 @@ def test_run_agent_command_explicit_session_in_use_does_not_retry_menu(
         raise SessionInUseError("Session is in use by another owner.")
 
     monkeypatch.setattr(
-        "mycode.cli.start_agent_application_session",
+        "mycode.application.startup.start_agent_application_session",
         fail_start,
     )
     monkeypatch.setattr(
@@ -2048,6 +1794,76 @@ def test_run_agent_command_marks_session_interrupted_on_unexpected_error(
     assert sessions[0].status == "interrupted"
     assert outputs[-1] == "错误> Agent 运行失败：unexpected failure"
     assert all("Traceback" not in output for output in outputs)
+
+
+def test_run_agent_command_normal_exit_reports_close_failure_without_raising(
+    tmp_path, monkeypatch
+) -> None:
+    from mycode.application.agent_session import AgentApplicationSession
+
+    def fail_close(self) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(AgentApplicationSession, "close", fail_close)
+    monkeypatch.setattr(
+        "mycode.application.agent_session.build_agent_runner",
+        lambda **kwargs: FakeRunner(event_batches=[]),
+    )
+    outputs: list[str] = []
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: "/exit",
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert any("Session 清理失败：cleanup failed" in output for output in outputs)
+    assert all("Agent 启动失败" not in output for output in outputs)
+
+
+def test_run_agent_command_keeps_runtime_error_primary_when_interrupt_fails(
+    tmp_path, monkeypatch
+) -> None:
+    from mycode.application.agent_session import AgentApplicationSession
+
+    original_interrupt = AgentApplicationSession.interrupt
+
+    class FailingRunner:
+        instruction_sources = ()
+        instruction_warnings = ()
+
+        def run(self, user_message: str):
+            raise RuntimeError("agent failed")
+            yield
+
+    def cleanup_then_fail(self) -> None:
+        original_interrupt(self)
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(AgentApplicationSession, "interrupt", cleanup_then_fail)
+    monkeypatch.setattr(
+        "mycode.application.agent_session.build_agent_runner",
+        lambda **kwargs: FailingRunner(),
+    )
+    outputs: list[str] = []
+
+    run_agent_command(
+        workspace_path=tmp_path,
+        input_func=lambda _prompt: "trigger failure",
+        output_func=outputs.append,
+        session_request=SessionStartRequest(mode="new"),
+        session_store=SessionStore(tmp_path / "projects"),
+        llm_config=configured_llm(),
+        mcp_config=MCPConfig(),
+    )
+
+    assert "错误> Agent 运行失败：agent failed" in outputs
+    assert any("Session 清理失败：cleanup failed" in output for output in outputs)
+    assert all("Agent 启动失败" not in output for output in outputs)
 
 
 def test_run_agent_command_marks_session_interrupted_on_keyboard_interrupt(

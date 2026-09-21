@@ -5,13 +5,11 @@ import pytest
 from mycode.presentation.cli.confirmer import TerminalConfirmer
 from mycode.permissions import ConfirmationResult
 from mycode.skills import MAX_ACTIVE_SKILLS, ActiveSkillState, Skill, SkillRegistry
-from mycode.tools import (
-    LoadSkillTool,
-    ReadSkillResourceTool,
-    RunSkillScriptTool,
-    ToolRegistry,
-    Workspace,
-)
+from mycode.tools.load_skill import LoadSkillTool
+from mycode.tools.read_skill_resource import ReadSkillResourceTool
+from mycode.tools.run_skill_script import RunSkillScriptTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 
 
 class ApprovingConfirmer:

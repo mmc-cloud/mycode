@@ -6,6 +6,7 @@ from collections.abc import Callable
 from pathlib import Path
 from uuid import uuid4
 
+from mycode import startup_profile
 from mycode.agent.events import AgentEvent, AgentStopReason
 from mycode.context.artifacts import (
     ReadArtifactTool,
@@ -16,7 +17,7 @@ from mycode.context.budget import ContextBudget
 from mycode.context.compact import CompactState, ConversationCompactor
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
-from mycode.llm import OpenAICompatibleLLMClient
+from mycode.providers.openai_compatible import OpenAICompatibleLLMClient
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
 from mycode.messages import Message
@@ -31,13 +32,11 @@ from mycode.subagents.delegate import DelegateTaskTool
 from mycode.subagents.delegation import DelegationToolBatchHandler
 from mycode.subagents.observability import SubAgentObserver
 from mycode.subagents.runtime import SubAgentRuntime
-from mycode.tools import (
-    LoadSkillTool,
-    ReadSkillResourceTool,
-    RunSkillScriptTool,
-    Workspace,
-    create_default_tool_registry,
-)
+from mycode.tools.defaults import create_default_tool_registry
+from mycode.tools.load_skill import LoadSkillTool
+from mycode.tools.read_skill_resource import ReadSkillResourceTool
+from mycode.tools.run_skill_script import RunSkillScriptTool
+from mycode.tools.workspace import Workspace
 
 
 AgentEventHandler = Callable[[AgentEvent], None]
@@ -60,128 +59,142 @@ def build_agent_runner(
 ) -> AgentRunner:
     """Assemble one Agent runtime without coupling it to a presentation layer."""
     workspace_root = Path.cwd() if workspace_path is None else workspace_path
-    workspace = Workspace(workspace_root)
-    project = ProjectIdentity.from_workspace(workspace.root)
-    effective_memory_store = (
-        MemoryStore(project) if memory_store is None else memory_store
-    )
-    instruction_bundle = load_instruction_bundle(workspace.root)
-    skill_registry = SkillRegistry.discover(workspace.root)
-    active_skill_state = ActiveSkillState()
-    config = (
-        load_llm_config(workspace_root=workspace.root)
-        if llm_config is None
-        else llm_config
-    )
-    effective_llm_session_id = llm_session_id or uuid4().hex
-    client = OpenAICompatibleLLMClient(
-        config=config,
-        session_id=effective_llm_session_id,
-    )
-    summary_client = OpenAICompatibleLLMClient(
-        config=config,
-        model=config.compact_model,
-        thinking_enabled=False,
-        session_id=effective_llm_session_id,
-    )
-    context_budget = context_budget_from_config(config)
-    memory_recall_policy = MemoryRecallPolicy(
-        max_tokens=config.memory_context_tokens,
-    )
-    subagent_runtime = SubAgentRuntime(
-        workspace=workspace,
-        llm_client_factory=lambda: OpenAICompatibleLLMClient(
+    with startup_profile.span("runner.workspace"):
+        workspace = Workspace(workspace_root)
+        project = ProjectIdentity.from_workspace(workspace.root)
+    with startup_profile.span("runner.memory_store"):
+        effective_memory_store = (
+            MemoryStore(project) if memory_store is None else memory_store
+        )
+    with startup_profile.span("runner.instructions"):
+        instruction_bundle = load_instruction_bundle(workspace.root)
+    with startup_profile.span("runner.skills"):
+        skill_registry = SkillRegistry.discover(workspace.root)
+        active_skill_state = ActiveSkillState()
+    with startup_profile.span("runner.config"):
+        config = (
+            load_llm_config(workspace_root=workspace.root)
+            if llm_config is None
+            else llm_config
+        )
+    with startup_profile.span("runner.llm_client"):
+        effective_llm_session_id = llm_session_id or uuid4().hex
+        client = OpenAICompatibleLLMClient(
             config=config,
-            model=config.subagent_model,
             session_id=effective_llm_session_id,
-        ),
-        confirmer=confirmer,
-        memory_store=effective_memory_store,
-        memory_recall_policy=memory_recall_policy,
-        context_budget=context_budget,
-        observability_sink=observability_sink,
-    )
-    history_messages = (
-        [] if conversation_history is None else conversation_history.get_messages()
-    )
-    if any(message.role == "system" for message in history_messages):
-        raise ValueError("conversation_history must not contain system messages.")
-    conversation = Conversation.from_messages(
-        [
-            Message(
-                role="system",
-                content=build_agent_system_prompt(
-                    instruction_bundle.to_prompt_text(),
-                    memory_enabled=True,
-                    delegation_enabled=True,
-                    skill_catalog=skill_registry.get_catalog(),
-                ),
+        )
+        summary_client = OpenAICompatibleLLMClient(
+            config=config,
+            model=config.compact_model,
+            thinking_enabled=False,
+            session_id=effective_llm_session_id,
+        )
+    with startup_profile.span("runner.budget"):
+        context_budget = context_budget_from_config(config)
+        memory_recall_policy = MemoryRecallPolicy(
+            max_tokens=config.memory_context_tokens,
+        )
+    with startup_profile.span("runner.subagent_runtime"):
+        subagent_runtime = SubAgentRuntime(
+            workspace=workspace,
+            llm_client_factory=lambda: OpenAICompatibleLLMClient(
+                config=config,
+                model=config.subagent_model,
+                session_id=effective_llm_session_id,
             ),
-            *history_messages,
-        ],
-        on_message_added=on_message_added,
-    )
-    artifact_store = (
-        None
-        if artifact_directory is None
-        else ToolResultArtifactStore(
-            root=artifact_directory,
-            threshold_chars=context_budget.tool_result_compression_threshold_chars,
-        )
-    )
-    extra_tools = []
-    if artifact_store is not None:
-        extra_tools.append(ReadArtifactTool(artifact_store.root))
-    extra_tools.append(
-        DelegateTaskTool(
-            subagent_runtime,
-            observer=subagent_observer,
-        )
-    )
-    if skill_registry.list_skills():
-        extra_tools.extend(
-            [
-                LoadSkillTool(skill_registry, active_skill_state),
-                ReadSkillResourceTool(skill_registry, active_skill_state),
-                RunSkillScriptTool(workspace, skill_registry, active_skill_state),
-            ]
-        )
-    tool_registry = create_default_tool_registry(
-        workspace,
-        confirmer=confirmer,
-        memory_store=effective_memory_store,
-        extra_tools=extra_tools,
-    )
-
-    return AgentRunner(
-        llm_client=client,
-        tool_registry=tool_registry,
-        conversation=conversation,
-        context_budget=context_budget,
-        instruction_sources=tuple(
-            source.label for source in instruction_bundle.sources
-        ),
-        instruction_warnings=tuple(
-            issue.display for issue in instruction_bundle.issues
-        ),
-        skill_warnings=tuple(warning.display for warning in skill_registry.warnings),
-        active_skill_state=active_skill_state,
-        memory_context_selector=MemoryContextSelector(
-            effective_memory_store,
-            policy=memory_recall_policy,
-        ),
-        tool_batch_handler=DelegationToolBatchHandler(),
-        compactor=ConversationCompactor(
-            llm_client=summary_client,
-            state=CompactState() if compact_state is None else compact_state,
-            on_state_changed=on_compact_state_changed,
+            confirmer=confirmer,
+            memory_store=effective_memory_store,
+            memory_recall_policy=memory_recall_policy,
+            context_budget=context_budget,
             observability_sink=observability_sink,
-            observability_scope="compact",
-        ),
-        tool_result_artifact_store=artifact_store,
-        observability_sink=observability_sink,
-        observability_scope="main",
-    )
+        )
+    with startup_profile.span("runner.conversation"):
+        history_messages = (
+            []
+            if conversation_history is None
+            else conversation_history.get_messages()
+        )
+        if any(message.role == "system" for message in history_messages):
+            raise ValueError("conversation_history must not contain system messages.")
+        conversation = Conversation.from_messages(
+            [
+                Message(
+                    role="system",
+                    content=build_agent_system_prompt(
+                        instruction_bundle.to_prompt_text(),
+                        memory_enabled=True,
+                        delegation_enabled=True,
+                        skill_catalog=skill_registry.get_catalog(),
+                    ),
+                ),
+                *history_messages,
+            ],
+            on_message_added=on_message_added,
+        )
+    with startup_profile.span("runner.artifacts"):
+        artifact_store = (
+            None
+            if artifact_directory is None
+            else ToolResultArtifactStore(
+                root=artifact_directory,
+                threshold_chars=context_budget.tool_result_compression_threshold_chars,
+            )
+        )
+    with startup_profile.span("runner.tools"):
+        extra_tools = []
+        if artifact_store is not None:
+            extra_tools.append(ReadArtifactTool(artifact_store.root))
+        extra_tools.append(
+            DelegateTaskTool(
+                subagent_runtime,
+                observer=subagent_observer,
+            )
+        )
+        if skill_registry.list_skills():
+            extra_tools.extend(
+                [
+                    LoadSkillTool(skill_registry, active_skill_state),
+                    ReadSkillResourceTool(skill_registry, active_skill_state),
+                    RunSkillScriptTool(workspace, skill_registry, active_skill_state),
+                ]
+            )
+        tool_registry = create_default_tool_registry(
+            workspace,
+            confirmer=confirmer,
+            memory_store=effective_memory_store,
+            extra_tools=extra_tools,
+        )
+
+    with startup_profile.span("runner.finalize"):
+        return AgentRunner(
+            llm_client=client,
+            tool_registry=tool_registry,
+            conversation=conversation,
+            context_budget=context_budget,
+            instruction_sources=tuple(
+                source.label for source in instruction_bundle.sources
+            ),
+            instruction_warnings=tuple(
+                issue.display for issue in instruction_bundle.issues
+            ),
+            skill_warnings=tuple(warning.display for warning in skill_registry.warnings),
+            active_skill_state=active_skill_state,
+            memory_context_selector=MemoryContextSelector(
+                effective_memory_store,
+                policy=memory_recall_policy,
+            ),
+            tool_batch_handler=DelegationToolBatchHandler(),
+            compactor=ConversationCompactor(
+                llm_client=summary_client,
+                state=CompactState() if compact_state is None else compact_state,
+                on_state_changed=on_compact_state_changed,
+                observability_sink=observability_sink,
+                observability_scope="compact",
+            ),
+            tool_result_artifact_store=artifact_store,
+            observability_sink=observability_sink,
+            observability_scope="main",
+        )
 
 
 def run_agent_turn(

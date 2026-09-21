@@ -4,6 +4,7 @@ import pytest
 
 from mycode.agent.events import AgentToolCall
 from mycode.messages import Message
+from mycode.model_projection import project_model_message
 
 
 def test_message_stores_role_and_content() -> None:
@@ -22,16 +23,17 @@ def test_message_is_immutable() -> None:
         message.content = "changed"
 
 
-def test_message_can_convert_to_model_dict() -> None:
+def test_message_has_no_provider_serialization_method() -> None:
     message = Message(role="system", content="You are a coding agent.")
 
-    assert message.to_model_dict() == {
+    assert not hasattr(message, "to_model_dict")
+    assert project_model_message(message) == {
         "role": "system",
         "content": "You are a coding agent.",
     }
 
 
-def test_assistant_tool_call_message_can_convert_to_model_dict() -> None:
+def test_assistant_tool_call_has_canonical_projection() -> None:
     message = Message(
         role="assistant",
         content="",
@@ -44,17 +46,14 @@ def test_assistant_tool_call_message_can_convert_to_model_dict() -> None:
         ),
     )
 
-    assert message.to_model_dict() == {
+    assert project_model_message(message) == {
         "role": "assistant",
         "content": "",
         "tool_calls": [
             {
                 "id": "call_123",
-                "type": "function",
-                "function": {
-                    "name": "read_file",
-                    "arguments": '{"path": "README.md"}',
-                },
+                "name": "read_file",
+                "arguments": {"path": "README.md"},
             }
         ],
     }
@@ -73,19 +72,19 @@ def test_assistant_tool_call_message_preserves_non_ascii_arguments() -> None:
         ),
     )
 
-    tool_call = message.to_model_dict()["tool_calls"][0]
+    tool_call = project_model_message(message)["tool_calls"][0]
 
-    assert tool_call["function"]["arguments"] == '{"path": "文档/说明.md"}'
+    assert tool_call["arguments"] == {"path": "文档/说明.md"}
 
 
-def test_tool_result_message_can_convert_to_model_dict() -> None:
+def test_tool_result_message_has_canonical_projection() -> None:
     message = Message(
         role="tool",
         content="1 | hello",
         tool_call_id="call_123",
     )
 
-    assert message.to_model_dict() == {
+    assert project_model_message(message) == {
         "role": "tool",
         "content": "1 | hello",
         "tool_call_id": "call_123",

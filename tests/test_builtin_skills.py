@@ -2,7 +2,9 @@ from importlib.resources import files
 from pathlib import Path
 
 from mycode.skills import ActiveSkillState, SkillRegistry
-from mycode.tools import LoadSkillTool, ReadSkillResourceTool, ToolRegistry
+from mycode.tools.load_skill import LoadSkillTool
+from mycode.tools.read_skill_resource import ReadSkillResourceTool
+from mycode.tools.registry import ToolRegistry
 
 
 DATABASE_RECOVERY_DESCRIPTION = (

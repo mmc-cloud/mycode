@@ -57,6 +57,34 @@ def test_unknown_slash_command_returns_none() -> None:
     assert parse_slash_command("/unknown") is None
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/context\n正文",
+        "/help\n正文",
+        "正文\n/help",
+        "/resume abc\nmore",
+        "/nope\n正文",
+    ],
+)
+def test_multiline_text_is_never_a_command(text: str) -> None:
+    """Slash commands are single-line control input."""
+    assert parse_slash_command(text) is None
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("/help\n", ParsedCommand("help")),
+        ("\n/help", ParsedCommand("help")),
+        ("/help\r\n", ParsedCommand("help")),
+        ("  /QuIt\n", ParsedCommand("exit")),
+    ],
+)
+def test_surrounding_newlines_are_stripped(text: str, expected: ParsedCommand) -> None:
+    assert parse_slash_command(text) == expected
+
+
 @pytest.mark.parametrize("text", ["/resume", "/resume a b", "/exit abc"])
 def test_known_command_argument_errors_raise_usage_error(text: str) -> None:
     with pytest.raises(CommandParseError) as exc_info:

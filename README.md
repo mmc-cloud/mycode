@@ -63,7 +63,6 @@ mycode agent
 | 命令                       | 说明                                                                     |
 | -------------------------- | ------------------------------------------------------------------------ |
 | `mycode agent`           | 在当前目录启动 coding agent                                              |
-| `mycode chat`            | 启动不带 coding tools 的普通模型对话                                     |
 | `mycode tui`             | 启动 Textual 终端界面                                                    |
 | `mycode runtime --jsonl` | 启动机器可消费的 JSONL runtime；stdout 只输出 JSONL，诊断信息写到 stderr |
 | `mycode --help`          | 查看命令列表；`mycode <子命令> --help` 查看子命令帮助                  |
@@ -120,8 +119,6 @@ if (-not (Test-Path $mycodeConfigFile)) {
 - `LLM_THINKING_ENABLED`、`LLM_REASONING_EFFORT`、`LLM_MAX_OUTPUT_TOKENS`：可选的推理配置，模型服务不支持时保持留空。
 
 完整字段和注释见 [`.env.example`](.env.example)。
-
-`mycode chat` 没有 workspace 语义，只使用进程环境、用户级配置和默认值。
 
 项目级 secret 放在 `<workspace>\.mycode\.env`，该文件已被 `.env` 的 Git ignore 规则排除；不要提交真实 API Key 或 token。
 

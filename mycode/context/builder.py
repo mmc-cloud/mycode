@@ -1,4 +1,4 @@
-"""One-way model context construction shared by Agent and Chat."""
+"""One-way model context construction for the Agent runtime."""
 
 from dataclasses import dataclass, replace
 from typing import Literal
@@ -8,12 +8,12 @@ from mycode.context.budget import (
     MemoryContextStats,
     ModelContext,
     TokenEstimator,
-    TokenUsage,
     budget_model_context,
 )
 from mycode.context.compact import ConversationCompactor
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_events import TokenUsage
 from mycode.context.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
 
 

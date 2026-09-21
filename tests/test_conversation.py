@@ -3,6 +3,7 @@ import pytest
 from mycode.agent.events import AgentModelResponse, AgentToolCall
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_projection import project_model_messages
 
 
 def test_new_conversation_starts_empty() -> None:
@@ -81,12 +82,13 @@ def test_get_messages_returns_copy() -> None:
     assert conversation.get_messages() == [Message(role="user", content="hello")]
 
 
-def test_conversation_can_convert_to_model_messages() -> None:
+def test_conversation_exposes_canonical_messages_without_wire_serialization() -> None:
     conversation = Conversation()
     conversation.add_system_message("system rules")
     conversation.add_user_message("hello")
 
-    assert conversation.to_model_messages() == [
+    assert not hasattr(conversation, "to_model_messages")
+    assert project_model_messages(conversation.get_messages()) == [
         {"role": "system", "content": "system rules"},
         {"role": "user", "content": "hello"},
     ]
@@ -128,7 +130,7 @@ def test_conversation_can_append_tool_result_message() -> None:
     ]
 
 
-def test_conversation_can_convert_tool_call_messages_to_model_messages() -> None:
+def test_conversation_can_project_tool_call_messages() -> None:
     tool_call = AgentToolCall(
         id="call_123",
         name="read_file",
@@ -146,7 +148,7 @@ def test_conversation_can_convert_tool_call_messages_to_model_messages() -> None
         content="1 | hello",
     )
 
-    assert conversation.to_model_messages() == [
+    assert project_model_messages(conversation.get_messages()) == [
         {"role": "user", "content": "Read README"},
         {
             "role": "assistant",
@@ -155,11 +157,8 @@ def test_conversation_can_convert_tool_call_messages_to_model_messages() -> None
             "tool_calls": [
                 {
                     "id": "call_123",
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": '{"path": "README.md"}',
-                    },
+                    "name": "read_file",
+                    "arguments": {"path": "README.md"},
                 }
             ],
         },
@@ -207,7 +206,7 @@ def test_present_empty_reasoning_is_replayed_as_null() -> None:
     )
 
     assert message.reasoning_content is None
-    assert message.to_model_dict()["reasoning_content"] is None
+    assert project_model_messages([message])[0]["reasoning_content"] is None
 
     with pytest.raises(ValueError, match="assistant tool-call"):
         AgentModelResponse(

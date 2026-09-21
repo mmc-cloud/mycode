@@ -26,16 +26,17 @@ from mycode.context.compact import ConversationCompactor
 from mycode.context.tool_result_retention import ToolResultRetentionPolicy, TurnLocalFullGroup
 from mycode.context.builder import ContextBuilder
 from mycode.error_handling import classify_model_error, format_model_error
+from mycode.model_errors import model_error_type
+from mycode.model_events import ModelStreamEvent, TokenUsage
 from mycode.context.budget import (
     ContextBudget,
     ModelContext,
     TokenEstimator,
-    TokenUsage,
     format_model_context_stats,
     model_context_needs_notice,
 )
 from mycode.conversation import Conversation
-from mycode.llm import LLMClient
+from mycode.llm_contracts import LLMClient
 from mycode.memory_context import MemoryRecall, MemoryRecallProvider
 from mycode.messages import Message
 from mycode.observability import ObservationSink, emit_observation
@@ -55,7 +56,9 @@ from mycode.agent.progress import (
     normalize_run_checkpoint,
     resume_guidance,
 )
-from mycode.tools import ToolArgumentValidationError, ToolRegistry, ToolResult, Workspace
+from mycode.tools.base import ToolArgumentValidationError, ToolResult
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 
 
 DEFAULT_REPEATED_TOOL_CALL_LIMIT = 3
@@ -494,7 +497,7 @@ class AgentRunner:
 
                                 if event.type == "text_delta":
                                     content_parts.append(event.content)
-                                    yield event
+                                    yield _agent_event_from_model(event)
                                     continue
 
                                 if (
@@ -503,8 +506,8 @@ class AgentRunner:
                                 ):
                                     tool_calls.append(event.tool_call)
                                     observable_tool_call_events.append(
-                                        replace(
-                                            event,
+                                        AgentEvent(
+                                            type="tool_call",
                                             tool_call=_observable_tool_call(
                                                 self.tool_registry,
                                                 event.tool_call,
@@ -521,7 +524,7 @@ class AgentRunner:
                                         content="".join(content_parts),
                                         tool_calls=tool_calls,
                                     )
-                                    yield event
+                                    yield _agent_event_from_model(event)
                                     yield AgentEvent(
                                         type="stop",
                                         stop_reason="model_error",
@@ -533,7 +536,7 @@ class AgentRunner:
                                 call_kind="agent_tools",
                                 content="".join(content_parts),
                                 tool_calls=tool_calls,
-                                fallback_error_type=type(error).__name__,
+                                fallback_error_type=model_error_type(error),
                             )
                             classified = classify_model_error(error)
                             if (
@@ -571,7 +574,7 @@ class AgentRunner:
                                     call_kind="agent_tools",
                                     outcome="exhausted",
                                     retries=DEFAULT_MODEL_MAX_RETRIES,
-                                    final_error_type=type(error).__name__,
+                                    final_error_type=model_error_type(error),
                                 )
                             yield AgentEvent(
                                 type="error",
@@ -745,7 +748,7 @@ class AgentRunner:
                     call_kind="max_turns_finalization",
                     content="".join(content_parts),
                     tool_calls=(),
-                    fallback_error_type=type(error).__name__,
+                    fallback_error_type=model_error_type(error),
                 )
                 classified = classify_model_error(error)
                 if (
@@ -778,7 +781,7 @@ class AgentRunner:
                         call_kind="max_turns_finalization",
                         outcome="exhausted",
                         retries=DEFAULT_MODEL_MAX_RETRIES,
-                        final_error_type=type(error).__name__,
+                        final_error_type=model_error_type(error),
                     )
                 yield AgentEvent(
                     type="error",
@@ -1067,7 +1070,7 @@ class AgentRunner:
             attempt=attempt,
             max_retries=DEFAULT_MODEL_MAX_RETRIES,
             delay_seconds=delay_seconds,
-            error_type=type(error).__name__,
+            error_type=model_error_type(error),
             error_code=error_code,
             retryable=True,
             call_kind=call_kind,
@@ -1299,6 +1302,18 @@ def _context_event(
                 else None
             ),
         ),
+    )
+
+
+def _agent_event_from_model(event: ModelStreamEvent) -> AgentEvent:
+    """Convert a provider-neutral stream value at the Agent boundary."""
+    return AgentEvent(
+        type=event.type,
+        content=event.content,
+        tool_call=event.tool_call,
+        error=event.error,
+        reasoning_content=event.reasoning_content,
+        reasoning_state=event.reasoning_state,
     )
 
 

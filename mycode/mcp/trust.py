@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from mycode import startup_profile
 from mycode.config import MYCODE_CONFIG_DIR_NAME
 from mycode.mcp.config import (
     MCPConfig,
@@ -150,50 +151,51 @@ def resolve_project_mcp_trust(
     confirmer: MCPTrustConfirmer,
     trust_file: str | Path | None = None,
 ) -> MCPTrustResolution:
-    fingerprint = project_mcp_fingerprint(loaded)
-    if fingerprint is None:
-        return MCPTrustResolution(config=loaded.merged)
+    with startup_profile.span("mcp.trust"):
+        fingerprint = project_mcp_fingerprint(loaded)
+        if fingerprint is None:
+            return MCPTrustResolution(config=loaded.merged)
 
-    path = default_mcp_trust_file() if trust_file is None else Path(trust_file)
-    store, invalid = _read_trust_store(path)
-    warnings: list[MCPTrustWarning] = []
-    if invalid:
-        warning = MCPTrustWarning(
-            code="invalid_trust_store",
-            message=(
-                "MCP trust store is invalid; project MCP will be treated as untrusted."
-            ),
-        )
-        warnings.append(warning)
-        _report_warning(confirmer, warning)
-    if store.projects.get(project.key) == fingerprint:
-        return MCPTrustResolution(config=loaded.merged, warnings=tuple(warnings))
+        path = default_mcp_trust_file() if trust_file is None else Path(trust_file)
+        store, invalid = _read_trust_store(path)
+        warnings: list[MCPTrustWarning] = []
+        if invalid:
+            warning = MCPTrustWarning(
+                code="invalid_trust_store",
+                message=(
+                    "MCP trust store is invalid; project MCP will be treated as untrusted."
+                ),
+            )
+            warnings.append(warning)
+            _report_warning(confirmer, warning)
+        if store.projects.get(project.key) == fingerprint:
+            return MCPTrustResolution(config=loaded.merged, warnings=tuple(warnings))
 
-    approved = confirmer.confirm(_build_trust_request(loaded))
-    if not approved:
+        approved = confirmer.confirm(_build_trust_request(loaded))
+        if not approved:
+            return MCPTrustResolution(
+                config=merge_mcp_configs(loaded.user, MCPConfig()),
+                approved=False,
+                warnings=tuple(warnings),
+            )
+
+        store.projects[project.key] = fingerprint
+        try:
+            _write_trust_store(path, store)
+        except OSError:
+            warning = MCPTrustWarning(
+                code="persistence_failed",
+                message=(
+                    "MCP trust store could not be saved; this run remains enabled."
+                ),
+            )
+            warnings.append(warning)
+            _report_warning(confirmer, warning)
         return MCPTrustResolution(
-            config=merge_mcp_configs(loaded.user, MCPConfig()),
-            approved=False,
+            config=loaded.merged,
+            approved=True,
             warnings=tuple(warnings),
         )
-
-    store.projects[project.key] = fingerprint
-    try:
-        _write_trust_store(path, store)
-    except OSError:
-        warning = MCPTrustWarning(
-            code="persistence_failed",
-            message=(
-                "MCP trust store could not be saved; this run remains enabled."
-            ),
-        )
-        warnings.append(warning)
-        _report_warning(confirmer, warning)
-    return MCPTrustResolution(
-        config=loaded.merged,
-        approved=True,
-        warnings=tuple(warnings),
-    )
 
 
 def apply_project_mcp_trust(

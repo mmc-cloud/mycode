@@ -3,15 +3,28 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import BadRequestError
+from openai import APIStatusError, BadRequestError
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessage
 
-from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
 from mycode.config import LLMConfig
-from mycode.context.budget import TokenUsage
 from mycode.conversation import Conversation
-from mycode.llm import FakeLLMClient, OpenAICompatibleLLMClient
+from mycode.llm_contracts import FakeLLMClient
+from mycode.model_events import ModelResponse, ModelStreamEvent, ModelToolCall, TokenUsage
+from mycode.providers.openai_compatible import OpenAICompatibleLLMClient
+from mycode.model_errors import ModelProviderError
 from mycode.messages import Message
+
+
+def test_legacy_llm_facade_keeps_established_exports() -> None:
+    from mycode.llm import (
+        FakeLLMClient as FacadeFakeLLMClient,
+        LLMClient as FacadeLLMClient,
+        OpenAICompatibleLLMClient as FacadeOpenAICompatibleLLMClient,
+    )
+
+    assert FacadeFakeLLMClient is FakeLLMClient
+    assert FacadeOpenAICompatibleLLMClient is OpenAICompatibleLLMClient
+    assert FacadeLLMClient is not None
 
 
 def test_openai_compatible_client_configures_sdk_retries_and_timeouts(
@@ -23,7 +36,7 @@ def test_openai_compatible_client_configures_sdk_retries_and_timeouts(
         captured.update(kwargs)
         return SimpleNamespace()
 
-    monkeypatch.setattr("mycode.llm.OpenAI", fake_openai)
+    monkeypatch.setattr("mycode.providers.openai_compatible.OpenAI", fake_openai)
 
     OpenAICompatibleLLMClient(
         config=LLMConfig(
@@ -64,7 +77,7 @@ def test_fake_llm_client_raises_when_no_responses_left() -> None:
 
 
 def test_fake_llm_client_streams_tool_response_events() -> None:
-    tool_call = AgentToolCall(
+    tool_call = ModelToolCall(
         id="call_123",
         name="grep",
         arguments={"query": "main"},
@@ -73,18 +86,17 @@ def test_fake_llm_client_streams_tool_response_events() -> None:
         responses=[],
         stream_chunk_size=3,
         tool_responses=[
-            AgentModelResponse(
+            ModelResponse(
                 content="hello",
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
             )
         ],
     )
 
     assert list(client.stream_with_tools(Conversation(), [])) == [
-        AgentEvent(type="text_delta", content="hel"),
-        AgentEvent(type="text_delta", content="lo"),
-        AgentEvent(type="tool_call", tool_call=tool_call),
+        ModelStreamEvent(type="text_delta", content="hel"),
+        ModelStreamEvent(type="text_delta", content="lo"),
+        ModelStreamEvent(type="tool_call", tool_call=tool_call),
     ]
 
 
@@ -216,8 +228,10 @@ def test_model_observation_keeps_only_safe_provider_diagnostic() -> None:
         _client=fake_sdk_client,
     )
 
-    with pytest.raises(BadRequestError):
+    with pytest.raises(ModelProviderError) as captured:
         client.complete(Conversation())
+
+    assert captured.value.provider_error_type == "BadRequestError"
 
     observation = client.last_model_response
     assert observation is not None
@@ -329,6 +343,72 @@ def test_openai_compatible_client_streams_response_chunks() -> None:
     }
 
 
+def test_openai_compatible_client_formats_canonical_message_history() -> None:
+    fake_sdk_client = FakeOpenAIClient(response_content="done")
+    client = OpenAICompatibleLLMClient(
+        config=LLMConfig(
+            api_key="test-key",
+            base_url="https://example.com",
+            model="test-model",
+        ),
+        _client=fake_sdk_client,
+    )
+    conversation = Conversation.from_messages(
+        [
+            Message(role="system", content="rules"),
+            Message(role="user", content="read"),
+            Message(role="assistant", content="working"),
+            Message(
+                role="assistant",
+                content="",
+                tool_calls=(ModelToolCall(
+                    id="call_1", name="read_file",
+                    arguments={"path": "文档/说明.md"},
+                ),),
+                reasoning_content="private reasoning",
+            ),
+            Message(role="tool", content="file body", tool_call_id="call_1"),
+            Message(
+                role="assistant", content="",
+                tool_calls=(ModelToolCall(
+                    id="call_2", name="read_file", arguments={"path": "README.md"},
+                ),),
+                reasoning_state="present_empty",
+            ),
+        ]
+    )
+
+    client.complete(conversation)
+
+    assert fake_sdk_client.chat.completions.last_request["messages"] == [
+        {"role": "system", "content": "rules"},
+        {"role": "user", "content": "read"},
+        {"role": "assistant", "content": "working"},
+        {
+            "role": "assistant", "content": "",
+            "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": '{"path": "文档/说明.md"}',
+                },
+            }],
+            "reasoning_content": "private reasoning",
+        },
+        {"role": "tool", "content": "file body", "tool_call_id": "call_1"},
+        {
+            "role": "assistant", "content": "",
+            "tool_calls": [{
+                "id": "call_2", "type": "function",
+                "function": {
+                    "name": "read_file", "arguments": '{"path": "README.md"}',
+                },
+            }],
+            "reasoning_content": None,
+        },
+    ]
+
+
 def test_openai_compatible_client_captures_non_stream_token_usage() -> None:
     fake_sdk_client = FakeOpenAIClient(
         response_content="hello",
@@ -434,8 +514,8 @@ def test_openai_compatible_client_streams_with_tools_text_deltas() -> None:
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
     assert events == [
-        AgentEvent(type="text_delta", content="he"),
-        AgentEvent(type="text_delta", content="llo"),
+        ModelStreamEvent(type="text_delta", content="he"),
+        ModelStreamEvent(type="text_delta", content="llo"),
     ]
     assert fake_sdk_client.chat.completions.last_request["stream"] is True
     assert fake_sdk_client.chat.completions.last_request["tools"] == [
@@ -489,7 +569,7 @@ def test_openai_compatible_client_streams_with_tools_ignores_empty_choice_chunks
 
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
-    assert events == [AgentEvent(type="text_delta", content="hello")]
+    assert events == [ModelStreamEvent(type="text_delta", content="hello")]
 
 
 def test_openai_compatible_client_streams_with_tools_accumulates_tool_calls() -> None:
@@ -526,9 +606,9 @@ def test_openai_compatible_client_streams_with_tools_accumulates_tool_calls() ->
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
     assert events == [
-        AgentEvent(
+        ModelStreamEvent(
             type="tool_call",
-            tool_call=AgentToolCall(
+            tool_call=ModelToolCall(
                 id="call_123",
                 name="read_file",
                 arguments={"path": "README.md"},
@@ -569,8 +649,8 @@ def test_openai_compatible_client_streams_reasoning_separately_from_tool_call() 
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
     assert events[:2] == [
-        AgentEvent(type="reasoning_delta", reasoning_content="private "),
-        AgentEvent(type="reasoning_delta", reasoning_content="reasoning"),
+        ModelStreamEvent(type="reasoning_delta", reasoning_content="private "),
+        ModelStreamEvent(type="reasoning_delta", reasoning_content="reasoning"),
     ]
     assert events[-1].type == "tool_call"
     assert client.last_reasoning_char_count == len("private reasoning")
@@ -607,7 +687,7 @@ def test_thinking_stream_accepts_null_and_empty_reasoning_chunks() -> None:
 
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
-    assert events[0] == AgentEvent(
+    assert events[0] == ModelStreamEvent(
         type="reasoning_state",
         reasoning_state="present_empty",
     )
@@ -661,7 +741,7 @@ def test_openai_sdk_stream_preserves_present_null_reasoning_field() -> None:
 
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
-    assert events[0] == AgentEvent(
+    assert events[0] == ModelStreamEvent(
         type="reasoning_state",
         reasoning_state="present_empty",
     )
@@ -697,7 +777,7 @@ def test_thinking_stream_without_reasoning_field_becomes_model_error() -> None:
     events = list(client.stream_with_tools(Conversation(), [fake_tool_schema()]))
 
     assert events == [
-        AgentEvent(
+        ModelStreamEvent(
             type="error",
             error=(
                 "Thinking tool-call response omitted the reasoning_content field."

@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from mycode.tools import Workspace, WorkspacePathError
+from mycode.tools.workspace import Workspace, WorkspacePathError
 
 
 def test_workspace_root_is_resolved_to_absolute_path(tmp_path: Path) -> None:

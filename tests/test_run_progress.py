@@ -15,7 +15,7 @@ from mycode.agent.progress import (
     observe_tool_result,
     resume_guidance,
 )
-from mycode.tools import Workspace
+from mycode.tools.workspace import Workspace
 
 
 def observation(

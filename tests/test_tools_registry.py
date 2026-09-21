@@ -9,15 +9,8 @@ from mycode.permissions import (
     PermissionRequest,
     ToolPermissionProfile,
 )
-from mycode.tools import (
-    BaseTool,
-    DuplicateToolError,
-    PydanticTool,
-    ToolArgs,
-    ToolNotFoundError,
-    ToolRegistry,
-    ToolResult,
-)
+from mycode.tools.base import BaseTool, PydanticTool, ToolArgs, ToolResult
+from mycode.tools.registry import DuplicateToolError, ToolNotFoundError, ToolRegistry
 
 
 def test_register_and_get_tool_by_name() -> None:

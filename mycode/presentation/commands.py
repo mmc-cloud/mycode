@@ -13,6 +13,13 @@ class CommandSpec:
     aliases: tuple[str, ...]
     usage: str
     description: str
+    requires_arguments: bool = False
+    """Whether the command needs the user to supply an argument.
+
+    This is the single source of truth for "can this command run as typed?".
+    The parser uses it to validate argument counts, and the TUI picker uses it
+    to decide whether choosing the command runs it or only fills it in.
+    """
 
 
 @dataclass(frozen=True)
@@ -41,7 +48,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         "/sessions",
         "List sessions in the current project.",
     ),
-    CommandSpec("resume", (), "/resume <session_id>", "Resume a session."),
+    CommandSpec(
+        "resume",
+        (),
+        "/resume <session_id>",
+        "Resume a session.",
+        requires_arguments=True,
+    ),
     CommandSpec("context", (), "/context", "Show current context information."),
     CommandSpec("compact", (), "/compact", "Compact the current conversation."),
     CommandSpec(
@@ -62,12 +75,18 @@ for _spec in COMMAND_SPECS:
 def parse_slash_command(text: str) -> ParsedCommand | None:
     """Parse a registered slash command, or return ``None`` for normal input.
 
-    Command names and aliases are case-insensitive. Arguments are split on
-    whitespace only; command-specific validation is intentionally limited to
-    the current contract.
+    Slash commands are single-line control input. Outer whitespace is ignored,
+    so ``/help\\n`` is still a command, but a line break inside the text makes the
+    whole input ordinary prompt text: ``/context\\n正文`` is a prompt, not a
+    command with a bad argument. Command names and aliases are case-insensitive,
+    and arguments are split on whitespace only.
     """
 
-    parts = text.strip().split()
+    candidate = text.strip()
+    if "\n" in candidate or "\r" in candidate:
+        return None
+
+    parts = candidate.split()
     if not parts or not parts[0].startswith("/"):
         return None
 
@@ -77,7 +96,7 @@ def parse_slash_command(text: str) -> ParsedCommand | None:
         return None
 
     args = tuple(parts[1:])
-    if spec.name == "resume":
+    if spec.requires_arguments:
         if len(args) != 1:
             raise CommandParseError(spec.name, spec.usage)
     elif args:

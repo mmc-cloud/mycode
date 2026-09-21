@@ -11,7 +11,8 @@ from mycode.mcp.tool_adapter import (
     build_registry_name,
 )
 from mycode.permissions import DefaultPermissionChecker, PermissionDecision
-from mycode.tools import SyncTool, ToolArgumentValidationError, ToolRegistry
+from mycode.tools.base import SyncTool, ToolArgumentValidationError
+from mycode.tools.registry import ToolRegistry
 
 
 async def fake_call(alias, name, arguments):

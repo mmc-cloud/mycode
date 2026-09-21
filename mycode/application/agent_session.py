@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Literal
 
+from mycode import startup_profile
 from mycode.agent.events import AgentEvent
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.agent.runner import AgentRunner
@@ -17,7 +18,8 @@ from mycode.application.sessions import (
     start_project_session,
 )
 from mycode.config import LLMConfig
-from mycode.mcp import MCPConfig, MCPManager
+from mycode.mcp.config import MCPConfig
+from mycode.mcp.manager import MCPManager
 from mycode.observability import ObservationSink
 from mycode.permissions import Confirmer
 from mycode.persistence.session_store import SessionStore
@@ -318,50 +320,57 @@ def start_agent_application_session(
     llm_config: LLMConfig | None = None,
     observability_sink: ObservationSink | None = None,
 ) -> AgentApplicationSession:
-    active_session = start_project_session(store, project, request=request)
-    mcp_manager: MCPManager | None = None
-    try:
-        conversation_history = active_session.load_history()
-        compact_state = active_session.load_compact_state()
-        mcp_manager = MCPManager(
-            MCPConfig() if mcp_config is None else mcp_config,
-            observability_sink=observability_sink,
-        )
-        mcp_manager.start()
-        session_observer = SessionSubAgentObserver(session=active_session.writer)
-        subagent_observer: SubAgentObserver = session_observer
-        if external_observer is not None:
-            subagent_observer = CompositeSubAgentObserver(
-                observers=(session_observer, external_observer),
+    with startup_profile.span("session.startup"):
+        with startup_profile.span("session.open"):
+            active_session = start_project_session(store, project, request=request)
+        mcp_manager: MCPManager | None = None
+        try:
+            with startup_profile.span("session.history"):
+                conversation_history = active_session.load_history()
+            with startup_profile.span("session.compact_state"):
+                compact_state = active_session.load_compact_state()
+            mcp_manager = MCPManager(
+                MCPConfig() if mcp_config is None else mcp_config,
+                observability_sink=observability_sink,
             )
-        runner = build_agent_runner(
-            workspace_path=project.workspace_root,
-            confirmer=confirmer,
-            conversation_history=conversation_history,
-            on_message_added=active_session.persist_message,
-            compact_state=compact_state,
-            on_compact_state_changed=active_session.persist_compact_state,
-            artifact_directory=active_session.artifact_directory,
-            subagent_observer=subagent_observer,
-            llm_config=llm_config,
-            llm_session_id=active_session.record.id,
-            observability_sink=observability_sink,
-        )
-        for tool in mcp_manager.tools:
-            runner.tool_registry.register(tool)
-        return AgentApplicationSession(
-            runner=runner,
-            active_project_session=active_session,
-            mcp_manager=mcp_manager,
-        )
-    except BaseException:
-        if mcp_manager is not None:
+            with startup_profile.span("mcp.start"):
+                mcp_manager.start()
+            session_observer = SessionSubAgentObserver(session=active_session.writer)
+            subagent_observer: SubAgentObserver = session_observer
+            if external_observer is not None:
+                subagent_observer = CompositeSubAgentObserver(
+                    observers=(session_observer, external_observer),
+                )
+            with startup_profile.span("runner.build"):
+                runner = build_agent_runner(
+                    workspace_path=project.workspace_root,
+                    confirmer=confirmer,
+                    conversation_history=conversation_history,
+                    on_message_added=active_session.persist_message,
+                    compact_state=compact_state,
+                    on_compact_state_changed=active_session.persist_compact_state,
+                    artifact_directory=active_session.artifact_directory,
+                    subagent_observer=subagent_observer,
+                    llm_config=llm_config,
+                    llm_session_id=active_session.record.id,
+                    observability_sink=observability_sink,
+                )
+            with startup_profile.span("mcp.tools"):
+                for tool in mcp_manager.tools:
+                    runner.tool_registry.register(tool)
+            return AgentApplicationSession(
+                runner=runner,
+                active_project_session=active_session,
+                mcp_manager=mcp_manager,
+            )
+        except BaseException:
+            if mcp_manager is not None:
+                try:
+                    mcp_manager.close()
+                except BaseException:
+                    pass
             try:
-                mcp_manager.close()
+                active_session.interrupt()
             except BaseException:
                 pass
-        try:
-            active_session.interrupt()
-        except BaseException:
-            pass
-        raise
+            raise

@@ -6,9 +6,11 @@ import time
 
 import pytest
 
-from mycode.agent.events import AgentEvent, AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentEvent, AgentToolCall
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_events import ModelResponse, ModelStreamEvent
+from mycode.model_projection import project_model_messages
 from mycode.agent.runner import (
     AgentRunner,
     DEFAULT_MAX_CONCURRENT_SAFE_TOOLS,
@@ -27,7 +29,8 @@ from mycode.subagents.limits import (
 )
 from mycode.subagents.tool_batch import SubAgentToolBatchHandler
 from mycode.subagents.runtime import SubAgentExecution
-from mycode.tools import PydanticTool, ToolArgs, ToolRegistry, ToolResult
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
+from mycode.tools.registry import ToolRegistry
 from mycode.tools.defaults import create_default_tool_registry
 from mycode.tools.workspace import Workspace
 
@@ -167,11 +170,10 @@ def test_delegation_barrier_runs_all_children_then_parent_replans_once() -> None
     )
     client = RecordingParentLLM(
         responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[stale_call, explorer_call, reviewer_call],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="Replanned final answer."),
+            ModelResponse(content="Replanned final answer."),
         ]
     )
     runner = AgentRunner(
@@ -577,15 +579,13 @@ def test_delegation_limit_blocks_extra_child_call_within_parent_run() -> None:
     runtime = RecordingRuntime()
     client = RecordingParentLLM(
         responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[_delegate_call("call_one", objective="First task.")],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[_delegate_call("call_two", objective="Second task.")],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="Done."),
+            ModelResponse(content="Done."),
         ]
     )
     runner = AgentRunner(
@@ -606,16 +606,14 @@ def test_parent_resets_delegation_limit_for_each_user_run() -> None:
     runtime = RecordingRuntime()
     client = RecordingParentLLM(
         responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[_delegate_call("call_first", objective="First run.")],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="First done."),
-            AgentModelResponse(
+            ModelResponse(content="First done."),
+            ModelResponse(
                 tool_calls=[_delegate_call("call_second", objective="Second run.")],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="Second done."),
+            ModelResponse(content="Second done."),
         ]
     )
     runner = AgentRunner(
@@ -913,8 +911,8 @@ class RecordingParentLLM:
 
     def __init__(
         self,
-        responses: list[AgentModelResponse] | None = None,
-        stream_events: list[list[AgentEvent]] | None = None,
+        responses: list[ModelResponse] | None = None,
+        stream_events: list[list[ModelStreamEvent]] | None = None,
     ) -> None:
         self.responses = [] if responses is None else list(responses)
         self.stream_events = [] if stream_events is None else list(stream_events)
@@ -931,16 +929,16 @@ class RecordingParentLLM:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
-        self.seen_conversations.append(conversation.to_model_messages())
+    ) -> Iterator[ModelStreamEvent]:
+        self.seen_conversations.append(project_model_messages(conversation.get_messages()))
         if self.stream_events:
             yield from self.stream_events.pop(0)
             return
         response = self.responses.pop(0)
         if response.content:
-            yield AgentEvent(type="text_delta", content=response.content)
+            yield ModelStreamEvent(type="text_delta", content=response.content)
         for tool_call in response.tool_calls:
-            yield AgentEvent(type="tool_call", tool_call=tool_call)
+            yield ModelStreamEvent(type="tool_call", tool_call=tool_call)
 
 
 class InterruptingRuntime:

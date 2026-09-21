@@ -12,11 +12,12 @@ from mycode.context.budget import (
     CompactContextStats,
     ContextBudget,
     TokenEstimator,
-    TokenUsage,
     estimate_conversation,
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_events import TokenUsage
+from mycode.model_projection import project_model_message
 from mycode.observability import ObservationSink, emit_observation
 
 
@@ -725,9 +726,7 @@ def _summary_prompt(
 
 
 def _compact_message_dict(message: Message) -> dict[str, object]:
-    model_dict = message.to_model_dict()
-    model_dict.pop("reasoning_content", None)
-    return model_dict
+    return project_model_message(message, include_reasoning=False)
 
 
 def _parse_compact_summary(content: str) -> CompactSummary:

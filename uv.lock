@@ -566,7 +566,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.13.4" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "pyyaml", specifier = ">=6.0.2,<7" },
-    { name = "textual", specifier = ">=8.2.8" },
+    { name = "textual", specifier = "~=8.2.8" },
 ]
 
 [package.metadata.requires-dev]

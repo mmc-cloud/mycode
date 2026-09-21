@@ -3,14 +3,7 @@ import asyncio
 import pytest
 
 from mycode.permissions import PermissionDecision
-from mycode.tools import (
-    BaseTool,
-    PydanticTool,
-    SyncTool,
-    ToolArgs,
-    ToolPermissionProfileError,
-    ToolResult,
-)
+from mycode.tools.base import BaseTool, PydanticTool, SyncTool, ToolArgs, ToolPermissionProfileError, ToolResult
 
 
 def test_tool_result_success_sets_content_and_metadata() -> None:

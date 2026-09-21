@@ -2,7 +2,8 @@ import re
 from pathlib import Path
 
 import mycode.tools.grep as grep_module
-from mycode.tools import GrepArgs, GrepTool, Workspace
+from mycode.tools.grep import GrepArgs, GrepTool
+from mycode.tools.workspace import Workspace
 
 
 def test_grep_matches_regular_expression_in_utf8_files(tmp_path: Path) -> None:

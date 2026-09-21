@@ -4,6 +4,7 @@ import math
 
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_events import TokenUsage
 from mycode.context.tool_result_format import (
     COMPRESSED_TOOL_RESULT_MARKER, TOOL_RESULT_METADATA_MARKER,
     ParsedToolResultContent, parse_tool_result_content, safe_tool_metadata,
@@ -24,6 +25,9 @@ DEFAULT_MIXED_TOKENS_PER_CHAR = 0.8
 DEFAULT_NON_ASCII_TOKENS_PER_CHAR = 1.2
 DEFAULT_CALIBRATION_SAFETY_FACTOR = 1.1
 DEFAULT_MAX_CALIBRATION_SAMPLES = 20
+_TOOL_CALL_ESTIMATE_BASE_CHARS = 73
+
+
 @dataclass(frozen=True)
 class ContextBudget:
     """Model context budget measured in tokens."""
@@ -62,13 +66,6 @@ class ContextBudget:
             - self.reserved_output_tokens
             - self.safety_margin_tokens
         )
-
-
-@dataclass(frozen=True)
-class TokenUsage:
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
 
 
 @dataclass
@@ -304,10 +301,11 @@ class ContextBudgetExceededError(RuntimeError):
 
 
 def estimate_message(message: Message) -> MessageEstimate:
-    model_dict = message.to_model_dict()
     content_chars = len(message.content)
     reasoning_chars = len(message.reasoning_content or "")
-    tool_call_chars = _estimate_tool_calls(message)
+    serialized_chars, _non_ascii_chars, tool_call_chars = (
+        estimate_canonical_message_size(message)
+    )
     tool_call_id_chars = len(message.tool_call_id or "")
     component_chars = (
         len(message.role)
@@ -316,8 +314,6 @@ def estimate_message(message: Message) -> MessageEstimate:
         + tool_call_chars
         + tool_call_id_chars
     )
-    serialized_chars = len(json.dumps(model_dict, ensure_ascii=False))
-
     return MessageEstimate(
         role=message.role,
         content_chars=content_chars,
@@ -339,20 +335,27 @@ def estimate_conversation(
     message_estimates = tuple(
         estimate_message(message) for message in conversation.get_messages()
     )
-    serialized_message_text = json.dumps(
-        conversation.to_model_messages(), ensure_ascii=False
+    messages = conversation.get_messages()
+    message_serialization = [
+        estimate_canonical_message_size(message) for message in messages
+    ]
+    serialized_messages = _json_list_chars(
+        [serialized for serialized, _non_ascii, _tools in message_serialization]
     )
-    serialized_messages = len(serialized_message_text)
+    message_non_ascii_chars = sum(
+        non_ascii for _serialized, non_ascii, _tools in message_serialization
+    )
     estimated_message_chars = sum(
         estimate.total_chars for estimate in message_estimates
     )
     message_list_overhead_chars = serialized_messages - estimated_message_chars
 
     serialized_tool_text = _serialize_tool_schemas(tools)
-    total_text = serialized_message_text + serialized_tool_text
     token_estimate = active_estimator.estimate(
-        total_chars=len(total_text),
-        non_ascii_chars=_count_non_ascii(total_text),
+        total_chars=serialized_messages + len(serialized_tool_text),
+        non_ascii_chars=(
+            message_non_ascii_chars + _count_non_ascii(serialized_tool_text)
+        ),
     )
 
     return ConversationEstimate(
@@ -407,7 +410,7 @@ def budget_model_context(
 
     Optional memory must already be in messages. Agent requests lower tool-group
     precision, omit memory, then trim history. Calls without a retention projection
-    retain the existing Chat/standalone trimming and memory-omission behavior.
+    retain the existing Agent/standalone trimming and memory-omission behavior.
     """
     active_budget = ContextBudget() if budget is None else budget
     active_estimator = TokenEstimator() if token_estimator is None else token_estimator
@@ -718,12 +721,70 @@ def format_model_context_stats(
     )
 
 
-def _estimate_tool_calls(message: Message) -> int:
-    model_tool_calls = message.to_model_dict().get("tool_calls")
-    if not isinstance(model_tool_calls, list):
-        return 0
+def estimate_canonical_message_size(message: Message) -> tuple[int, int, int]:
+    """Return request-equivalent chars, non-ASCII chars, and tool-call chars.
 
-    return len(json.dumps(model_tool_calls, ensure_ascii=False))
+    The estimate is derived from canonical fields and keeps the established
+    request-size result without importing or reconstructing a provider formatter.
+    """
+    fields: list[tuple[str, int]] = [
+        ("role", _json_value_chars(message.role)),
+        ("content", _json_value_chars(message.content)),
+    ]
+    non_ascii_chars = _json_non_ascii(message.role) + _json_non_ascii(
+        message.content
+    )
+    tool_call_chars = 0
+    if message.tool_calls:
+        serialized_calls: list[int] = []
+        for tool_call in message.tool_calls:
+            arguments = json.dumps(tool_call.arguments, ensure_ascii=False)
+            serialized_calls.append(
+                _TOOL_CALL_ESTIMATE_BASE_CHARS
+                + _json_value_chars(tool_call.id)
+                + _json_value_chars(tool_call.name)
+                + _json_value_chars(arguments)
+                - 6
+            )
+            non_ascii_chars += (
+                _json_non_ascii(tool_call.id)
+                + _json_non_ascii(tool_call.name)
+                + _json_non_ascii(arguments)
+            )
+        tool_call_chars = _json_list_chars(serialized_calls)
+        fields.append(("tool_calls", tool_call_chars))
+    if message.tool_call_id is not None:
+        fields.append(("tool_call_id", _json_value_chars(message.tool_call_id)))
+        non_ascii_chars += _json_non_ascii(message.tool_call_id)
+    if message.reasoning_state != "absent":
+        fields.append(
+            ("reasoning_content", _json_value_chars(message.reasoning_content))
+        )
+        non_ascii_chars += _json_non_ascii(message.reasoning_content)
+    return _json_object_chars(fields), non_ascii_chars, tool_call_chars
+
+
+def _json_object_chars(fields: list[tuple[str, int]]) -> int:
+    return (
+        2
+        + sum(
+            len(json.dumps(name)) + 2 + value_chars
+            for name, value_chars in fields
+        )
+        + max(0, len(fields) - 1) * 2
+    )
+
+
+def _json_list_chars(item_chars: list[int]) -> int:
+    return 2 + sum(item_chars) + max(0, len(item_chars) - 1) * 2
+
+
+def _json_value_chars(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False))
+
+
+def _json_non_ascii(value: object) -> int:
+    return _count_non_ascii(json.dumps(value, ensure_ascii=False))
 
 
 def _serialize_tool_schemas(tools: list[dict[str, object]] | None) -> str:

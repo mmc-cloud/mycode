@@ -9,24 +9,31 @@ from uuid import uuid4
 from textual import on
 from textual.app import App
 from textual.message import Message
-from textual.widgets import Input, OptionList
+from textual.widgets import OptionList
 
+from mycode import startup_profile
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.application.agent_session import (
     AgentApplicationSession,
     CompactResult,
     ContextStatus,
-    start_agent_application_session,
+)
+from mycode.application.startup import (
+    ApplicationEnvironment,
+    ApplicationSessionFactory,
+    ApplicationStartupWarning,
+    create_application_environment,
+    prepare_application_session_factory,
+    resolve_application_llm_config,
 )
 from mycode.application.events import RuntimeEvent
 from mycode.application.sessions import (
     SessionStartRequest,
     list_project_sessions,
 )
-from mycode.config import LLMConfig, load_llm_config
+from mycode.config import LLMConfig
 from mycode.error_handling import error_summary
-from mycode.mcp import MCPConfig, MCPConfigError, load_mcp_config_layers
-from mycode.mcp.trust import resolve_project_mcp_trust
+from mycode.mcp.config import MCPConfig
 from mycode.permissions import ConfirmationResult
 from mycode.persistence.session_store import (
     SessionInUseError,
@@ -65,15 +72,26 @@ from mycode.presentation.tui.screens import (
 )
 from mycode.presentation.tui.widgets import (
     SPLASH_LOGO,
+    CommandPicker,
     ConversationView,
     HeaderBar,
+    PromptTextArea,
     StatusBar,
 )
-from mycode.project import ProjectIdentity
-from mycode.tools.workspace import Workspace
 
 
 HistoryItem = tuple[str, str]
+
+
+def _try_close_application_session(
+    application_session: AgentApplicationSession,
+) -> str:
+    """Close a TUI-owned session without breaking presentation cleanup."""
+    try:
+        application_session.close()
+    except Exception as caught:  # noqa: BLE001 - presentation cleanup boundary
+        return error_summary(caught)
+    return ""
 
 
 class WelcomeMetadataMessage(Message):
@@ -125,10 +143,12 @@ class StartupFailedMessage(Message):
         *,
         session_in_use: bool = False,
         replace_current: bool = False,
+        cleanup_warning: str = "",
     ) -> None:
         self.error = error
         self.session_in_use = session_in_use
         self.replace_current = replace_current
+        self.cleanup_warning = cleanup_warning
         super().__init__()
 
 
@@ -323,8 +343,16 @@ class MyCodeTuiApp(App[None]):
         padding: 0 2;
     }
 
+    #command-picker {
+        background: $panel;
+        border: round $primary-darken-2;
+        height: auto;
+        margin: 0 2;
+        padding: 0 1;
+    }
+
     #prompt {
-        height: 3;
+        height: 7;
         margin: 0 2 1 2;
     }
     """
@@ -344,10 +372,13 @@ class MyCodeTuiApp(App[None]):
     ) -> None:
         super().__init__(**kwargs)
         del splash_duration
-        workspace_root = Path.cwd() if workspace_path is None else workspace_path
-        self.workspace = Workspace(workspace_root)
-        self.project = ProjectIdentity.from_workspace(self.workspace.root)
-        self.session_store = session_store or SessionStore()
+        self._environment: ApplicationEnvironment = create_application_environment(
+            workspace_path,
+            session_store=session_store,
+        )
+        self.workspace = self._environment.workspace
+        self.project = self._environment.project
+        self.session_store = self._environment.session_store
         self._llm_config = llm_config
         self._mcp_config_override = mcp_config
         self._trust_file = trust_file
@@ -363,6 +394,7 @@ class MyCodeTuiApp(App[None]):
         self._startup_active = False
         self._shutdown_requested = Event()
         self._session_lock = Lock()
+        self._session_factory: ApplicationSessionFactory | None = None
         self._application_session: AgentApplicationSession | None = None
         self._pending_application_sessions: list[AgentApplicationSession] = []
         self._turn_session_owned_by_worker = False
@@ -410,8 +442,10 @@ class MyCodeTuiApp(App[None]):
         config = self._llm_config
         error = ""
         try:
-            if config is None:
-                config = load_llm_config(workspace_root=self.workspace.root)
+            config = resolve_application_llm_config(
+                self._environment,
+                llm_config=config,
+            )
         except Exception as caught:  # noqa: BLE001 - UI boundary reports a summary
             error = error_summary(caught)
 
@@ -514,44 +548,31 @@ class MyCodeTuiApp(App[None]):
         try:
             if self._shutdown_requested.is_set():
                 return
-            self._post_progress("Loading project configuration...")
-            config = self._llm_config
-            if config is None:
-                config = load_llm_config(workspace_root=self.workspace.root)
+            if self._session_factory is None:
+                self._post_progress("Loading project configuration...")
+                config = resolve_application_llm_config(
+                    self._environment,
+                    llm_config=self._llm_config,
+                )
                 self._llm_config = config
-
-            self._post_progress("Checking MCP trust...")
-            if self._mcp_config_override is None:
-                try:
-                    loaded_mcp = load_mcp_config_layers(
-                        workspace_root=self.workspace.root
-                    )
-                    trust_resolution = resolve_project_mcp_trust(
-                        loaded_mcp,
-                        self.project,
-                        confirmer=self._trust_confirmer,
-                        trust_file=self._trust_file,
-                    )
-                    effective_mcp_config = trust_resolution.config
-                except MCPConfigError as caught:
-                    self._post_progress(f"MCP config unavailable: {error_summary(caught)}")
-                    effective_mcp_config = MCPConfig()
-            else:
-                effective_mcp_config = self._mcp_config_override
+                self._post_progress("Checking MCP trust...")
+                self._session_factory = prepare_application_session_factory(
+                    self._environment,
+                    llm_config=config,
+                    mcp_config=self._mcp_config_override,
+                    mcp_trust_confirmer=self._trust_confirmer,
+                    trust_file=self._trust_file,
+                    confirmer=self._permission_confirmer,
+                    external_observer=self._subagent_observer,
+                    warning_handler=self._handle_startup_warning,
+                )
 
             self._post_progress("Connecting MCP...")
             self._post_progress("Starting runtime...")
             if self._shutdown_requested.is_set():
                 return
-            application_session = start_agent_application_session(
-                self.session_store,
-                self.project,
-                request=request,
-                mcp_config=effective_mcp_config,
-                confirmer=self._permission_confirmer,
-                external_observer=self._subagent_observer,
-                llm_config=config,
-            )
+            application_session = self._session_factory.open_session(request)
+            startup_profile.total("runtime.ready")
             if not self._register_pending_application_session(application_session):
                 return
             history = _visible_history(
@@ -568,21 +589,32 @@ class MyCodeTuiApp(App[None]):
                 )
             )
         except SessionInUseError as caught:
+            cleanup_warning = ""
             if application_session is not None:
-                self._cleanup_startup_session(application_session)
+                cleanup_warning = self._cleanup_startup_session(application_session)
             self.post_message(
                 StartupFailedMessage(
                     caught,
                     session_in_use=True,
                     replace_current=replace_current,
+                    cleanup_warning=cleanup_warning,
                 )
             )
         except Exception as caught:  # noqa: BLE001 - worker boundary returns to Welcome
+            cleanup_warning = ""
             if application_session is not None:
-                self._cleanup_startup_session(application_session)
+                cleanup_warning = self._cleanup_startup_session(application_session)
             self.post_message(
-                StartupFailedMessage(caught, replace_current=replace_current)
+                StartupFailedMessage(
+                    caught,
+                    replace_current=replace_current,
+                    cleanup_warning=cleanup_warning,
+                )
             )
+
+    def _handle_startup_warning(self, warning: ApplicationStartupWarning) -> None:
+        if warning.code == "mcp_config_error":
+            self._post_progress(f"MCP config unavailable: {warning.message}")
 
     def _register_pending_application_session(
         self,
@@ -595,14 +627,14 @@ class MyCodeTuiApp(App[None]):
                 self._pending_application_sessions.append(application_session)
                 should_close = False
         if should_close:
-            application_session.close()
+            _try_close_application_session(application_session)
             return False
         return True
 
     def _cleanup_startup_session(
         self,
         application_session: AgentApplicationSession,
-    ) -> None:
+    ) -> str:
         with self._session_lock:
             try:
                 self._pending_application_sessions.remove(application_session)
@@ -610,8 +642,9 @@ class MyCodeTuiApp(App[None]):
                 claimed = False
             else:
                 claimed = True
-        if claimed:
-            application_session.close()
+        if not claimed:
+            return ""
+        return _try_close_application_session(application_session)
 
     def _post_progress(self, value: str) -> None:
         self.post_message(StartupProgressMessage(value))
@@ -817,19 +850,15 @@ class MyCodeTuiApp(App[None]):
         if not claimed:
             return
         if should_close:
-            message.application_session.close()
+            _try_close_application_session(message.application_session)
             return
 
         if message.replace_current:
-            if old_session is not None:
-                try:
-                    old_session.close()
-                except Exception as caught:  # noqa: BLE001 - preserve new session
-                    close_warning = error_summary(caught)
-                else:
-                    close_warning = ""
-            else:
-                close_warning = ""
+            close_warning = (
+                _try_close_application_session(old_session)
+                if old_session is not None
+                else ""
+            )
             self._queued_events.extend(switch_events)
             self.switch_screen(
                 MainScreen(
@@ -839,9 +868,11 @@ class MyCodeTuiApp(App[None]):
                 )
             )
             if close_warning:
-                self._show_command_notice(
-                    f"Old session cleanup warning: {close_warning}",
-                    level="warning",
+                self.call_after_refresh(
+                    lambda: self._show_command_notice(
+                        f"Old session cleanup warning: {close_warning}",
+                        level="warning",
+                    )
                 )
             return
 
@@ -868,6 +899,11 @@ class MyCodeTuiApp(App[None]):
                 f"Session switch failed: {detail}",
                 level="warning" if message.session_in_use else "error",
             )
+            if message.cleanup_warning:
+                self._show_command_notice(
+                    f"Session cleanup warning: {message.cleanup_warning}",
+                    level="warning",
+                )
             self._set_prompt_enabled(True)
             self._set_status("Ready")
             self._focus_prompt()
@@ -881,6 +917,12 @@ class MyCodeTuiApp(App[None]):
         else:
             notice = "Startup failed. Choose a session to try again."
             error = f"{type(message.error).__name__}: {error_summary(message.error)}"
+        if message.cleanup_warning:
+            cleanup_notice = f"Session cleanup warning: {message.cleanup_warning}"
+            if error:
+                error += f"\n⚠ {cleanup_notice}"
+            else:
+                notice += f" {cleanup_notice}"
         self._show_welcome(notice=notice, error=error)
         self._start_welcome_metadata_load(name="refresh-session-list")
 
@@ -1034,7 +1076,7 @@ class MyCodeTuiApp(App[None]):
         except Exception as caught:  # noqa: BLE001 - UI boundary reports a summary
             message = ContextStatusMessage(error=error_summary(caught))
         if self._release_command_session_after_worker(application_session):
-            application_session.close()
+            _try_close_application_session(application_session)
             return
         self.post_message(message)
 
@@ -1063,7 +1105,7 @@ class MyCodeTuiApp(App[None]):
         except Exception as caught:  # noqa: BLE001 - UI boundary reports a summary
             message = CompactResultMessage(error=error_summary(caught))
         if self._release_command_session_after_worker(application_session):
-            application_session.close()
+            _try_close_application_session(application_session)
             return
         self.post_message(message)
 
@@ -1199,12 +1241,12 @@ class MyCodeTuiApp(App[None]):
             except BaseException as interrupt_caught:  # noqa: BLE001 - preserve UI recovery
                 interrupt_error = interrupt_caught
             if self._release_turn_session_after_turn(application_session):
-                application_session.close()
+                _try_close_application_session(application_session)
                 return
             self.post_message(TurnFailedMessage(turn_id, caught, interrupt_error))
             return
         if self._release_turn_session_after_turn(application_session):
-            application_session.close()
+            _try_close_application_session(application_session)
             return
         self.post_message(TurnCompletedMessage(turn_id, outcome))
 
@@ -1275,12 +1317,12 @@ class MyCodeTuiApp(App[None]):
     def _set_prompt_enabled(self, enabled: bool) -> None:
         if not isinstance(self.screen, MainScreen):
             return
-        self.screen.query_one(Input).disabled = not enabled
+        self.screen.query_one(PromptTextArea).disabled = not enabled
 
     def _focus_prompt(self) -> None:
         if self._session_unusable or not isinstance(self.screen, MainScreen):
             return
-        self.set_focus(self.screen.query_one(Input))
+        self.set_focus(self.screen.query_one(PromptTextArea))
 
     def action_quit(self) -> None:
         if self._active_turn_id is not None:
@@ -1318,7 +1360,7 @@ class MyCodeTuiApp(App[None]):
                 sessions.append(self._application_session)
                 self._application_session = None
         for application_session in sessions:
-            application_session.close()
+            _try_close_application_session(application_session)
 
 
 def _request_label(request: SessionStartRequest) -> str:
@@ -1341,10 +1383,12 @@ def run_tui() -> None:
 
 
 __all__ = [
+    "CommandPicker",
     "ConversationView",
     "HeaderBar",
     "MainScreen",
     "MyCodeTuiApp",
+    "PromptTextArea",
     "SPLASH_LOGO",
     "StatusBar",
     "run_tui",

@@ -1,7 +1,9 @@
 from pathlib import Path
 import subprocess
 
-from mycode.tools import InspectChangesTool, ToolRegistry, Workspace
+from mycode.tools.inspect_changes import InspectChangesTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 
 
 def test_inspect_changes_status_reports_worktree_state(tmp_path: Path) -> None:

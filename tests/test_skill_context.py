@@ -1,7 +1,8 @@
+from collections.abc import Iterator
 import json
 from pathlib import Path
 
-from mycode.agent.events import AgentModelResponse, AgentToolCall
+from mycode.agent.events import AgentToolCall
 from mycode.context.budget import ContextBudget, TokenEstimator
 from mycode.context.builder import ContextBuilder
 from mycode.context.compact import CompactPolicy, ConversationCompactor
@@ -9,12 +10,14 @@ from mycode.application import build_agent_runner
 from mycode.cli import run_agent_loop
 from mycode.config import LLMConfig
 from mycode.conversation import Conversation
-from mycode.llm import FakeLLMClient
+from mycode.llm_contracts import FakeLLMClient
 from mycode.messages import Message
+from mycode.model_events import ModelResponse, ModelStreamEvent
 from mycode.prompts import build_agent_system_prompt
 from mycode.agent.runner import AgentRunner
 from mycode.skills import ActiveSkillState, Skill, SkillRegistry
-from mycode.tools import LoadSkillTool, ToolRegistry
+from mycode.tools.load_skill import LoadSkillTool
+from mycode.tools.registry import ToolRegistry
 from mycode.context.tool_result_retention import ToolResultRetentionPolicy
 
 
@@ -168,11 +171,11 @@ def test_active_skill_survives_compact_but_is_not_summarized(tmp_path: Path) -> 
 
 
 class RecordingSkillClient(FakeLLMClient):
-    def __init__(self, tool_responses):
+    def __init__(self, tool_responses: list[ModelResponse]) -> None:
         super().__init__(responses=[], tool_responses=tool_responses)
         self.seen_messages = []
 
-    def stream_with_tools(self, conversation, tools):
+    def stream_with_tools(self, conversation, tools) -> Iterator[ModelStreamEvent]:
         self.seen_messages.append(conversation.get_messages())
         yield from super().stream_with_tools(conversation, tools)
 
@@ -185,16 +188,15 @@ def test_runner_skill_lifecycle_and_observability_are_task_scoped(tmp_path: Path
     tools = ToolRegistry.from_tools([LoadSkillTool(registry, state)])
     client = RecordingSkillClient(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=(
                     AgentToolCall(
                         id="load-1", name="load_skill", arguments={"name": skill.name}
                     ),
                 ),
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="first done"),
-            AgentModelResponse(content="second done"),
+            ModelResponse(content="first done"),
+            ModelResponse(content="second done"),
         ]
     )
     observations = []
@@ -307,15 +309,14 @@ def test_runner_clears_skill_state_when_generator_is_closed(tmp_path: Path) -> N
     registry.register(skill)
     client = RecordingSkillClient(
         [
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=(
                     AgentToolCall(
                         id="load-1", name="load_skill", arguments={"name": skill.name}
                     ),
                 ),
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="unused"),
+            ModelResponse(content="unused"),
         ]
     )
     runner = AgentRunner(

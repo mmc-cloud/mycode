@@ -13,13 +13,16 @@ from mycode.agent.events import (
     AgentToolCall,
 )
 from mycode.context.budget import (
-    ContextBudget, MemoryContextStats, TokenUsage, estimate_conversation,
+    ContextBudget, MemoryContextStats, estimate_conversation,
 )
 from mycode.conversation import Conversation
-from mycode.llm import FakeLLMClient
+from mycode.llm_contracts import FakeLLMClient
+from mycode.providers.openai_errors import normalize_openai_error
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecall
 from mycode.messages import Message
+from mycode.model_events import ModelResponse, ModelStreamEvent, TokenUsage
+from mycode.model_projection import project_model_messages
 from mycode.project import ProjectIdentity
 from mycode.agent.runner import (
     AgentRunner,
@@ -37,14 +40,10 @@ from mycode.agent.runner import (
 )
 from mycode.agent.progress import MAIN_NEAR_LIMIT_PROMPT, MAX_TURNS_FINALIZATION_PROMPT
 from mycode.permissions import ConfirmationResult, PermissionDecision
-from mycode.tools import (
-    PydanticTool,
-    ReadFileTool,
-    ToolArgs,
-    ToolRegistry,
-    ToolResult,
-    Workspace,
-)
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
+from mycode.tools.read_file import ReadFileTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 from mycode.tools.read_file import MAX_LINES_LIMIT
 
 
@@ -91,7 +90,7 @@ def _run_response(runner: AgentRunner, user_message: str) -> AgentModelResponse:
 def test_runner_returns_final_answer_without_tools() -> None:
     observations: list[dict[str, object]] = []
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="final answer")]
+        responses=[ModelResponse(content="final answer")]
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -124,8 +123,8 @@ def test_runner_executes_tool_calls_when_content_is_empty() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls"),
-            AgentModelResponse(content="done"),
+            ModelResponse(tool_calls=[tool_call]),
+            ModelResponse(content="done"),
         ]
     )
     runner = AgentRunner(
@@ -144,8 +143,8 @@ def test_runner_executes_tool_calls_when_content_is_empty() -> None:
 def test_runner_retries_once_after_empty_response(empty_content) -> None:
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(content=empty_content),
-            AgentModelResponse(content="recovered final"),
+            ModelResponse(content=empty_content),
+            ModelResponse(content="recovered final"),
         ]
     )
     runner = AgentRunner(
@@ -182,10 +181,9 @@ def test_runner_retries_empty_response_to_tool_call_in_last_turn() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(content=""),
-            AgentModelResponse(
+            ModelResponse(content=""),
+            ModelResponse(
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
             ),
         ],
         plain_responses=["bounded final"],
@@ -212,9 +210,9 @@ def test_runner_stops_with_empty_response_error_after_second_empty() -> None:
     observations: list[dict[str, object]] = []
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(content=""),
-            AgentModelResponse(content="   "),
-            AgentModelResponse(content="must not be requested"),
+            ModelResponse(content=""),
+            ModelResponse(content="   "),
+            ModelResponse(content="must not be requested"),
         ]
     )
     runner = AgentRunner(
@@ -251,10 +249,10 @@ def test_runner_stops_with_empty_response_error_after_second_empty() -> None:
 
 def test_runner_reasoning_without_content_or_tools_is_empty_response() -> None:
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="final after retry")],
+        responses=[ModelResponse(content="final after retry")],
         stream_events=[
             [
-                AgentEvent(
+                ModelStreamEvent(
                     type="reasoning_delta",
                     reasoning_content="private reasoning",
                 )
@@ -278,9 +276,9 @@ def test_runner_accepts_final_immediately_after_tracked_mutation() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(tool_calls=[write_call], stop_reason="tool_calls"),
-            AgentModelResponse(content="first final"),
-            AgentModelResponse(content="must not be requested"),
+            ModelResponse(tool_calls=[write_call]),
+            ModelResponse(content="first final"),
+            ModelResponse(content="must not be requested"),
         ]
     )
     runner = AgentRunner(
@@ -317,10 +315,10 @@ def test_runner_convergence_guidance_never_removes_investigation_tools() -> None
     ]
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(tool_calls=[calls[0]], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=[calls[1]], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=[calls[2]], stop_reason="tool_calls"),
-            AgentModelResponse(content="replanned"),
+            ModelResponse(tool_calls=[calls[0]]),
+            ModelResponse(tool_calls=[calls[1]]),
+            ModelResponse(tool_calls=[calls[2]]),
+            ModelResponse(content="replanned"),
         ]
     )
 
@@ -560,12 +558,11 @@ def test_runner_executes_tool_and_returns_second_model_answer() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
                 reasoning_content="private synthetic reasoning",
             ),
-            AgentModelResponse(content="final answer"),
+            ModelResponse(content="final answer"),
         ]
     )
     runner = AgentRunner(
@@ -605,9 +602,9 @@ def test_runner_accumulates_token_usage_across_internal_tool_turns() -> None:
     client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls"),
-            AgentModelResponse(content="done"),
-            AgentModelResponse(content="next run"),
+            ModelResponse(tool_calls=[tool_call]),
+            ModelResponse(content="done"),
+            ModelResponse(content="next run"),
         ],
         token_usages=[
             TokenUsage(prompt_tokens=10, completion_tokens=2, total_tokens=12),
@@ -649,7 +646,7 @@ def test_runner_honors_custom_tool_batch_stop_response() -> None:
         arguments={"text": "hello"},
     )
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls")]
+        responses=[ModelResponse(tool_calls=[tool_call])]
     )
 
     def stop_after_batch(registry, tool_calls):
@@ -693,7 +690,7 @@ def test_runner_rejects_incomplete_custom_tool_batch() -> None:
     runner = AgentRunner(
         llm_client=RecordingLLMClient(
             responses=[
-                AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls")
+                ModelResponse(tool_calls=[tool_call])
             ]
         ),
         tool_registry=ToolRegistry.from_tools([FakeTool()]),
@@ -708,7 +705,7 @@ def test_runner_rejects_incomplete_custom_tool_batch() -> None:
 
 def test_runner_passes_tool_schemas_to_llm() -> None:
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="final answer")]
+        responses=[ModelResponse(content="final answer")]
     )
     registry = ToolRegistry.from_tools([FakeTool()])
     runner = AgentRunner(llm_client=llm_client, tool_registry=registry)
@@ -735,7 +732,7 @@ def test_runner_passes_tool_schemas_to_llm() -> None:
 
 def test_runner_uses_model_context_without_trimming_history() -> None:
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="final answer")]
+        responses=[ModelResponse(content="final answer")]
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -767,7 +764,7 @@ def test_runner_uses_model_context_without_trimming_history() -> None:
 
 def test_runner_does_not_call_model_when_context_is_over_budget() -> None:
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="unused")]
+        responses=[ModelResponse(content="unused")]
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -786,7 +783,7 @@ def test_runner_does_not_call_model_when_context_is_over_budget() -> None:
 
 def test_runner_does_not_call_model_when_tool_schema_exceeds_budget() -> None:
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="unused")]
+        responses=[ModelResponse(content="unused")]
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -810,8 +807,8 @@ def test_runner_writes_missing_tool_failure_back_to_conversation() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls"),
-            AgentModelResponse(content="saw the error"),
+            ModelResponse(tool_calls=[tool_call]),
+            ModelResponse(content="saw the error"),
         ]
     )
     runner = AgentRunner(llm_client=llm_client, tool_registry=ToolRegistry())
@@ -828,12 +825,10 @@ def test_runner_writes_missing_tool_failure_back_to_conversation() -> None:
 
 def test_runner_returns_model_error_without_executing_tools() -> None:
     llm_client = RecordingLLMClient(
-        responses=[
-            AgentModelResponse(
-                content="bad tool arguments",
-                stop_reason="model_error",
-            )
-        ]
+        responses=[],
+        stream_events=[
+            [ModelStreamEvent(type="error", error="bad tool arguments")]
+        ],
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -878,8 +873,8 @@ def test_runner_tracked_mutations_do_not_extend_strict_max_turns() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(tool_calls=[first_tool_call], stop_reason="tool_calls"),
-            AgentModelResponse(tool_calls=[second_tool_call], stop_reason="tool_calls"),
+            ModelResponse(tool_calls=[first_tool_call]),
+            ModelResponse(tool_calls=[second_tool_call]),
         ],
         plain_responses=["同步阶段性结论。"],
     )
@@ -943,10 +938,9 @@ def test_runner_stops_on_repeated_tool_call() -> None:
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(tool_calls=[tool_call], stop_reason="tool_calls"),
-            AgentModelResponse(
+            ModelResponse(tool_calls=[tool_call]),
+            ModelResponse(
                 tool_calls=[repeated_tool_call],
-                stop_reason="tool_calls",
             ),
         ]
     )
@@ -975,10 +969,10 @@ def test_runner_reports_near_limit_guidance_once_at_exactly_five_turns() -> None
         responses=[],
         stream_events=[
             *(
-                [AgentEvent(type="tool_call", tool_call=tool_call)]
+                [ModelStreamEvent(type="tool_call", tool_call=tool_call)]
                 for tool_call in tool_calls
             ),
-            [AgentEvent(type="text_delta", content="done")],
+            [ModelStreamEvent(type="text_delta", content="done")],
         ],
     )
     runner = AgentRunner(
@@ -1018,12 +1012,11 @@ def test_empty_response_retry_does_not_recalculate_near_limit_guidance() -> None
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[tool_call],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content=""),
-            AgentModelResponse(content="recovered final"),
+            ModelResponse(content=""),
+            ModelResponse(content="recovered final"),
         ]
     )
     runner = AgentRunner(
@@ -1067,7 +1060,7 @@ def _successful_batch(registry, tool_calls):
 def test_runner_stream_continues_from_persisted_max_turns_checkpoint() -> None:
     llm_client = RecordingLLMClient(
         responses=[],
-        stream_events=[[AgentEvent(type="text_delta", content="continued")]],
+        stream_events=[[ModelStreamEvent(type="text_delta", content="continued")]],
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -1099,7 +1092,7 @@ def test_runner_stream_continues_from_persisted_max_turns_checkpoint() -> None:
 
 def test_runner_continues_from_persisted_max_turns_checkpoint() -> None:
     llm_client = RecordingLLMClient(
-        responses=[AgentModelResponse(content="continued")],
+        responses=[ModelResponse(content="continued")],
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -1129,8 +1122,8 @@ def test_runner_streams_final_answer_text_and_stop_event() -> None:
         responses=[],
         stream_events=[
             [
-                AgentEvent(type="text_delta", content="hello"),
-                AgentEvent(type="text_delta", content=" world"),
+                ModelStreamEvent(type="text_delta", content="hello"),
+                ModelStreamEvent(type="text_delta", content=" world"),
             ],
         ],
     )
@@ -1165,7 +1158,7 @@ def test_runner_stream_uses_model_context_without_trimming_history() -> None:
         responses=[],
         stream_events=[
             [
-                AgentEvent(type="text_delta", content="final answer"),
+                ModelStreamEvent(type="text_delta", content="final answer"),
             ],
         ],
     )
@@ -1205,7 +1198,7 @@ def test_runner_stream_uses_model_context_without_trimming_history() -> None:
 def test_runner_stream_does_not_call_model_when_context_is_over_budget() -> None:
     llm_client = RecordingLLMClient(
         responses=[],
-        stream_events=[[AgentEvent(type="text_delta", content="unused")]],
+        stream_events=[[ModelStreamEvent(type="text_delta", content="unused")]],
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -1235,13 +1228,13 @@ def test_runner_streams_tool_call_tool_result_and_second_model_answer() -> None:
         responses=[],
         stream_events=[
             [
-                AgentEvent(
+                ModelStreamEvent(
                     type="reasoning_delta",
                     reasoning_content="private synthetic reasoning",
                 ),
                 tool_call_event,
             ],
-            [AgentEvent(type="text_delta", content="final answer")],
+            [ModelStreamEvent(type="text_delta", content="final answer")],
         ],
     )
     runner = AgentRunner(
@@ -1320,8 +1313,8 @@ def test_runner_stream_observes_normalized_args_but_replays_provider_call(
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [AgentEvent(type="tool_call", tool_call=raw_tool_call)],
-            [AgentEvent(type="text_delta", content="done")],
+            [ModelStreamEvent(type="tool_call", tool_call=raw_tool_call)],
+            [ModelStreamEvent(type="text_delta", content="done")],
         ],
     )
     runner = AgentRunner(
@@ -1361,13 +1354,13 @@ def test_runner_stream_replays_present_empty_reasoning_as_null() -> None:
         responses=[],
         stream_events=[
             [
-                AgentEvent(
+                ModelStreamEvent(
                     type="reasoning_state",
                     reasoning_state="present_empty",
                 ),
-                AgentEvent(type="tool_call", tool_call=tool_call),
+                ModelStreamEvent(type="tool_call", tool_call=tool_call),
             ],
-            [AgentEvent(type="text_delta", content="done")],
+            [ModelStreamEvent(type="text_delta", content="done")],
         ],
     )
     runner = AgentRunner(
@@ -1397,15 +1390,15 @@ def test_runner_stream_supports_fifty_present_empty_reasoning_tool_turns() -> No
         responses=[],
         stream_events=[
             [
-                AgentEvent(
+                ModelStreamEvent(
                     type="reasoning_state",
                     reasoning_state="present_empty",
                 ),
-                AgentEvent(type="tool_call", tool_call=tool_call),
+                ModelStreamEvent(type="tool_call", tool_call=tool_call),
             ]
             for tool_call in tool_calls
         ]
-        + [[AgentEvent(type="text_delta", content="done")]],
+        + [[ModelStreamEvent(type="text_delta", content="done")]],
     )
     runner = AgentRunner(
         llm_client=llm_client,
@@ -1440,7 +1433,7 @@ def test_runner_stream_honors_custom_tool_batch_stop_response() -> None:
     )
     client = RecordingLLMClient(
         responses=[],
-        stream_events=[[AgentEvent(type="tool_call", tool_call=tool_call)]],
+        stream_events=[[ModelStreamEvent(type="tool_call", tool_call=tool_call)]],
     )
 
     def stop_after_batch(registry, tool_calls):
@@ -1499,8 +1492,8 @@ def test_runner_stream_emits_context_notice_once_per_user_turn() -> None:
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [AgentEvent(type="tool_call", tool_call=tool_call)],
-            [AgentEvent(type="text_delta", content="final answer")],
+            [ModelStreamEvent(type="tool_call", tool_call=tool_call)],
+            [ModelStreamEvent(type="text_delta", content="final answer")],
         ],
     )
     runner = AgentRunner(
@@ -1532,8 +1525,8 @@ def test_runner_stream_updates_context_when_later_turn_overflows() -> None:
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [AgentEvent(type="tool_call", tool_call=tool_call)],
-            [AgentEvent(type="text_delta", content="unused")],
+            [ModelStreamEvent(type="tool_call", tool_call=tool_call)],
+            [ModelStreamEvent(type="text_delta", content="unused")],
         ],
     )
     runner = AgentRunner(
@@ -1557,8 +1550,8 @@ def test_runner_stream_reports_previous_actual_input_on_next_user_turn() -> None
     client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(content="first"),
-            AgentModelResponse(content="second"),
+            ModelResponse(content="first"),
+            ModelResponse(content="second"),
         ],
         token_usages=[usage, None],
     )
@@ -1581,7 +1574,7 @@ def test_runner_streams_model_error_and_stop_event() -> None:
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [AgentEvent(type="error", error="invalid tool arguments")],
+            [ModelStreamEvent(type="error", error="invalid tool arguments")],
         ],
     )
     runner = AgentRunner(llm_client=llm_client, tool_registry=ToolRegistry())
@@ -1624,7 +1617,7 @@ def test_runner_retries_retryable_model_error_and_recovers(
     client = ScriptedRetryLLMClient(
         tool_scripts=[
             ([], retryable_timeout()),
-            ([AgentEvent(type="text_delta", content="recovered")], None),
+            ([ModelStreamEvent(type="text_delta", content="recovered")], None),
         ]
     )
     monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.25)
@@ -1728,7 +1721,7 @@ def test_runner_exhausts_three_retryable_model_attempts(monkeypatch) -> None:
     "error",
     [
         RuntimeError("stream broke"),
-        BadRequestError(
+        normalize_openai_error(BadRequestError(
             "invalid request",
             response=httpx.Response(
                 400,
@@ -1737,7 +1730,7 @@ def test_runner_exhausts_three_retryable_model_attempts(monkeypatch) -> None:
                 ),
             ),
             body=None,
-        ),
+        )),
     ],
 )
 def test_runner_does_not_retry_non_retryable_or_unknown_model_error(
@@ -1766,10 +1759,10 @@ def test_runner_discards_partial_response_from_failed_attempt(monkeypatch) -> No
     client = ScriptedRetryLLMClient(
         tool_scripts=[
             (
-                [AgentEvent(type="text_delta", content="partial failed text")],
+                [ModelStreamEvent(type="text_delta", content="partial failed text")],
                 retryable_timeout(),
             ),
-            ([AgentEvent(type="text_delta", content="clean answer")], None),
+            ([ModelStreamEvent(type="text_delta", content="clean answer")], None),
         ]
     )
     monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 3.5)
@@ -1814,9 +1807,9 @@ def test_runner_never_executes_tool_call_from_failed_attempt(monkeypatch) -> Non
 
     client = ScriptedRetryLLMClient(
         tool_scripts=[
-            ([AgentEvent(type="tool_call", tool_call=tool_call)], retryable_timeout()),
-            ([AgentEvent(type="tool_call", tool_call=tool_call)], None),
-            ([AgentEvent(type="text_delta", content="done")], None),
+            ([ModelStreamEvent(type="tool_call", tool_call=tool_call)], retryable_timeout()),
+            ([ModelStreamEvent(type="tool_call", tool_call=tool_call)], None),
+            ([ModelStreamEvent(type="text_delta", content="done")], None),
         ]
     )
     monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.0)
@@ -1845,7 +1838,7 @@ def test_network_retry_is_independent_from_empty_response_retry(monkeypatch) -> 
         tool_scripts=[
             ([], retryable_timeout()),
             ([], None),
-            ([AgentEvent(type="text_delta", content="final")], None),
+            ([ModelStreamEvent(type="text_delta", content="final")], None),
         ]
     )
     monkeypatch.setattr(runner_module.random, "uniform", lambda _a, _b: 4.0)
@@ -1898,8 +1891,8 @@ def test_runner_stream_stops_after_max_turns(monkeypatch) -> None:
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [AgentEvent(type="tool_call", tool_call=first_tool_call)],
-            [AgentEvent(type="tool_call", tool_call=second_tool_call)],
+            [ModelStreamEvent(type="tool_call", tool_call=first_tool_call)],
+            [ModelStreamEvent(type="tool_call", tool_call=second_tool_call)],
         ],
         plain_responses=["根据现有信息得到阶段性结论。"],
     )
@@ -1958,8 +1951,8 @@ def test_runner_stream_stops_on_repeated_tool_call() -> None:
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [AgentEvent(type="tool_call", tool_call=tool_call)],
-            [AgentEvent(type="tool_call", tool_call=repeated_tool_call)],
+            [ModelStreamEvent(type="tool_call", tool_call=tool_call)],
+            [ModelStreamEvent(type="tool_call", tool_call=repeated_tool_call)],
         ],
     )
     runner = AgentRunner(
@@ -2014,8 +2007,8 @@ def test_runner_recalls_current_disk_memory_without_persisting_it(
     )
     llm_client = RecordingLLMClient(
         responses=[
-            AgentModelResponse(content="first answer"),
-            AgentModelResponse(content="second answer"),
+            ModelResponse(content="first answer"),
+            ModelResponse(content="second answer"),
         ]
     )
     runner = AgentRunner(
@@ -2088,10 +2081,7 @@ def test_runner_stream_reports_memory_counts_without_memory_content(
     llm_client = RecordingLLMClient(
         responses=[],
         stream_events=[
-            [
-                AgentEvent(type="text_delta", content="answer"),
-                AgentEvent(type="stop", stop_reason="final_answer"),
-            ]
+            [ModelStreamEvent(type="text_delta", content="answer")],
         ],
     )
     runner = AgentRunner(
@@ -2262,8 +2252,8 @@ def test_max_turns_finalization_retry_exhausted(monkeypatch) -> None:
 class RecordingLLMClient:
     def __init__(
         self,
-        responses: list[AgentModelResponse],
-        stream_events: list[list[AgentEvent]] | None = None,
+        responses: list[ModelResponse],
+        stream_events: list[list[ModelStreamEvent]] | None = None,
         plain_responses: list[str] | None = None,
     ) -> None:
         self.responses = responses
@@ -2274,7 +2264,7 @@ class RecordingLLMClient:
         self.seen_plain_conversations: list[list[dict[str, object]]] = []
 
     def complete(self, conversation: Conversation) -> Message:
-        self.seen_plain_conversations.append(conversation.to_model_messages())
+        self.seen_plain_conversations.append(project_model_messages(conversation.get_messages()))
         if not self.plain_responses:
             raise RuntimeError("RecordingLLMClient has no plain responses left")
         return Message(role="assistant", content=self.plain_responses.pop(0))
@@ -2286,8 +2276,8 @@ class RecordingLLMClient:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
-        self.seen_conversations.append(conversation.to_model_messages())
+    ) -> Iterator[ModelStreamEvent]:
+        self.seen_conversations.append(project_model_messages(conversation.get_messages()))
         self.seen_tools.append(tools)
 
         if self.stream_events:
@@ -2298,21 +2288,19 @@ class RecordingLLMClient:
 
         response = self.responses.pop(0)
         if response.reasoning_content is not None:
-            yield AgentEvent(
+            yield ModelStreamEvent(
                 type="reasoning_delta",
                 reasoning_content=response.reasoning_content,
             )
         if response.tool_calls and response.reasoning_state != "absent":
-            yield AgentEvent(
+            yield ModelStreamEvent(
                 type="reasoning_state",
                 reasoning_state=response.reasoning_state,
             )
-        if response.stop_reason == "model_error":
-            yield AgentEvent(type="error", error=response.content)
-        elif response.content:
-            yield AgentEvent(type="text_delta", content=response.content)
+        if response.content:
+            yield ModelStreamEvent(type="text_delta", content=response.content)
         for tool_call in response.tool_calls:
-            yield AgentEvent(type="tool_call", tool_call=tool_call)
+            yield ModelStreamEvent(type="tool_call", tool_call=tool_call)
 
 
 class FailingLLMClient:
@@ -2329,7 +2317,7 @@ class FailingLLMClient:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
+    ) -> Iterator[ModelStreamEvent]:
         raise self.error
         yield
 
@@ -2338,7 +2326,7 @@ class ScriptedRetryLLMClient:
     def __init__(
         self,
         *,
-        tool_scripts: list[tuple[list[AgentEvent], Exception | None]] | None = None,
+        tool_scripts: list[tuple[list[ModelStreamEvent], Exception | None]] | None = None,
         plain_scripts: list[tuple[list[str], Exception | None]] | None = None,
     ) -> None:
         self.tool_scripts = [] if tool_scripts is None else tool_scripts
@@ -2353,7 +2341,7 @@ class ScriptedRetryLLMClient:
         raise NotImplementedError
 
     def stream_complete(self, conversation: Conversation) -> Iterator[str]:
-        self.seen_plain_conversations.append(conversation.to_model_messages())
+        self.seen_plain_conversations.append(project_model_messages(conversation.get_messages()))
         chunks, error = self.plain_scripts.pop(0)
         content_chars = 0
         for chunk in chunks:
@@ -2371,8 +2359,8 @@ class ScriptedRetryLLMClient:
         self,
         conversation: Conversation,
         tools: list[dict[str, object]],
-    ) -> Iterator[AgentEvent]:
-        self.seen_conversations.append(conversation.to_model_messages())
+    ) -> Iterator[ModelStreamEvent]:
+        self.seen_conversations.append(project_model_messages(conversation.get_messages()))
         events, error = self.tool_scripts.pop(0)
         content_chars = 0
         for event in events:
@@ -2404,9 +2392,11 @@ class ScriptedRetryLLMClient:
         }
 
 
-def retryable_timeout() -> APITimeoutError:
-    return APITimeoutError(
-        request=httpx.Request("POST", "https://example.com/v1/chat/completions")
+def retryable_timeout() -> Exception:
+    return normalize_openai_error(
+        APITimeoutError(
+            request=httpx.Request("POST", "https://example.com/v1/chat/completions")
+        )
     )
 
 

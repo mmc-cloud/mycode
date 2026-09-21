@@ -10,13 +10,14 @@ from mycode.context.artifacts import ToolResultArtifactStore
 from uuid import uuid4
 
 from mycode.agent.events import AgentEvent, AgentModelResponse
-from mycode.context.budget import ContextBudget, MemoryContextStats, TokenEstimator, TokenUsage
+from mycode.context.budget import ContextBudget, MemoryContextStats, TokenEstimator
 from mycode.conversation import Conversation
 from mycode.instructions import InstructionBundle, load_instruction_bundle
-from mycode.llm import LLMClient
+from mycode.llm_contracts import LLMClient
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
 from mycode.messages import Message
+from mycode.model_events import TokenUsage
 from mycode.observability import ObservationSink
 from mycode.permissions import Confirmer, RejectingConfirmer
 from mycode.agent.runner import (

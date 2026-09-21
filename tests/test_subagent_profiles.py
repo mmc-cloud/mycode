@@ -12,7 +12,7 @@ from mycode.subagents.profiles import (
     create_subagent_tool_registry,
 )
 from mycode.subagents.prompts import build_subagent_system_prompt
-from mycode.tools import Workspace
+from mycode.tools.workspace import Workspace
 
 
 def test_builtin_profiles_define_three_distinct_roles() -> None:

@@ -3,11 +3,13 @@ import sys
 
 import pytest
 
-from mycode.agent.events import AgentModelResponse, AgentToolCall
-from mycode.llm import FakeLLMClient
+from mycode.agent.events import AgentToolCall
+from mycode.llm_contracts import FakeLLMClient
+from mycode.model_events import ModelResponse
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
 from mycode.agent.runner import AgentRunner
-from mycode.tools import Workspace, create_default_tool_registry
+from mycode.tools.workspace import Workspace
+from mycode.tools.defaults import create_default_tool_registry
 
 
 @pytest.mark.parametrize(
@@ -35,7 +37,7 @@ def test_real_main_agent_validation_reaches_runtime_observation(
     llm_client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id=f"call_{case}",
@@ -46,9 +48,8 @@ def test_real_main_agent_validation_reaches_runtime_observation(
                         },
                     )
                 ],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="validation recorded"),
+            ModelResponse(content="validation recorded"),
         ],
     )
     runner = AgentRunner(llm_client=llm_client, tool_registry=registry)
@@ -76,7 +77,7 @@ def test_process_start_failure_records_validation_attempt_without_result(
     llm_client = FakeLLMClient(
         responses=[],
         tool_responses=[
-            AgentModelResponse(
+            ModelResponse(
                 tool_calls=[
                     AgentToolCall(
                         id="call_missing_validator",
@@ -84,9 +85,8 @@ def test_process_start_failure_records_validation_attempt_without_result(
                         arguments={"command": ["missing-validator-for-mycode-tests"]},
                     )
                 ],
-                stop_reason="tool_calls",
             ),
-            AgentModelResponse(content="validator could not start"),
+            ModelResponse(content="validator could not start"),
         ],
     )
     runner = AgentRunner(llm_client=llm_client, tool_registry=registry)

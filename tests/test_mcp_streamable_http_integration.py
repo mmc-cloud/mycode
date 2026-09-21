@@ -8,7 +8,7 @@ from mycode.agent.events import AgentToolCall
 from mycode.mcp.config import MCPConfig
 from mycode.mcp.manager import MCPManager
 from mycode.agent.runner import execute_tool_batch
-from mycode.tools import ToolRegistry
+from mycode.tools.registry import ToolRegistry
 
 
 def test_local_streamable_http_headers_calls_slow_tool_and_cleanup() -> None:

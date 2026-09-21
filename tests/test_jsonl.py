@@ -236,16 +236,32 @@ class InterruptFailRuntimeApplication(FatalRuntimeApplication):
         raise RuntimeError("interrupt detail")
 
 
+class FakeApplicationSessionFactory:
+    def __init__(self, application) -> None:
+        self.application = application
+        self.requests: list[SessionStartRequest] = []
+
+    def open_session(self, request: SessionStartRequest):
+        self.requests.append(request)
+        return self.application
+
+
+def install_fake_session_factory(monkeypatch, application) -> FakeApplicationSessionFactory:
+    factory = FakeApplicationSessionFactory(application)
+    monkeypatch.setattr(
+        "mycode.adapters.jsonl.prepare_application_session_factory",
+        lambda *args, **kwargs: factory,
+    )
+    return factory
+
+
 def run_fake_runtime(
     tmp_path,
     monkeypatch,
     application,
     input_text: str,
 ):
-    monkeypatch.setattr(
-        "mycode.application.startup.start_agent_application_session",
-        lambda *args, **kwargs: application,
-    )
+    install_fake_session_factory(monkeypatch, application)
     output_stream = io.StringIO()
     error_stream = io.StringIO()
     exit_code = run_jsonl_runtime(
@@ -415,10 +431,7 @@ def test_jsonl_machine_runtime_is_json_only_and_forwards_turn_events(
     error_stream = io.StringIO()
     seen_turns: list[tuple[str, str]] = []
     application = FakeRuntimeApplication(seen_turns)
-    monkeypatch.setattr(
-        "mycode.application.startup.start_agent_application_session",
-        lambda *args, **kwargs: application,
-    )
+    install_fake_session_factory(monkeypatch, application)
 
     exit_code = run_jsonl_runtime(
         workspace_path=tmp_path,
@@ -455,10 +468,7 @@ def test_jsonl_context_controls_use_structured_messages_without_slash_commands(
         '{"version":1,"type":"compact"}\n'
         '{"version":1,"type":"close"}\n'
     )
-    monkeypatch.setattr(
-        "mycode.application.startup.start_agent_application_session",
-        lambda *args, **kwargs: application,
-    )
+    install_fake_session_factory(monkeypatch, application)
     output_stream = io.StringIO()
 
     assert run_jsonl_runtime(
@@ -500,17 +510,8 @@ def test_machine_runtime_never_opens_session_menu(
     expected_mode,
     expected_id,
 ) -> None:
-    calls: list[SessionStartRequest] = []
     application = FakeRuntimeApplication([])
-
-    def fake_start(*args, **kwargs):
-        calls.append(kwargs["request"])
-        return application
-
-    monkeypatch.setattr(
-        "mycode.application.startup.start_agent_application_session",
-        fake_start,
-    )
+    factory = install_fake_session_factory(monkeypatch, application)
     output_stream = io.StringIO()
 
     assert run_jsonl_runtime(
@@ -522,9 +523,9 @@ def test_machine_runtime_never_opens_session_menu(
         error_stream=io.StringIO(),
     ) == 0
 
-    assert len(calls) == 1
-    assert calls[0].mode == expected_mode
-    assert calls[0].session_id == expected_id
+    assert len(factory.requests) == 1
+    assert factory.requests[0].mode == expected_mode
+    assert factory.requests[0].session_id == expected_id
     assert "session>" not in output_stream.getvalue()
 
 
@@ -671,10 +672,7 @@ def test_jsonl_protocol_errors_are_structured_and_runtime_continues(
     monkeypatch,
 ) -> None:
     application = FakeRuntimeApplication([])
-    monkeypatch.setattr(
-        "mycode.application.startup.start_agent_application_session",
-        lambda *args, **kwargs: application,
-    )
+    install_fake_session_factory(monkeypatch, application)
     input_stream = io.StringIO(
         "{broken\n"
         '{"version":2,"type":"turn"}\n'

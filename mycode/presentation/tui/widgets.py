@@ -382,6 +382,30 @@ class PromptTextArea(TextArea):
             return
         self._refresh_picker(allow_open=True)
 
+    def _refresh_size(self) -> None:
+        """Keep the cursor inside the document before Textual measures it.
+
+        Textual's ``_undo_batch``/``_redo_batch`` shrink the document and call
+        this before they restore the selection, so undoing a large paste leaves
+        the cursor past the end of the document; the wrapped document then
+        raises ``ValueError`` while the scrollbar watcher asks where the cursor
+        is, which ends the whole app. The invalid window is transient, so
+        clamping here is enough and Textual still restores the selection itself
+        right after. Covered by ``test_undo_after_a_large_paste_does_not_crash``.
+        """
+        self._clamp_cursor_into_document()
+        super()._refresh_size()
+
+    def _clamp_cursor_into_document(self) -> None:
+        """Move a cursor that fell past the end of the document back inside."""
+        lines = self.document.lines
+        row, column = self.cursor_location
+        if row < len(lines):
+            return
+        row = max(len(lines) - 1, 0)
+        column = min(column, len(lines[row]))
+        self.move_cursor((row, column))
+
     def action_submit(self) -> None:
         """Submit the composed text and clear the composer."""
         self._submit(self.text)

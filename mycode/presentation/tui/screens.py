@@ -7,6 +7,7 @@ from collections.abc import Sequence
 from textual.css.query import NoMatches
 from textual.app import ComposeResult
 from textual.containers import Vertical
+from textual.events import Paste
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, LoadingIndicator, OptionList, Static
 from textual.widgets.option_list import Option
@@ -176,6 +177,22 @@ class MainScreen(Screen[None]):
         self, event: PromptTextArea.PickerChanged
     ) -> None:
         self.query_one(CommandPicker).render_state(event.state)
+
+    def _on_paste(self, event: Paste) -> None:
+        """Route a paste that reached the screen back into the prompt composer.
+
+        Textual forwards ``Paste`` to the focused widget and falls back to the
+        current screen when nothing is focused. Windows Terminal blurs the app
+        while its large-paste confirmation dialog is up, so a large paste is
+        delivered during that window and would otherwise land here and be
+        dropped. The composer stops the events it handles itself, so this only
+        sees pastes that would otherwise be lost.
+        """
+        prompt = self.query_one(PromptTextArea)
+        if prompt.disabled:
+            return
+        event.stop()
+        prompt.post_message(Paste(event.text))
 
 
 class MCPTrustScreen(ModalScreen[bool]):

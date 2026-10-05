@@ -73,7 +73,9 @@ from textual.widgets import OptionList
 from textual._xterm_parser import XTermParser
 
 
-async def _wait_for_child(pilot, screen, selector: str) -> Widget:
+async def _wait_for_child(
+    pilot, screen, selector: str | type[Widget]
+) -> Widget:
     """Wait until ``selector`` is mounted on ``screen``, then return it.
 
     Pushing or switching a screen is asynchronous: the screen becomes current
@@ -88,6 +90,19 @@ async def _wait_for_child(pilot, screen, selector: str) -> Widget:
         except NoMatches:
             continue
     raise AssertionError(f"{selector} was never mounted on {screen!r}")
+
+
+def _transcript_if_mounted(app) -> str | None:
+    """Return the conversation transcript, or ``None`` mid-screen-switch.
+
+    The same asynchronous switch means a query inside a wait loop can find a
+    screen whose children are not composed yet; that iteration simply is not
+    ready to be inspected.
+    """
+    try:
+        return app.screen.query_one(ConversationView).transcript_text
+    except NoMatches:
+        return None
 
 
 def run_async(coroutine):
@@ -1089,6 +1104,73 @@ def test_prompt_inserts_multiline_paste_as_one_edit(tmp_path) -> None:
     run_async(exercise())
 
 
+def test_undo_after_a_large_paste_does_not_crash(tmp_path) -> None:
+    """Undo must survive the window where the cursor is past the document end.
+
+    Textual shrinks the document and measures it before restoring the
+    selection, which makes the wrapped document raise ``ValueError`` and ends
+    the app. The composer clamps the cursor before that measurement.
+    """
+    pasted = "\n".join(f"line {index} " + "x" * 40 for index in range(220))
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main(app, pilot)
+            prompt, _ = _prompt_and_picker(app)
+            prompt.focus()
+            await pilot.pause()
+            app.post_message(Paste(pasted))
+            await pilot.pause()
+            assert prompt.text == pasted
+
+            await pilot.press("ctrl+z")
+            await pilot.pause()
+            assert prompt.text == ""
+
+            await pilot.press("ctrl+y")
+            await pilot.pause()
+            assert prompt.text == pasted
+
+    run_async(exercise())
+
+
+def test_paste_survives_a_blurred_window(tmp_path) -> None:
+    """A paste delivered while nothing is focused still reaches the composer.
+
+    Windows Terminal blurs the app while its large-paste confirmation dialog is
+    up, and Textual forwards ``Paste`` to the focused widget, falling back to
+    the current screen when nothing is focused. Without the screen forwarding it
+    on, a large paste is silently dropped.
+    """
+    pasted = "\n".join(f"line {index} " + "x" * 40 for index in range(200))
+
+    async def exercise() -> None:
+        app = _app(tmp_path)
+        async with app.run_test() as pilot:
+            await _open_main(app, pilot)
+            prompt, picker = _prompt_and_picker(app)
+
+            app.set_focus(None)
+            await pilot.pause()
+            assert app.focused is None
+
+            app.post_message(Paste(pasted))
+            await pilot.pause()
+            assert prompt.text == pasted
+            assert picker.is_open is False
+
+            # A disabled composer (turn running) must not swallow the paste.
+            prompt.clear()
+            prompt.disabled = True
+            await pilot.pause()
+            app.post_message(Paste("while disabled"))
+            await pilot.pause()
+            assert prompt.text == ""
+
+    run_async(exercise())
+
+
 def test_pasted_single_line_slash_does_not_open_the_picker(tmp_path) -> None:
     """Typing ``/co`` opens the picker; pasting the same text must not.
 
@@ -1142,11 +1224,11 @@ def test_pasted_command_text_still_runs_through_the_parser(
             await pilot.press("ctrl+enter")
             for _ in range(_TURN_WAIT_ITERATIONS):
                 await pilot.pause(0.02)
-                transcript = app.screen.query_one(ConversationView).transcript_text
-                if "estimated input" in transcript:
+                transcript = _transcript_if_mounted(app)
+                if transcript is not None and "estimated input" in transcript:
                     break
-            transcript = app.screen.query_one(ConversationView).transcript_text
-            assert "estimated input: 120 / 900 tokens" in transcript
+            conversation = await _wait_for_child(pilot, app.screen, ConversationView)
+            assert "estimated input: 120 / 900 tokens" in conversation.transcript_text
             assert calls == []
             assert prompt.text == ""
 
@@ -1506,10 +1588,11 @@ def test_tui_new_switches_after_target_session_is_ready(monkeypatch, tmp_path) -
             app.submit_user_message("/new")
             for _ in range(60):
                 await pilot.pause(0.02)
+                transcript = _transcript_if_mounted(app)
                 if (
                     app._application_session is target
-                    and "target question"
-                    in app.screen.query_one(ConversationView).transcript_text
+                    and transcript is not None
+                    and "target question" in transcript
                 ):
                     break
 
@@ -1517,8 +1600,10 @@ def test_tui_new_switches_after_target_session_is_ready(monkeypatch, tmp_path) -
             assert app._application_session is target
             assert current.close_count == 1
             assert target.close_count == 0
-            assert "target question" in app.screen.query_one(ConversationView).transcript_text
-            assert "Target session" in str(app.screen.query_one(HeaderBar).render())
+            conversation = await _wait_for_child(pilot, app.screen, ConversationView)
+            assert "target question" in conversation.transcript_text
+            header = await _wait_for_child(pilot, app.screen, HeaderBar)
+            assert "Target session" in str(header.render())
 
     run_async(exercise())
 
@@ -2707,10 +2792,11 @@ def test_tui_replacement_keeps_new_session_when_old_cleanup_fails(tmp_path) -> N
             )
             for _ in range(60):
                 await pilot.pause(0.02)
+                transcript = _transcript_if_mounted(app)
                 if (
                     app._application_session is replacement
-                    and "Old session cleanup warning"
-                    in app.screen.query_one(ConversationView).transcript_text
+                    and transcript is not None
+                    and "Old session cleanup warning" in transcript
                 ):
                     break
 
@@ -2718,9 +2804,8 @@ def test_tui_replacement_keeps_new_session_when_old_cleanup_fails(tmp_path) -> N
             assert app._application_session is replacement
             assert old.close_count == 1
             assert replacement.close_count == 0
-            assert "Old session cleanup warning" in app.screen.query_one(
-                ConversationView
-            ).transcript_text
+            conversation = await _wait_for_child(pilot, app.screen, ConversationView)
+            assert "Old session cleanup warning" in conversation.transcript_text
 
             app.submit_user_message("use replacement")
             for _ in range(60):

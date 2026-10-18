@@ -1,5 +1,6 @@
 import io
 import json
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -10,9 +11,17 @@ from mycode.adapters.jsonl import (
     JsonlMCPTrustConfirmer,
     JsonlProtocolError,
     run_jsonl_runtime,
+    serialize_agent_event,
     serialize_runtime_event,
 )
-from mycode.agent.events import AgentEvent
+from mycode.agent.events import AgentEvent, AgentToolCall
+from mycode.agent.runner import AgentRunner
+from mycode.llm_contracts import FakeLLMClient
+from mycode.model_events import ModelResponse
+from mycode.tools.base import PydanticTool, ToolArgs, ToolResult
+from mycode.tools.read_file import ReadFileTool
+from mycode.tools.registry import ToolRegistry
+from mycode.tools.workspace import Workspace
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.application.events import RuntimeEvent
 from mycode.application.agent_session import CompactResult, ContextStatus
@@ -41,6 +50,135 @@ def test_runtime_event_wraps_existing_agent_event_and_preserves_identity() -> No
         "turn_id": "turn-1",
         "event": {"type": "text_delta", "content": "hello"},
     }
+
+
+@pytest.mark.parametrize("call_id", [None, "call-123", ""])
+@pytest.mark.parametrize("ok", [True, False])
+def test_tool_result_serialization_adds_optional_call_id_without_changing_result(
+    call_id, ok,
+) -> None:
+    result = (
+        ToolResult.success("hello", metadata={"path": "demo.txt"})
+        if ok else ToolResult.failure("read failed", metadata={"path": "demo.txt"})
+    )
+    expected = {
+        "ok": result.ok,
+        "content": result.content,
+        "error": result.error,
+        "metadata": {"path": "demo.txt"},
+    }
+    if call_id is not None:
+        expected["tool_call_id"] = call_id
+
+    assert serialize_agent_event(AgentEvent(
+        type="tool_result", tool_result=result, tool_call_id=call_id,
+    )) == {"type": "tool_result", "tool_result": expected}
+
+
+@pytest.mark.parametrize("case", ["success", "missing_file", "invalid_args", "missing_tool"])
+def test_runner_file_tool_results_keep_call_id_through_jsonl(tmp_path, case) -> None:
+    (tmp_path / "demo.txt").write_text("hello\n", encoding="utf-8")
+    call = AgentToolCall(
+        id=f"call-{case}",
+        name="missing" if case == "missing_tool" else "read_file",
+        arguments={} if case == "invalid_args" else {
+            "path": "absent.txt" if case == "missing_file" else "demo.txt",
+        },
+    )
+    runner = AgentRunner(
+        llm_client=FakeLLMClient(responses=[], tool_responses=[
+            ModelResponse(tool_calls=[call]), ModelResponse(content="done"),
+        ]),
+        tool_registry=ToolRegistry.from_tools([ReadFileTool(Workspace(tmp_path))]),
+    )
+    events, messages = _run_runner_to_jsonl(runner)
+    result_event = next(event for event in events if event.type == "tool_result")
+    result = next(message["event"]["tool_result"] for message in messages
+                  if message["event"]["type"] == "tool_result")
+
+    assert result_event.tool_call_id == call.id
+    assert result["tool_call_id"] == call.id
+    assert result["ok"] is (case == "success")
+    if case == "success":
+        assert "hello" in result["content"]
+    else:
+        assert result["error"]
+    tool_message = next(message for message in runner.conversation.get_messages()
+                        if message.role == "tool")
+    assert tool_message.tool_call_id == call.id
+    assert events[-1].stop_reason == "final_answer"
+
+
+@pytest.mark.parametrize("first_fails", [False, True])
+def test_concurrent_same_name_results_keep_ids_when_second_finishes_first(first_fails) -> None:
+    second_finished = threading.Event()
+    completion_order = []
+
+    class OrderedArgs(ToolArgs):
+        label: str
+
+    class OrderedTool(PydanticTool[OrderedArgs]):
+        name = "ordered_read"
+        description = "Controlled concurrent read for association regression."
+        args_model = OrderedArgs
+        capability = "read"
+        risk = "low"
+        concurrency_safe = True
+
+        def _run(self, args: OrderedArgs) -> ToolResult:
+            if args.label == "first":
+                if not second_finished.wait(timeout=5):
+                    raise RuntimeError("second call did not run concurrently")
+                completion_order.append("first")
+                if first_fails:
+                    raise RuntimeError("first read failed")
+            else:
+                completion_order.append("second")
+                second_finished.set()
+            return ToolResult.success(args.label)
+
+    calls = [AgentToolCall(id=f"call-{label}", name="ordered_read", arguments={"label": label})
+             for label in ("first", "second")]
+    runner = AgentRunner(
+        llm_client=FakeLLMClient(responses=[], tool_responses=[
+            ModelResponse(tool_calls=calls), ModelResponse(content="done"),
+        ]),
+        tool_registry=ToolRegistry.from_tools([OrderedTool()]),
+    )
+    events, messages = _run_runner_to_jsonl(runner)
+    results = [message["event"]["tool_result"] for message in messages
+               if message["event"]["type"] == "tool_result"]
+
+    assert completion_order == ["second", "first"]
+    assert [event.tool_call_id for event in events if event.type == "tool_result"] == [
+        call.id for call in calls
+    ]
+    assert [result["tool_call_id"] for result in results] == [call.id for call in calls]
+    assert results[0]["ok"] is not first_fails
+    if first_fails:
+        assert "first read failed" in results[0]["error"]
+    else:
+        assert results[0]["content"] == "first"
+    assert results[1]["ok"] is True
+    assert results[1]["content"] == "second"
+    assert [message["event"]["tool_call"]["id"] for message in messages
+            if message["event"]["type"] == "tool_call"] == [call.id for call in calls]
+    assert events[-1].stop_reason == "final_answer"
+
+
+def _run_runner_to_jsonl(runner):
+    output = io.StringIO()
+    channel = JsonlChannel(io.StringIO(), output)
+    events = []
+    for event in runner.run("read the requested files"):
+        events.append(event)
+        channel.emit(serialize_runtime_event(RuntimeEvent(
+            type="agent", turn_id="turn-tools", agent_event=event,
+        )))
+    messages = [json.loads(line) for line in output.getvalue().splitlines()]
+    assert all(message["version"] == 1 and message["turn_id"] == "turn-tools"
+               for message in messages)
+    return events, messages
 
 
 def test_runtime_event_serializes_ready_status_and_outcome() -> None:

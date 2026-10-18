@@ -561,7 +561,10 @@ def serialize_agent_event(event: AgentEvent) -> dict[str, object]:
     if event.tool_call is not None:
         payload["tool_call"] = _serialize_tool_call(event.tool_call)
     if event.tool_result is not None:
-        payload["tool_result"] = _serialize_tool_result(event.tool_result)
+        result_payload = _serialize_tool_result(event.tool_result)
+        if event.tool_call_id is not None:
+            result_payload["tool_call_id"] = event.tool_call_id
+        payload["tool_result"] = result_payload
     if event.stop_reason is not None:
         payload["stop_reason"] = event.stop_reason
     if event.error is not None:

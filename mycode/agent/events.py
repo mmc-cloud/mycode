@@ -106,3 +106,4 @@ class AgentEvent:
     error: str | None = None
     reasoning_content: str = field(default="", repr=False)
     reasoning_state: ReasoningState = field(default="absent", repr=False)
+    tool_call_id: str | None = None

@@ -71,6 +71,7 @@ def test_agent_event_can_represent_text_delta() -> None:
     assert event.content == "hello"
     assert event.tool_call is None
     assert event.tool_result is None
+    assert event.tool_call_id is None
     assert event.stop_reason is None
     assert event.error is None
 
@@ -120,10 +121,11 @@ def test_agent_event_can_represent_tool_result() -> None:
         metadata={"path": "README.md"},
     )
 
-    event = AgentEvent(type="tool_result", tool_result=result)
+    event = AgentEvent(type="tool_result", tool_result=result, tool_call_id="call_123")
 
     assert event.type == "tool_result"
     assert event.tool_result == result
+    assert event.tool_call_id == "call_123"
 
 
 def test_agent_event_can_represent_stop() -> None:

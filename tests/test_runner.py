@@ -1251,6 +1251,7 @@ def test_runner_streams_tool_call_tool_result_and_second_model_answer() -> None:
         tool_call_event,
         AgentEvent(
             type="tool_result",
+            tool_call_id=tool_call.id,
             tool_result=ToolResult.success(
                 content="fake result: hello",
                 metadata={"text": "hello"},
@@ -1463,6 +1464,7 @@ def test_runner_stream_honors_custom_tool_batch_stop_response() -> None:
 
     assert events[-3] == AgentEvent(
         type="tool_result",
+        tool_call_id=tool_call.id,
         tool_result=ToolResult.success(
             content="fake result: hello",
             metadata={"text": "hello"},

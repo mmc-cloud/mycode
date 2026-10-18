@@ -927,7 +927,11 @@ class AgentRunner:
         results: dict[str, tuple[str, str]] = {}
         externalized_count = 0
         for execution in batch.executions:
-            yield AgentEvent(type="tool_result", tool_result=execution.result)
+            yield AgentEvent(
+                type="tool_result",
+                tool_result=execution.result,
+                tool_call_id=execution.tool_call.id,
+            )
             content = format_tool_result(execution.result)
             persisted_content = self._tool_result_content(execution, content=content)
             for warning in self._drain_artifact_warnings():

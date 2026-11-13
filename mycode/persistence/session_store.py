@@ -398,6 +398,26 @@ class WritableSession:
                 self.storage.project_directory, self.layout.compact_path, state.model_dump(mode="json"),
             )
 
+    def load_model_selection(self):
+        from mycode.model_selection import ModelSelection
+        with self._mutex, _storage_errors():
+            self._check_open()
+            path = self.layout.root / "model-selection.json"
+            if not path.exists() and not path.is_symlink():
+                return None
+            try:
+                return ModelSelection.model_validate(read_json_snapshot(self.storage.project_directory, path))
+            except Exception:
+                raise SessionDataError("Session model selection is invalid; the snapshot was preserved.") from None
+
+    def save_model_selection(self, selection):
+        from mycode.model_selection import ModelSelection
+        with self._mutex, _storage_errors():
+            self._check_open()
+            validated = ModelSelection.model_validate(selection)
+            write_json_snapshot(self.storage.project_directory,
+                                self.layout.root / "model-selection.json", validated.model_dump())
+
     def load_or_reset_compact_state(self) -> CompactStateLoadResult:
         with self._mutex, _storage_errors():
             self._check_open()

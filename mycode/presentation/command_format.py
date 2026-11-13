@@ -38,11 +38,6 @@ def format_session_list(
 
 
 def format_context_status(status: ContextStatus) -> tuple[str, ...]:
-    percent = (
-        0.0
-        if status.max_input_tokens < 1
-        else status.estimated_input_tokens / status.max_input_tokens * 100
-    )
     provider = (
         "unavailable"
         if status.last_provider_prompt_tokens is None
@@ -59,10 +54,14 @@ def format_context_status(status: ContextStatus) -> tuple[str, ...]:
     )
     return (
         "Context",
-        "estimated input: "
-        f"{status.estimated_input_tokens:,} / "
-        f"{status.max_input_tokens:,} tokens ({percent:.1f}%)",
+        f"estimated input: ~{status.estimated_input_tokens:,} tokens",
+        f"context occupancy: ~{status.estimated_input_tokens:,} / "
+        f"{status.context_window_tokens:,} tokens ({status.context_window_percent:.1f}%)",
+        f"input budget: ~{status.estimated_input_tokens:,} / "
+        f"{status.max_input_tokens:,} tokens ({status.input_budget_percent:.1f}%)",
         f"context window: {status.context_window_tokens:,}",
+        f"window source: {status.context_window_source} (" + (
+            f"API limit={status.context_window_server_limit})" if status.context_window_server_limit is not None else "unverified)"),
         f"reserved output: {status.reserved_output_tokens:,}",
         f"safety margin: {status.safety_margin_tokens:,}",
         f"estimate source: {status.estimate_source}",
@@ -77,6 +76,16 @@ def format_context_status(status: ContextStatus) -> tuple[str, ...]:
         "tool results: "
         f"{status.compressed_tool_result_count} compressed",
     )
+
+
+def format_context_summary(status: ContextStatus) -> str:
+    def short(tokens):
+        if tokens >= 1_000_000:
+            return f"{tokens / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+        if tokens >= 1000:
+            return f"{tokens / 1000:.1f}".rstrip("0").rstrip(".") + "K"
+        return str(tokens)
+    return f"~{short(status.estimated_input_tokens)} / {short(status.context_window_tokens)} ({status.context_window_percent:.1f}%)"
 
 
 def format_compact_result(result: CompactResult) -> str:

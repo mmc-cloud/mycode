@@ -11,6 +11,7 @@ from textual.message import Message
 from textual.widgets import Static, TextArea
 
 from mycode.presentation.commands import COMMAND_SPECS, CommandSpec
+from mycode.presentation.command_format import format_context_summary
 
 
 SPLASH_LOGO = r"""        ╭──────────╮
@@ -197,6 +198,10 @@ class HeaderBar(Static):
         self._session = value or "—"
         self._refresh()
 
+    def set_model(self, value: str) -> None:
+        self._model = value or "—"
+        self._refresh()
+
     def _refresh(self) -> None:
         self.update(
             Text(
@@ -209,10 +214,22 @@ class HeaderBar(Static):
 
 class StatusBar(Static):
     def __init__(self, value: str = "UI Ready", *args, **kwargs) -> None:
-        super().__init__(value, *args, **kwargs)
+        self.status = value
+        self._context_summary = ""
+        super().__init__(Text(value), *args, **kwargs)
 
     def set_status(self, value: str) -> None:
-        self.update(Text(value))
+        self.status = value
+        self._refresh()
+
+    def set_context(self, context) -> None:
+        if context is None:
+            return  # Keep the last successful snapshot when inspection fails.
+        self._context_summary = format_context_summary(context)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self.update(Text(self.status + (f"   ·   {self._context_summary}" if self._context_summary else "")))
 
 
 @dataclass(frozen=True)

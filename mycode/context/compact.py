@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import math
@@ -16,6 +16,7 @@ from mycode.context.budget import (
 )
 from mycode.conversation import Conversation
 from mycode.messages import Message
+from mycode.model_activity import model_operation
 from mycode.model_events import TokenUsage
 from mycode.model_projection import project_model_message
 from mycode.observability import ObservationSink, emit_observation
@@ -157,7 +158,11 @@ class ConversationCompactor:
     observability_sink: ObservationSink | None = None
     observability_scope: str = "compact"
     observability_run_id: str | None = None
+    summary_budget: ContextBudget | None = None
+    summary_token_estimator: TokenEstimator = field(default_factory=TokenEstimator, repr=False)
+    model_activity: object | None = field(default=None, repr=False)
 
+    @model_operation("compact")
     def prepare(
         self,
         conversation: Conversation,
@@ -241,8 +246,8 @@ class ConversationCompactor:
             prompt = _summary_prompt(boundary, candidate.messages_to_summarize)
             prompt_estimate = estimate_conversation(
                 prompt,
-                budget,
-                token_estimator=token_estimator,
+                self.summary_budget if self.summary_budget is not None else budget,
+                token_estimator=self.summary_token_estimator,
             )
             if prompt_estimate.over_budget:
                 raise RuntimeError(
@@ -252,6 +257,7 @@ class ConversationCompactor:
             model_call_started = True
             response = self.llm_client.complete(prompt)
             attempt_usage = _last_token_usage(self.llm_client)
+            self.summary_token_estimator.observe(prompt_estimate, attempt_usage)
             self._emit_model_response(
                 response.content,
                 turn=observability_turn,

@@ -7,8 +7,10 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TextIO
+from typing import Annotated, Literal, TextIO
 from uuid import uuid4
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from mycode.agent.events import (
     AgentEvent,
@@ -33,6 +35,7 @@ from mycode.permissions import (
     ConfirmationResult,
     Confirmer,
 )
+from mycode.persistence.connection_store import ConnectionStoreError
 from mycode.persistence.session_store import (
     SessionInUseError,
     SessionNotFoundError,
@@ -44,6 +47,64 @@ from mycode.tools.base import ToolResult
 
 JSONL_PROTOCOL_VERSION = 1
 _PERMISSION_DECISIONS = {"once", "task", "session", "reject"}
+
+
+class ModelMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    version: Literal[1]
+    type: Literal["model"]
+    request_id: str = Field(min_length=1, max_length=200)
+    action: Literal["status", "set", "default", "clear_default"] = "status"
+    role: Literal["main", "subagent", "compact"] | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    connection: str | None = Field(default=None, min_length=1, max_length=200)
+    thinking: Literal["auto", "on", "off"] | None = None
+    effort: Literal["auto", "low", "high", "max"] | None = None
+    window: int | None = Field(default=None, ge=1)
+    reserve: int | None = Field(default=None, ge=0)
+    margin: int | None = Field(default=None, ge=0)
+    output: Annotated[int, Field(ge=1)] | Literal["auto"] | None = None
+
+    @model_validator(mode="after")
+    def action_fields(self):
+        parameters = self.model_fields_set - {"version", "type", "request_id", "action"}
+        if self.action == "set":
+            if self.role is None or "model" not in parameters:
+                raise ValueError("set requires role and model (null follows Main).")
+        elif parameters:
+            raise ValueError("Only set accepts model parameters.")
+        return self
+
+
+class ConnectMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True, hide_input_in_errors=True)
+    version: Literal[1]
+    type: Literal["connect"]
+    request_id: str = Field(min_length=1, max_length=200)
+    action: Literal["list", "add", "edit", "delete", "default", "models", "use"] = "list"
+    id: str | None = Field(default=None, min_length=1, max_length=200)
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    base_url: str | None = Field(default=None, min_length=1)
+    api_key: str | None = Field(default=None, min_length=1, repr=False)
+    headers: dict[str, str] | None = Field(default=None, repr=False)
+
+    @model_validator(mode="after")
+    def action_fields(self):
+        fields = self.model_fields_set - {"version", "type", "request_id", "action"}
+        allowed = ({"id", "base_url", "api_key", "headers"} if self.action in {"add", "edit"}
+                   else {"id", "model"} if self.action == "use"
+                   else set() if self.action == "list" else {"id"})
+        if fields - allowed or (self.action != "list" and self.id is None):
+            raise ValueError("Invalid fields for connection action.")
+        if self.action == "add" and (self.base_url is None or self.api_key is None):
+            raise ValueError("add requires base_url and api_key.")
+        if self.action == "edit" and not fields & {"base_url", "api_key", "headers"}:
+            raise ValueError("edit requires connection parameters.")
+        if self.action == "use" and self.model is None:
+            raise ValueError("use requires model.")
+        if any(getattr(self, name) is None for name in fields - {"id"}):
+            raise ValueError("Connection parameters cannot be null.")
+        return self
 
 
 class JsonlProtocolError(ValueError):
@@ -134,6 +195,9 @@ class JsonlConfirmer(Confirmer):
                     message="Permission confirmation unavailable.",
                     metadata={"input": "eof"},
                 )
+            if message.get("type") in {"model", "connect"}:
+                _management_error(self.channel, message, "runtime_busy", "Wait for the active request to finish.")
+                continue
             if message.get("type") != "permission_response":
                 self._protocol_error(
                     "unexpected_message",
@@ -195,6 +259,9 @@ class JsonlMCPTrustConfirmer:
                 continue
             if message is None:
                 return False
+            if message.get("type") in {"model", "connect"}:
+                _management_error(self.channel, message, "runtime_busy", "Wait for startup to finish.")
+                continue
             if message.get("type") != "mcp_trust_response":
                 self._protocol_error(
                     "unexpected_message",
@@ -354,13 +421,84 @@ def _run_message_loop(
         if message_type == "compact":
             _run_compact_message(channel, application_session)
             continue
+        if message_type in {"model", "connect"}:
+            _run_management_message(channel, application_session, message)
+            continue
         channel.emit(
             {
                 "type": "runtime_error",
                 "code": "unexpected_message",
-                "message": "Expected turn, context_status, compact, or close.",
+                "message": "Expected turn, context_status, compact, model, connect, or close.",
             }
         )
+
+
+def _management_error(channel, message, code, detail):
+    request_id = message.get("request_id")
+    channel.emit({"type": message["type"] + "_result",
+                  "request_id": request_id if isinstance(request_id, str) else None,
+                  "ok": False, "error": {"code": code, "message": detail}})
+
+
+def _model_state(manager):
+    roles = {}
+    for role in ("main", "subagent", "compact"):
+        config = manager.runner.model_configuration.resolve(role)
+        window = manager.windows[role]
+        roles[role] = {
+            "selection": getattr(manager.selection, role).model_dump(exclude={"window_binding"}),
+            "connection": manager.selection.identity(role)[0], "model": config.model,
+            "thinking": config.thinking_enabled, "effort": config.reasoning_effort,
+            "window": window.tokens, "window_source": window.source,
+            "server_limit": window.server_limit, "reserve": config.reserved_output_tokens,
+            "margin": config.context_safety_margin_tokens, "output": config.max_output_tokens,
+        }
+    return roles
+
+
+def _run_management_message(channel, application_session, message):
+    try:
+        request = (ModelMessage if message["type"] == "model" else ConnectMessage).model_validate(message)
+        manager = application_session.models
+        if isinstance(request, ModelMessage):
+            if request.action == "set":
+                options = request.model_dump(include=request.model_fields_set - {
+                    "version", "type", "request_id", "action", "role", "model"})
+                manager.select_model(request.role, request.model, **options)
+            elif request.action in {"default", "clear_default"}:
+                manager.command("model", ("default", "clear") if request.action == "clear_default" else ("default",))
+            data = {"roles": _model_state(manager)}
+        elif request.action == "models":
+            rows = manager.discover_models(request.id)
+            data = {"models": rows or [], "available": rows is not None,
+                    "warning": "model_list_unavailable" if rows is None else None}
+        else:
+            if request.action == "use":
+                manager.select_model("main", request.model, connection=request.id)
+            elif request.action != "list":
+                values = request.model_dump(include={"base_url", "api_key", "headers"}, exclude_unset=True)
+                manager.command("connect", (request.action, request.id), values=values)
+            doc = manager.store.read()
+            data = {"default_connection": (doc.default_models.main.connection_ref
+                        if doc.default_models is not None else doc.default_ref or "env"),
+                    "connections": [{"id": "env", "read_only": True}, *(
+                        {"id": key, "base_url": value.base_url, "read_only": False}
+                        for key, value in sorted(doc.connections.items()))]}
+    except ValidationError:
+        _management_error(channel, message, "invalid_parameters", "Invalid fields or parameter types for this action.")
+        return
+    except ConnectionStoreError as error:
+        # These domain errors already contain credential-free user messages.
+        _management_error(channel, message, "configuration_rejected", str(error))
+        return
+    except ValueError:
+        _management_error(channel, message, "configuration_rejected", "Check connection references, model parameters, storage and history budgets.")
+        return
+    except Exception:  # Adapter boundary: SDK/validation exceptions may contain credentials.
+        _management_error(channel, message, "operation_failed", "Operation failed; retry when idle and check connection/storage availability.")
+        return
+    channel.emit({"type": request.type + "_result", "request_id": request.request_id,
+                  "ok": True, "action": request.action, **data})
 
 
 def _run_turn_message(

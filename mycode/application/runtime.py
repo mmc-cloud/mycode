@@ -17,7 +17,8 @@ from mycode.context.budget import ContextBudget
 from mycode.context.compact import CompactState, ConversationCompactor
 from mycode.conversation import Conversation
 from mycode.instructions import load_instruction_bundle
-from mycode.providers.openai_compatible import OpenAICompatibleLLMClient
+from mycode.model_config import ModelConfiguration
+from mycode.providers.factory import ModelClientFactory
 from mycode.memory import MemoryStore
 from mycode.memory_context import MemoryContextSelector, MemoryRecallPolicy
 from mycode.messages import Message
@@ -54,6 +55,7 @@ def build_agent_runner(
     memory_store: MemoryStore | None = None,
     subagent_observer: SubAgentObserver | None = None,
     llm_config: LLMConfig | None = None,
+    model_configuration: ModelConfiguration | None = None,
     llm_session_id: str | None = None,
     observability_sink: ObservationSink | None = None,
 ) -> AgentRunner:
@@ -72,40 +74,33 @@ def build_agent_runner(
         skill_registry = SkillRegistry.discover(workspace.root)
         active_skill_state = ActiveSkillState()
     with startup_profile.span("runner.config"):
-        config = (
-            load_llm_config(workspace_root=workspace.root)
-            if llm_config is None
-            else llm_config
-        )
+        if model_configuration is not None and llm_config is not None:
+            raise ValueError("Supply either llm_config or model_configuration, not both.")
+        models = model_configuration
+        if models is None:
+            config = load_llm_config(workspace_root=workspace.root) if llm_config is None else llm_config
+            models = ModelConfiguration.from_config(config)
+        config = models.resolve("main")
     with startup_profile.span("runner.llm_client"):
         effective_llm_session_id = llm_session_id or uuid4().hex
-        client = OpenAICompatibleLLMClient(
-            config=config,
-            session_id=effective_llm_session_id,
-        )
-        summary_client = OpenAICompatibleLLMClient(
-            config=config,
-            model=config.compact_model,
-            thinking_enabled=False,
-            session_id=effective_llm_session_id,
-        )
+        client_factory = ModelClientFactory(models, effective_llm_session_id)
+        client = client_factory.create("main")
+        summary_client = client_factory.create("compact")
     with startup_profile.span("runner.budget"):
         context_budget = context_budget_from_config(config)
+        subagent_budget = context_budget_from_config(client_factory.config_for("subagent"))
+        compact_budget = context_budget_from_config(client_factory.config_for("compact"))
         memory_recall_policy = MemoryRecallPolicy(
             max_tokens=config.memory_context_tokens,
         )
     with startup_profile.span("runner.subagent_runtime"):
         subagent_runtime = SubAgentRuntime(
             workspace=workspace,
-            llm_client_factory=lambda: OpenAICompatibleLLMClient(
-                config=config,
-                model=config.subagent_model,
-                session_id=effective_llm_session_id,
-            ),
+            llm_client_factory=lambda: client_factory.create("subagent"),
             confirmer=confirmer,
             memory_store=effective_memory_store,
             memory_recall_policy=memory_recall_policy,
-            context_budget=context_budget,
+            context_budget=subagent_budget,
             observability_sink=observability_sink,
         )
     with startup_profile.span("runner.conversation"):
@@ -166,7 +161,7 @@ def build_agent_runner(
         )
 
     with startup_profile.span("runner.finalize"):
-        return AgentRunner(
+        runner = AgentRunner(
             llm_client=client,
             tool_registry=tool_registry,
             conversation=conversation,
@@ -186,6 +181,7 @@ def build_agent_runner(
             tool_batch_handler=DelegationToolBatchHandler(),
             compactor=ConversationCompactor(
                 llm_client=summary_client,
+                summary_budget=compact_budget,
                 state=CompactState() if compact_state is None else compact_state,
                 on_state_changed=on_compact_state_changed,
                 observability_sink=observability_sink,
@@ -195,6 +191,8 @@ def build_agent_runner(
             observability_sink=observability_sink,
             observability_scope="main",
         )
+        runner.model_configuration = models
+        return runner
 
 
 def run_agent_turn(

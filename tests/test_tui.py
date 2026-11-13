@@ -1,5 +1,5 @@
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from threading import Event, Thread, get_ident
@@ -70,6 +70,8 @@ from textual.css.query import NoMatches
 from textual.events import Key, Paste
 from textual.widget import Widget
 from textual.widgets import OptionList
+from textual.widgets import Input, Button, Select
+from mycode.presentation.tui.screens import ModelSettingsScreen
 from textual._xterm_parser import XTermParser
 
 
@@ -122,6 +124,205 @@ def test_tui_cli_route_starts_tui(monkeypatch) -> None:
     assert calls == [True]
 
 
+def test_tui_connection_editor_masks_secrets_and_saves_without_agent_turn(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    async def exercise():
+        app = _app(tmp_path)
+        async with app.run_test(size=(110, 45)) as pilot:
+            await _open_main_with_session(app, pilot)
+            await _wait_for_child(pilot, app.screen, PromptTextArea)
+            session = app._application_session
+            before = session.runner.conversation.get_messages()
+            app.submit_user_message("/connect add alternate")
+            await _wait_for_child(pilot, app.screen, "#setting-api_key")
+            assert isinstance(app.screen, ModelSettingsScreen)
+            key = app.screen.query_one("#setting-api_key", Input)
+            assert key.password is True
+            key.value = "synthetic-ui-secret"
+            app.screen.query_one("#setting-base_url", Input).value = "https://alternate.example/v1"
+            app.screen.query_one("#setting-headers", Input).value = '{"X-Private":"synthetic-ui-header"}'
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(100):
+                await pilot.pause(0.03)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert not app._command_worker_active
+            transcript = app.screen.query_one(ConversationView).transcript_text
+            assert "Connection saved" in transcript
+            assert "synthetic-ui-secret" not in transcript
+            assert "synthetic-ui-header" not in transcript
+            assert session.runner.conversation.get_messages() == before
+            assert session.models.store.read().connections["alternate"].api_key == "synthetic-ui-secret"
+    run_async(exercise())
+
+
+def test_tui_model_editor_updates_same_runtime_and_persists_selection(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    async def exercise():
+        app = _app(tmp_path)
+        async with app.run_test(size=(110, 55)) as pilot:
+            await _open_main_with_session(app, pilot)
+            await _wait_for_child(pilot, app.screen, PromptTextArea)
+            session = app._application_session
+            runner, conversation = session.runner, session.runner.conversation
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            app.screen.query_one("#setting-model", Input).value = "selected-model"
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(100):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert session.runner is runner and runner.conversation is conversation
+            assert runner.llm_client.model == "selected-model"
+            assert session.active_project_session.writer.load_model_selection().main.model == "selected-model"
+            assert "selected-model" in str(app.screen.query_one(HeaderBar).render())
+    run_async(exercise())
+
+
+def test_tui_model_editor_loads_current_values_and_noop_preserves_thinking(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    async def exercise():
+        app = _app(tmp_path)
+        async with app.run_test(size=(110, 55)) as pilot:
+            await _open_main_with_session(app, pilot)
+            await _wait_for_child(pilot, app.screen, PromptTextArea)
+            session = app._application_session
+            session.models.command("model", ("main", "configured", "thinking=on", "effort=max",
+                                               "window=64000", "reserve=4096", "margin=2048", "output=1000"))
+            before = session.models.selection
+            client = session.runner.llm_client
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            assert app.screen.query_one("#setting-model", Input).value == "configured"
+            assert app.screen.query_one("#setting-thinking", Select).value == "on"
+            assert app.screen.query_one("#setting-effort", Input).value == "max"
+            assert app.screen.query_one("#setting-window", Input).value == "64000"
+            assert app.screen.query_one("#setting-output", Input).value == "1000"
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert session.models.selection is before
+            assert session.runner.llm_client is client
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            app.screen.query_one("#setting-window", Input).value = "60000"
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(80):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert session.runner.context_budget.context_window_tokens == 60000
+            assert session.runner.llm_client.thinking_enabled is True
+            assert session.runner.llm_client.reasoning_effort == "max"
+            assert session.runner.llm_client.config.max_output_tokens == 1000
+    run_async(exercise())
+
+
+def test_tui_role_editor_loads_each_role_and_preserves_drafts(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    async def exercise():
+        app = _app(tmp_path)
+        async with app.run_test(size=(110, 55)) as pilot:
+            await _open_main_with_session(app, pilot)
+            await _wait_for_child(pilot, app.screen, PromptTextArea)
+            session = app._application_session
+            session.models.command("model", ("subagent", "worker", "thinking=off", "window=16000",
+                                               "reserve=2000", "margin=1000"))
+            session.models.command("model", ("compact", "summary", "thinking=on", "effort=high"))
+            before = session.models.selection
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            app.screen.query_one("#setting-role", Select).value = "subagent"
+            await pilot.pause()
+            assert app.screen.query_one("#setting-model", Input).value == "worker"
+            assert app.screen.query_one("#setting-thinking", Select).value == "off"
+            assert app.screen.query_one("#setting-window", Input).value == "16000"
+            app.screen.query_one("#setting-model", Input).value = "draft-worker"
+            app.screen.query_one("#setting-role", Select).value = "compact"
+            await pilot.pause()
+            assert app.screen.query_one("#setting-model", Input).value == "summary"
+            assert app.screen.query_one("#setting-thinking", Select).value == "on"
+            assert app.screen.query_one("#setting-effort", Input).value == "high"
+            app.screen.query_one("#setting-role", Select).value = "subagent"
+            await pilot.pause()
+            assert app.screen.query_one("#setting-model", Input).value == "draft-worker"
+            assert app.screen.query_one("#setting-thinking", Select).value == "off"
+            app.screen.query_one("#settings-cancel", Button).press()
+            await pilot.pause()
+            assert session.models.selection is before
+    run_async(exercise())
+
+
+def test_tui_model_change_does_not_submit_untouched_old_window(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    async def exercise():
+        app = _app(tmp_path)
+        async with app.run_test(size=(110, 55)) as pilot:
+            await _open_main_with_session(app, pilot)
+            await _wait_for_child(pilot, app.screen, PromptTextArea)
+            session = app._application_session
+            session.models.command("model", ("main", "first", "window=64000", "thinking=on", "effort=max"))
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            assert app.screen.query_one("#setting-window", Input).value == "64000"
+            app.screen.query_one("#setting-model", Input).value = "second"
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(80):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert session.runner.llm_client.model == "second"
+            assert session.runner.llm_client.thinking_enabled is True
+            assert session.runner.llm_client.reasoning_effort == "max"
+            assert session.runner.context_budget.context_window_tokens == 128000
+            assert "/ 128K (" in str(app.screen.query_one(StatusBar).render())
+            session.models.command("model", ("main", "first"))
+            assert session.runner.context_budget.context_window_tokens == 64000
+    run_async(exercise())
+
+
+def test_tui_env_thinking_save_keeps_current_api_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "user")
+    async def exercise():
+        config = LLMConfig(api_key="synthetic", base_url="https://example.com/v1",
+                           model="legacy-model", thinking_enabled=True)
+        app = MyCodeTuiApp(workspace_path=tmp_path, session_store=SessionStore(tmp_path / "projects"),
+                           llm_config=config, mcp_config=MCPConfig())
+        async with app.run_test(size=(110, 55)) as pilot:
+            await _open_main_with_session(app, pilot)
+            await _wait_for_child(pilot, app.screen, PromptTextArea)
+            session = app._application_session
+            selected, client = session.models.selection, session.runner.llm_client
+            assert selected.main.effort == "auto"
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            assert app.screen.query_one("#setting-thinking", Select).value == "on"
+            assert app.screen.query_one("#setting-effort", Input).value == "auto"
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(40):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert session.models.selection is selected
+            assert session.runner.llm_client is client
+            assert client.reasoning_effort is None
+            app.submit_user_message("/model edit")
+            await _wait_for_child(pilot, app.screen, "#setting-model")
+            app.screen.query_one("#setting-window", Input).value = "64000"
+            app.screen.query_one("#settings-save", Button).press()
+            for _ in range(80):
+                await pilot.pause(0.02)
+                if isinstance(app.screen, MainScreen) and not app._command_worker_active:
+                    break
+            assert session.runner.context_budget.context_window_tokens == 64000
+            assert session.runner.llm_client.thinking_enabled is True
+            assert session.runner.llm_client.reasoning_effort is None
+    run_async(exercise())
+
+
 def test_tui_help_does_not_start_app(monkeypatch, capsys) -> None:
     monkeypatch.setattr(
         "mycode.cli.run_tui",
@@ -136,6 +337,91 @@ def test_tui_help_does_not_start_app(monkeypatch, capsys) -> None:
     assert "usage: mycode tui" in captured.out
     assert "启动 MyCode Textual TUI" in captured.out
     assert captured.err == ""
+
+
+def test_context_formats_total_window_and_safe_budget_as_distinct_denominators():
+    from mycode.presentation.command_format import format_context_status, format_context_summary
+    status = _fake_session().get_context_status()
+    lines = format_context_status(status)
+    assert "context occupancy: ~120 / 1,000 tokens (12.0%)" in lines
+    assert "input budget: ~120 / 900 tokens (13.3%)" in lines
+    assert format_context_summary(status) == "~120 / 1K (12.0%)"
+    assert "last provider prompt: unavailable" in lines
+    status = replace(status, estimated_input_tokens=53000, context_window_tokens=1000000, max_input_tokens=900000)
+    assert format_context_summary(status) == "~53K / 1M (5.3%)"
+
+
+def test_status_bar_updates_after_turn_compact_and_resume_without_overwriting_status(monkeypatch, tmp_path):
+    fake = _fake_session()
+    current = fake.get_context_status()
+    reads = []
+    def inspect():
+        reads.append(get_ident())
+        return current
+    def turn(content, **kwargs):
+        nonlocal current
+        current = replace(current, estimated_input_tokens=420, last_provider_prompt_tokens=100)
+        for _ in range(20):
+            kwargs["event_handler"](RuntimeEvent(type="agent", turn_id=kwargs.get("turn_id"),
+                agent_event=AgentEvent(type="text_delta", content="chunk ")))
+        return AgentRunOutcome.from_stop_reason("final_answer")
+    def compact():
+        nonlocal current
+        before = current
+        current = replace(current, estimated_input_tokens=42, compact_status="active")
+        return CompactResult("compacted", None, before, current)
+    fake.get_context_status, fake.run_turn, fake.compact_context = inspect, turn, compact
+    target = _FakeApplicationSession(fake.history, session_id="target", title="Resumed session")
+    target.get_context_status = lambda: replace(current, estimated_input_tokens=240, context_window_tokens=2000)
+    sessions = iter((fake, target))
+    monkeypatch.setattr("mycode.application.startup.start_agent_application_session", lambda *args, **kwargs: next(sessions))
+    async def exercise():
+        app = _app(tmp_path)
+        async with app.run_test(size=(110, 55)) as pilot:
+            await _open_main_with_session(app, pilot)
+            bar = app.screen.query_one(StatusBar)
+            assert "~120 / 1K (12.0%)" in str(bar.render())
+            app.submit_user_message("go")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if app._active_turn_id is None:
+                    break
+            assert "~420 / 1K (42.0%)" in str(bar.render())
+            assert all(thread != app._thread_id for thread in reads)
+            assert len(reads) == 2  # Startup + turn completion, never one inspection per delta.
+            previous = str(bar.render())
+            def failed_context():
+                raise RuntimeError("inspection unavailable")
+            fake.get_context_status = failed_context
+            app.submit_user_message("/context")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if not app._command_worker_active:
+                    break
+            assert str(bar.render()) == previous
+            fake.get_context_status = inspect
+            app.submit_user_message("/compact")
+            for _ in range(60):
+                await pilot.pause(0.02)
+                if not app._command_worker_active:
+                    break
+            assert "~42 / 1K (4.2%)" in str(bar.render())
+            app._set_status("Waiting for permission…")
+            app._set_context_status(replace(current, estimated_input_tokens=50))
+            assert bar.status == app._current_status_text() == "Waiting for permission…"
+            assert str(bar.render()).count("~50") == 1
+            app._set_status("Fatal error")
+            app._set_context_status(current)
+            assert bar.status == "Fatal error"
+            app._set_status("Ready")
+            app.submit_user_message("/resume target")
+            for _ in range(80):
+                await pilot.pause(0.02)
+                if app._application_session is target and isinstance(app.screen, MainScreen):
+                    break
+            await _wait_for_child(pilot, app.screen, StatusBar)
+            assert "~240 / 2K (12.0%)" in str(app.screen.query_one(StatusBar).render())
+    run_async(exercise())
 
 
 def _llm_config() -> LLMConfig:
@@ -1228,7 +1514,7 @@ def test_pasted_command_text_still_runs_through_the_parser(
                 if transcript is not None and "estimated input" in transcript:
                     break
             conversation = await _wait_for_child(pilot, app.screen, ConversationView)
-            assert "estimated input: 120 / 900 tokens" in conversation.transcript_text
+            assert "estimated input: ~120 tokens" in conversation.transcript_text
             assert calls == []
             assert prompt.text == ""
 
@@ -1303,6 +1589,7 @@ def test_slash_picker_filters_navigates_and_closes(tmp_path) -> None:
             assert [spec.name for spec in prompt.picker_state.specs] == [
                 "context",
                 "compact",
+                "connect",
             ]
 
             await pilot.press("down")
@@ -1377,7 +1664,7 @@ def test_only_commands_with_arguments_are_filled_in_instead_of_run() -> None:
 
 def test_command_specs_are_the_only_command_source() -> None:
     assert filter_command_specs("") == COMMAND_SPECS
-    assert [spec.name for spec in filter_command_specs("CO")] == ["context", "compact"]
+    assert [spec.name for spec in filter_command_specs("CO")] == ["context", "compact", "connect"]
     assert [spec.name for spec in filter_command_specs("q")] == ["exit"]
     assert [spec.name for spec in filter_command_specs("nope")] == []
 
@@ -1483,7 +1770,7 @@ def test_tui_commands_use_shared_help_and_do_not_enter_agent(
             app.submit_user_message("/context")
             for _ in range(40):
                 await pilot.pause(0.02)
-                if "estimated input: 120 / 900 tokens" in app.screen.query_one(ConversationView).transcript_text:
+                if "estimated input: ~120 tokens" in app.screen.query_one(ConversationView).transcript_text:
                     break
             app.submit_user_message("/compact")
             for _ in range(40):
@@ -1495,7 +1782,8 @@ def test_tui_commands_use_shared_help_and_do_not_enter_agent(
             assert "/help" in transcript
             assert "/quit" in transcript
             assert "command> * session-1  Current" in transcript
-            assert "estimated input: 120 / 900 tokens (13.3%)" in transcript
+            assert "context occupancy: ~120 / 1,000 tokens (12.0%)" in transcript
+            assert "input budget: ~120 / 900 tokens (13.3%)" in transcript
             assert "context window: 1,000" in transcript
             assert "memory: none" in transcript
             assert "compact skipped: insufficient_history" in transcript
@@ -1748,7 +2036,7 @@ def test_input_runs_application_session_in_worker_and_enforces_one_active_turn(
                 assert app._active_turn_id is None
                 assert app.screen.query_one("#prompt").disabled is False
                 assert app.focused is prompt
-                assert str(app.screen.query_one(StatusBar).render()) == "Ready"
+                assert app.screen.query_one(StatusBar).status == "Ready"
                 assert "answer" in app.screen.query_one(ConversationView).transcript_text
                 assert presenter_threads
                 assert all(thread_id == app._thread_id for thread_id in presenter_threads)
@@ -1790,7 +2078,7 @@ def test_runtime_failure_finishes_turn_and_allows_next_turn(monkeypatch, tmp_pat
             assert calls == ["first"]
             assert app._session_unusable is False
             assert app.screen.query_one("#prompt").disabled is False
-            assert str(app.screen.query_one(StatusBar).render()) == "Ready"
+            assert app.screen.query_one(StatusBar).status == "Ready"
 
             app.submit_user_message("second")
             for _ in range(40):
@@ -1836,7 +2124,7 @@ def test_turn_exception_interrupts_session_and_blocks_future_submit(
             assert app._session_unusable is True
             assert calls == ["explode"]
             assert app.screen.query_one("#prompt").disabled is True
-            assert str(app.screen.query_one(StatusBar).render()) == "Fatal error"
+            assert app.screen.query_one(StatusBar).status == "Fatal error"
             assert "fatal agent error" in app.screen.query_one(ConversationView).transcript_text
 
             app.submit_user_message("must not run")

@@ -3,10 +3,12 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from openai import APIStatusError, BadRequestError
+from openai import APIStatusError, BadRequestError, OpenAI
 from openai.types.chat import ChatCompletionChunk, ChatCompletionMessage
 
 from mycode.config import LLMConfig
+from mycode.model_config import ModelConfiguration
+from mycode.providers.factory import ModelClientFactory
 from mycode.conversation import Conversation
 from mycode.llm_contracts import FakeLLMClient
 from mycode.model_events import ModelResponse, ModelStreamEvent, ModelToolCall, TokenUsage
@@ -25,6 +27,64 @@ def test_legacy_llm_facade_keeps_established_exports() -> None:
     assert FacadeFakeLLMClient is FakeLLMClient
     assert FacadeOpenAICompatibleLLMClient is OpenAICompatibleLLMClient
     assert FacadeLLMClient is not None
+
+
+@pytest.mark.parametrize("base_url", ["https://example.test/v1", "https://opencode.ai/zen/go/v1"])
+@pytest.mark.parametrize("thinking", [None, False, True])
+@pytest.mark.parametrize("pinned", [False, True])
+def test_role_factory_serializes_current_env_rules(monkeypatch, base_url, thinking, pinned):
+    """Compare current role rules through real SDK HTTP bodies and transport headers."""
+    import json
+
+    requests = []
+
+    def transport(request):
+        requests.append((str(request.url), dict(request.headers), json.loads(request.content)))
+        return httpx.Response(200, json={
+            "id": "response", "object": "chat.completion", "created": 0,
+            "model": "test", "choices": [{"index": 0, "finish_reason": "stop",
+                "message": {"role": "assistant", "content": "ok"}}],
+        })
+
+    def sdk(**kwargs):
+        return OpenAI(**kwargs, http_client=httpx.Client(transport=httpx.MockTransport(transport)))
+
+    monkeypatch.setattr("mycode.providers.openai_compatible.OpenAI", sdk)
+    legacy = LLMConfig(
+        api_key="synthetic-key", base_url=base_url, model="main",
+        compact_model="summary" if pinned else None,
+        subagent_model="worker" if pinned else None,
+        thinking_enabled=thinking, max_output_tokens=1234,
+        headers={"X-Test-Shared": "shared-header"},
+    )
+    factory = ModelClientFactory(ModelConfiguration.from_config(legacy), "session-123")
+    from dataclasses import replace
+    old_clients = []
+    for role, model in (("main", "main"), ("subagent", "worker" if pinned else "main"), ("compact", "summary" if pinned else "main")):
+        expected = replace(legacy, model=model, thinking_enabled=(False if role == "compact" else None if pinned and role == "subagent" else thinking),
+            reasoning_effort=None, max_output_tokens=None if pinned and role != "main" else 1234)
+        old_clients.append(OpenAICompatibleLLMClient(expected, session_id="session-123"))
+    for role, old in zip(("main", "subagent", "compact"), old_clients):
+        new = factory.create(role)
+        try:
+            old.complete(Conversation())
+            new.complete(Conversation())
+            assert requests[-2] == requests[-1]
+        finally:
+            old._client.close()
+            new._client.close()
+
+
+def test_custom_headers_keep_opencode_transport_authoritative() -> None:
+    client = OpenAICompatibleLLMClient(
+        LLMConfig(api_key="test", base_url="https://opencode.ai/zen/go/v1", model="test",
+                  headers={"X-Custom": "custom", "x-opencode-session": "wrong", "user-agent": "wrong"}),
+        session_id="session-123", _client=FakeOpenAIClient(response_content="ok"),
+    )
+    client.complete(Conversation())
+    assert client._client.chat.completions.last_request["extra_headers"] == {
+        "X-Custom": "custom", "User-Agent": "mycode-agent", "x-opencode-session": "session-123",
+    }
 
 
 def test_openai_compatible_client_configures_sdk_retries_and_timeouts(
@@ -430,6 +490,15 @@ def test_openai_compatible_client_captures_non_stream_token_usage() -> None:
         completion_tokens=8,
         total_tokens=128,
     )
+
+
+@pytest.mark.parametrize("prompt", [True, False, "100", -1, float("nan"), float("inf")])
+def test_openai_client_ignores_invalid_prompt_usage(prompt):
+    sdk = FakeOpenAIClient(response_content="done", response_usage=SimpleNamespace(
+        prompt_tokens=prompt, completion_tokens=0, total_tokens=0))
+    client = OpenAICompatibleLLMClient(config=LLMConfig(api_key="synthetic", base_url="https://example.com", model="test"), _client=sdk)
+    client.complete(Conversation())
+    assert client.last_token_usage is None
 
 
 def test_openai_compatible_client_captures_stream_usage_from_empty_choice_chunk() -> None:

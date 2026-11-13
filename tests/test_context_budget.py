@@ -269,6 +269,18 @@ def test_token_estimator_calibrates_from_real_prompt_usage() -> None:
     )
 
 
+@pytest.mark.parametrize("prompt", [None, True, False, 0, -1, "100", 10.5, float("nan"), float("inf")])
+def test_invalid_prompt_usage_cannot_pollute_estimator(prompt):
+    estimator = TokenEstimator()
+    conversation = Conversation.from_messages([Message(role="user", content="hello" * 20)])
+    initial = _estimate_conversation(conversation, ContextBudget(), token_estimator=estimator)
+    usage = None if prompt is None else TokenUsage(prompt, 0, 0)
+    estimator.observe(initial, usage)
+    after = _estimate_conversation(conversation, ContextBudget(), token_estimator=estimator)
+    assert after.token_estimate_source == "default"
+    assert after.estimated_input_tokens == initial.estimated_input_tokens
+
+
 def test_estimate_message_counts_tool_result_id() -> None:
     message = Message(
         role="tool",

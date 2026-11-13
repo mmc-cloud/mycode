@@ -12,6 +12,7 @@ from mycode.application.startup import (
 )
 from mycode.application.sessions import SessionStartRequest
 from mycode.config import LLMConfig
+from mycode.model_config import ModelConfiguration
 from mycode.conversation import Conversation
 from mycode.mcp.config import MCPConfig, MCPConfigError, MCPLoadedConfig
 from mycode.mcp.trust import MCPTrustResolution
@@ -121,6 +122,33 @@ def test_resolve_application_llm_config_reuses_explicit_or_loads_workspace(
     assert resolve_application_llm_config(environment, llm_config=loaded) is loaded
     assert resolve_application_llm_config(environment) is loaded
     assert calls == [tmp_path.resolve()]
+
+
+def test_structured_config_keeps_independent_sessions_and_one_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "mycode.application.startup.load_llm_config",
+        lambda **kwargs: pytest.fail("Explicit structured settings must not reload .env"),
+    )
+    models = ModelConfiguration.from_config(_llm_config())
+    factory = prepare_application_session_factory(
+        create_application_environment(tmp_path, session_store=SessionStore(tmp_path / "projects")),
+        model_configuration=models, mcp_config=MCPConfig(),
+    )
+    first = factory.open_session(SessionStartRequest(mode="new"))
+    try:
+        second = factory.open_session(SessionStartRequest(mode="new"))
+        try:
+            assert factory.model_configuration is models
+            assert first.runner is not second.runner
+            assert first.mcp_manager is not second.mcp_manager
+            assert first.runner.llm_client is not second.runner.llm_client
+            assert first.runner.compactor.summary_token_estimator is not second.runner.compactor.summary_token_estimator
+            assert first.runner.llm_client.session_id != second.runner.llm_client.session_id
+            assert first.runner.llm_client.config.model == models.selection.main.model
+        finally:
+            second.close()
+    finally:
+        first.close()
 
 
 def test_explicit_configs_skip_llm_and_mcp_resolution(tmp_path, monkeypatch) -> None:

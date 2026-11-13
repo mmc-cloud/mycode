@@ -130,6 +130,49 @@ def test_compactor_summarizes_old_turns_and_keeps_recent_protocol_groups() -> No
     ]
 
 
+def test_summary_uses_its_own_budget_and_calibration_without_changing_main_estimator():
+    history = conversation_with_tool_turn()
+    main_estimator = TokenEstimator()
+    main_budget = context_budget(100000)
+    estimate = estimate_conversation(history, main_budget, token_estimator=main_estimator)
+    main_estimator.observe(estimate, TokenUsage(
+        prompt_tokens=estimate.total_chars * 10, completion_tokens=1,
+        total_tokens=estimate.total_chars * 10 + 1,
+    ))
+    original_samples = {key: list(value) for key, value in main_estimator._samples.items()}
+    summary_client = RecordingSummaryClient(
+        responses=[summary_json("continue")],
+        token_usages=[TokenUsage(prompt_tokens=120, completion_tokens=30, total_tokens=150)],
+    )
+    compactor = ConversationCompactor(
+        llm_client=summary_client, summary_budget=context_budget(2000),
+        policy=CompactPolicy(recent_turns_to_keep=2),
+    )
+    result = compactor.prepare(history, main_budget, token_estimator=main_estimator, force=True)
+    assert result.stats.status == "compacted"
+    assert len(summary_client.seen_conversations) == 1
+    assert main_estimator._samples == original_samples
+    assert compactor.summary_token_estimator._samples
+    assert compactor.summary_token_estimator is not main_estimator
+
+
+def test_small_summary_window_fails_before_request_and_preserves_history_boundary():
+    history = conversation_with_tool_turn()
+    original = history.get_messages()
+    summary_client = RecordingSummaryClient(responses=[summary_json("continue")])
+    compactor = ConversationCompactor(
+        llm_client=summary_client, summary_budget=context_budget(100),
+        policy=CompactPolicy(recent_turns_to_keep=2),
+    )
+    result = compactor.prepare(
+        history, context_budget(100000), token_estimator=TokenEstimator(), force=True,
+    )
+    assert result.stats.status == "failed"
+    assert summary_client.seen_conversations == []
+    assert compactor.state.boundary is None
+    assert history.get_messages() == original
+
+
 def test_manual_compact_forces_attempt_below_trigger_without_changing_other_gates() -> None:
     client = RecordingSummaryClient(responses=[summary_json("manual compact")])
     compactor = ConversationCompactor(

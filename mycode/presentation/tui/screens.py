@@ -9,10 +9,11 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.events import Paste
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, LoadingIndicator, OptionList, Static
+from textual.widgets import Button, LoadingIndicator, OptionList, Static, Input, Select
 from textual.widgets.option_list import Option
 
 from mycode.application.sessions import SessionStartRequest
+from mycode.application.agent_session import ContextStatus
 from mycode.mcp.trust import MCPTrustRequest
 from mycode.permissions import ConfirmationRequest, ConfirmationResult
 from mycode.persistence.session_store import SessionRecord
@@ -141,11 +142,13 @@ class MainScreen(Screen[None]):
         workspace: str,
         model: str,
         history: tuple[tuple[str, str], ...] = (),
+        context_status: ContextStatus | None = None,
     ) -> None:
         super().__init__()
         self.workspace = workspace
         self.model = model
         self.history = history
+        self.context_status = context_status
 
     def compose(self) -> ComposeResult:
         yield HeaderBar(self.workspace, self.model, id="header")
@@ -193,6 +196,105 @@ class MainScreen(Screen[None]):
             return
         event.stop()
         prompt.post_message(Paste(event.text))
+
+
+class ModelSettingsScreen(ModalScreen[dict | None]):
+    """Secrets enter only password controls and never the conversation view."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    DEFAULT_CSS = """
+    ModelSettingsScreen { align: center middle; }
+    ModelSettingsScreen > Vertical { width: 78; height: auto; max-height: 95%; overflow-y: auto; background: $surface; padding: 1 2; border: round $accent; }
+    ModelSettingsScreen Input, ModelSettingsScreen Select { margin-bottom: 1; }
+    """
+
+    def __init__(self, *, connection=False, selection=None, windows=None):
+        super().__init__()
+        self.connection = connection
+        self._initial = {}
+        if selection is not None:
+            names = {"window": "context_window_tokens", "reserve": "reserved_output_tokens",
+                     "margin": "context_safety_margin_tokens", "output": "max_output_tokens"}
+            for role in ("main", "subagent", "compact"):
+                selected = getattr(selection, role)
+                values = {"role": role, "model": selected.model or "follow",
+                          "connection": selected.connection_ref or "follow",
+                          "thinking": selected.thinking or "inherit",
+                          "effort": selected.effort or ("auto" if role == "main" else "inherit")}
+                for key, name in names.items():
+                    value = getattr(selected, name)
+                    if key == "window" and windows is not None:
+                        value = windows[role].requested
+                    values[key] = str(value) if value is not None else (
+                        "auto" if key == "output" and role == "main" else "inherit")
+                self._initial[role] = values
+        self._drafts = {role: dict(values) for role, values in self._initial.items()}
+        self._selected_role = "main"
+
+    def compose(self):
+        with Vertical():
+            yield Static("API connection (blank fields keep existing values)" if self.connection else "Edit the selected role; existing values and per-role drafts are preserved")
+            if self.connection:
+                yield Input(placeholder="Base URL", id="setting-base_url")
+                yield Input(placeholder="API Key (hidden)", password=True, id="setting-api_key")
+                yield Input(placeholder="Headers JSON (hidden; {} clears)", password=True, id="setting-headers")
+            else:
+                yield Select([(role, role) for role in ("main", "subagent", "compact")], value="main", allow_blank=False, id="setting-role")
+                yield Input(placeholder="Model ID, or follow for SubAgent/Compact", id="setting-model")
+                yield Input(placeholder="Connection ID (blank retains; follow inherits Main; env uses .env)", id="setting-connection")
+                yield Select([("Follow Main/default", "inherit"), ("Auto", "auto"), ("On", "on"), ("Off", "off")], value="auto", allow_blank=False, id="setting-thinking")
+                for key, label in (("effort", "Effort: low / high / max (blank = API default)"),
+                                   ("window", "Context window"), ("reserve", "Output reserve"),
+                                   ("margin", "Safety margin"), ("output", "Request output limit")):
+                    yield Input(placeholder=label, id=f"setting-{key}")
+            yield Button("Save" if self.connection else "Save selected role", id="settings-save", variant="primary")
+            yield Button("Cancel", id="settings-cancel")
+
+    def on_button_pressed(self, event):
+        if event.button.id == "settings-cancel":
+            self.action_cancel()
+            return
+        if event.button.id == "settings-save":
+            values = self._values()
+            original = self._initial.get(self._selected_role)
+            if not self.connection and original is not None:
+                if values == original:
+                    self.dismiss(None)
+                    return
+                values = {key: value for key, value in values.items()
+                          if key in {"role", "model", "thinking", "effort", "output"} or value != original.get(key)}
+            self.dismiss(values)
+
+    def _values(self):
+        values = {widget.id.removeprefix("setting-"): widget.value for widget in self.query(Input)}
+        for widget in self.query(Select):
+            values[widget.id.removeprefix("setting-")] = str(widget.value)
+        return values
+
+    def on_mount(self):
+        if not self.connection:
+            self._load_role("main")
+
+    def _load_role(self, role):
+        values = self._drafts.get(role, {"model": "", "connection": "",
+            "thinking": "off" if role == "compact" else "auto"})
+        for widget in self.query(Input):
+            widget.value = values.get(widget.id.removeprefix("setting-"), "")
+        self.query_one("#setting-thinking", Select).value = values["thinking"]
+
+    def on_select_changed(self, event):
+        if event.select.id == "setting-role":
+            role = str(event.value)
+            if role == self._selected_role:
+                return
+            try:
+                self._drafts[self._selected_role] = self._values()
+                self._selected_role = role
+                self._load_role(role)
+            except NoMatches:
+                pass
+
+    def action_cancel(self):
+        self.dismiss(None)
 
 
 class MCPTrustScreen(ModalScreen[bool]):

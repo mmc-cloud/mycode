@@ -2,6 +2,8 @@ import os
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
+from types import MappingProxyType
 from typing import Literal
 
 from dotenv import dotenv_values
@@ -17,12 +19,28 @@ DEFAULT_LLM_MEMORY_CONTEXT_TOKENS = 2048
 DEFAULT_LLM_STREAM_INCLUDE_USAGE = True
 
 
-ReasoningEffort = Literal["high", "max"]
-SUPPORTED_REASONING_EFFORTS: frozenset[str] = frozenset({"high", "max"})
+ReasoningEffort = Literal["low", "high", "max"]
+SUPPORTED_REASONING_EFFORTS: frozenset[str] = frozenset({"low", "high", "max"})
 
 
 class MissingLLMConfigError(ValueError):
     pass
+
+
+def freeze_headers(headers: Mapping[str, str]) -> Mapping[str, str]:
+    """Copy connection headers without exposing values in validation errors."""
+    if not isinstance(headers, Mapping):
+        raise ValueError("Connection headers must be a mapping of strings.")
+    copied: dict[str, str] = {}
+    for name, value in headers.items():
+        if not isinstance(name, str) or re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name) is None:
+            raise ValueError("Connection header names must be valid HTTP tokens.")
+        if not isinstance(value, str) or "\r" in value or "\n" in value:
+            raise ValueError("Connection header values must be single-line strings.")
+        if name.lower() in {key.lower() for key in copied}:
+            raise ValueError("Connection header names must be unique ignoring case.")
+        copied[name] = value
+    return MappingProxyType(copied)
 
 
 class _RedactedConfigValues(Mapping[str, str | None]):
@@ -57,52 +75,40 @@ class LLMConfig:
     thinking_enabled: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
     max_output_tokens: int | None = None
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    # Provenance, not a compatibility mode: saved defaults cannot become env.
+    env_source: bool = field(default=True, repr=False)
 
     def __post_init__(self) -> None:
-        main_model = self.model.strip()
-        if main_model == "":
-            raise ValueError("MYCODE_MODEL must not be empty.")
-
-        compact_model = self.compact_model
-        subagent_model = self.subagent_model
-        object.__setattr__(self, "model", main_model)
-        object.__setattr__(
-            self,
-            "compact_model",
-            (
-                main_model
-                if compact_model is None or compact_model.strip() == ""
-                else compact_model.strip()
-            ),
-        )
-        object.__setattr__(
-            self,
-            "subagent_model",
-            main_model
-            if subagent_model is None or subagent_model.strip() == ""
-            else subagent_model.strip(),
-        )
+        for name in ("model", "compact_model", "subagent_model"):
+            value = getattr(self, name)
+            if value is not None:
+                value = value.strip()
+            if name == "model" and not value:
+                raise ValueError("MYCODE_MODEL must not be empty.")
+            object.__setattr__(self, name, value or None)
+        object.__setattr__(self, "headers", freeze_headers(self.headers))
+        if type(self.stream_include_usage) is not bool:
+            raise ValueError("stream_include_usage must be true or false.")
+        if self.thinking_enabled is not None and type(self.thinking_enabled) is not bool:
+            raise ValueError("thinking_enabled must be true, false or None.")
         if self.reasoning_effort is not None:
-            normalized_effort = self.reasoning_effort.strip().lower()
-            if normalized_effort not in SUPPORTED_REASONING_EFFORTS:
-                raise ValueError(
-                    "LLM_REASONING_EFFORT must be one of: high, max."
-                )
-            object.__setattr__(self, "reasoning_effort", normalized_effort)
-        if self.thinking_enabled is True and self.reasoning_effort is None:
-            object.__setattr__(self, "reasoning_effort", "high")
-        if self.thinking_enabled is not True and self.reasoning_effort is not None:
-            raise ValueError(
-                "LLM_REASONING_EFFORT requires LLM_THINKING_ENABLED=true."
-            )
-        if self.max_output_tokens is not None:
-            if self.max_output_tokens < 1:
-                raise ValueError("LLM_MAX_OUTPUT_TOKENS must be at least 1.")
-            if self.max_output_tokens > self.reserved_output_tokens:
-                raise ValueError(
-                    "LLM_MAX_OUTPUT_TOKENS must not exceed "
-                    "LLM_RESERVED_OUTPUT_TOKENS."
-                )
+            effort = self.reasoning_effort.strip().lower()
+            if effort not in SUPPORTED_REASONING_EFFORTS:
+                raise ValueError("LLM_REASONING_EFFORT must be low, high or max.")
+            if self.thinking_enabled is not True:
+                raise ValueError("LLM_REASONING_EFFORT requires LLM_THINKING_ENABLED=true.")
+            object.__setattr__(self, "reasoning_effort", effort)
+        for name in ("context_window_tokens", "reserved_output_tokens", "context_safety_margin_tokens", "memory_context_tokens"):
+            value = getattr(self, name)
+            if type(value) is not int or value < (1 if name == "context_window_tokens" else 0):
+                raise ValueError(f"{name} must be a valid token count.")
+        if self.reserved_output_tokens + self.context_safety_margin_tokens >= self.context_window_tokens:
+            raise ValueError("Model reserves must leave at least 1 input token.")
+        if self.max_output_tokens is not None and (
+            type(self.max_output_tokens) is not int or not 1 <= self.max_output_tokens <= self.reserved_output_tokens
+        ):
+            raise ValueError("LLM_MAX_OUTPUT_TOKENS must be positive and must not exceed LLM_RESERVED_OUTPUT_TOKENS.")
 
 
 def default_user_env_file() -> Path:
@@ -161,14 +167,12 @@ def load_llm_config(
             "MYCODE_MODEL",
             values,
         )
-        compact_model = _env_value(
+        compact_model = _optional_env_value(
             "MYCODE_COMPACT_MODEL",
-            model,
             values,
         )
-        subagent_model = _env_value(
+        subagent_model = _optional_env_value(
             "MYCODE_SUBAGENT_MODEL",
-            model,
             values,
         )
         context_window_tokens = _int_env_value(
@@ -340,7 +344,7 @@ def _optional_reasoning_effort_env_value(
         return None
     normalized = raw_value.lower()
     if normalized not in SUPPORTED_REASONING_EFFORTS:
-        raise ValueError(f"{name} must be one of: high, max.")
+        raise ValueError(f"{name} must be low, high or max.")
     return normalized  # type: ignore[return-value]
 
 

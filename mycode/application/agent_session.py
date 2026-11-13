@@ -18,6 +18,9 @@ from mycode.application.sessions import (
     start_project_session,
 )
 from mycode.config import LLMConfig
+from mycode.model_config import ModelConfiguration
+from mycode.model_activity import model_operation
+from mycode.model_windows import ModelWindow
 from mycode.mcp.config import MCPConfig
 from mycode.mcp.manager import MCPManager
 from mycode.observability import ObservationSink
@@ -50,6 +53,16 @@ class ContextStatus:
     compact_status: str
     compact_covered_message_count: int
     compressed_tool_result_count: int
+    context_window_source: str = "configured"
+    context_window_server_limit: int | None = None
+
+    @property
+    def context_window_percent(self) -> float:
+        return self.estimated_input_tokens / self.context_window_tokens * 100 if self.context_window_tokens > 0 else 0.0
+
+    @property
+    def input_budget_percent(self) -> float:
+        return self.estimated_input_tokens / self.max_input_tokens * 100 if self.max_input_tokens > 0 else 0.0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -57,6 +70,10 @@ class ContextStatus:
             "estimated_input_tokens": self.estimated_input_tokens,
             "context_window_tokens": self.context_window_tokens,
             "max_input_tokens": self.max_input_tokens,
+            "context_window_percent": self.context_window_percent,
+            "input_budget_percent": self.input_budget_percent,
+            "context_window_source": self.context_window_source,
+            "context_window_server_limit": self.context_window_server_limit,
             "reserved_output_tokens": self.reserved_output_tokens,
             "safety_margin_tokens": self.safety_margin_tokens,
             "estimate_source": self.estimate_source,
@@ -94,6 +111,7 @@ def _context_status(
     reserved_output_tokens: int,
     safety_margin_tokens: int,
     last_provider_prompt_tokens: int | None,
+    window: ModelWindow | None = None,
 ) -> ContextStatus:
     memory = context.memory_stats
     compact = context.compact_stats
@@ -113,7 +131,8 @@ def _context_status(
         reserved_output_tokens=reserved_output_tokens,
         safety_margin_tokens=safety_margin_tokens,
         estimate_source=context.estimate.token_estimate_source,
-        last_provider_prompt_tokens=last_provider_prompt_tokens,
+        last_provider_prompt_tokens=(last_provider_prompt_tokens
+            if type(last_provider_prompt_tokens) is int and last_provider_prompt_tokens >= 0 else None),
         source_message_count=context.source_message_count,
         model_visible_message_count=context.selected_message_count,
         memory_entry_count=(0 if memory is None else memory.included_entry_count),
@@ -121,6 +140,8 @@ def _context_status(
         compact_status=compact_status,
         compact_covered_message_count=compact_covered_message_count,
         compressed_tool_result_count=context.compressed_tool_result_count,
+        context_window_source=window.source if window is not None else "configured",
+        context_window_server_limit=window.server_limit if window is not None else None,
     )
 
 
@@ -130,6 +151,8 @@ class AgentApplicationSession:
     active_project_session: ActiveProjectSession
     mcp_manager: MCPManager
     _cleaned_up: bool = field(default=False, init=False, repr=False)
+    model_activity: object | None = field(default=None, init=False, repr=False)
+    models: object | None = field(default=None, init=False, repr=False)
 
     @property
     def compact_state_recovered(self) -> bool:
@@ -145,6 +168,7 @@ class AgentApplicationSession:
         context = self.runner.inspect_context()
         return _context_status(
             context,
+            window=None if self.models is None else self.models.windows["main"],
             context_window_tokens=self.runner.context_budget.context_window_tokens,
             reserved_output_tokens=self.runner.context_budget.reserved_output_tokens,
             safety_margin_tokens=self.runner.context_budget.safety_margin_tokens,
@@ -155,6 +179,7 @@ class AgentApplicationSession:
             ),
         )
 
+    @model_operation("compact")
     def compact_context(self) -> CompactResult:
         """Run one manual Compact and return a safe structured outcome."""
         self._ensure_active()
@@ -190,6 +215,7 @@ class AgentApplicationSession:
                 )
             after = _context_status(
                 context,
+                window=None if self.models is None else self.models.windows["main"],
                 context_window_tokens=self.runner.context_budget.context_window_tokens,
                 reserved_output_tokens=self.runner.context_budget.reserved_output_tokens,
                 safety_margin_tokens=self.runner.context_budget.safety_margin_tokens,
@@ -247,6 +273,7 @@ class AgentApplicationSession:
         for status in self.mcp_statuses:
             yield RuntimeEvent(type="mcp_status", mcp_status=status)
 
+    @model_operation("main")
     def run_turn(
         self,
         content: str,
@@ -297,6 +324,11 @@ class AgentApplicationSession:
     def _cleanup(self, status: Literal["closed", "interrupted"]) -> None:
         if self._cleaned_up:
             return
+        if self.models is not None:
+            try:
+                self.models.close()
+            except Exception:
+                pass
         try:
             if status == "closed":
                 self.active_project_session.close()
@@ -318,12 +350,15 @@ def start_agent_application_session(
     confirmer: Confirmer | None = None,
     external_observer: SubAgentObserver | None = None,
     llm_config: LLMConfig | None = None,
+    model_configuration: ModelConfiguration | None = None,
+    connection_store=None,
     observability_sink: ObservationSink | None = None,
 ) -> AgentApplicationSession:
     with startup_profile.span("session.startup"):
         with startup_profile.span("session.open"):
             active_session = start_project_session(store, project, request=request)
         mcp_manager: MCPManager | None = None
+        runner: AgentRunner | None = None
         try:
             with startup_profile.span("session.history"):
                 conversation_history = active_session.load_history()
@@ -352,18 +387,31 @@ def start_agent_application_session(
                     artifact_directory=active_session.artifact_directory,
                     subagent_observer=subagent_observer,
                     llm_config=llm_config,
+                    **({"model_configuration": model_configuration} if model_configuration is not None else {}),
                     llm_session_id=active_session.record.id,
                     observability_sink=observability_sink,
                 )
             with startup_profile.span("mcp.tools"):
                 for tool in mcp_manager.tools:
                     runner.tool_registry.register(tool)
-            return AgentApplicationSession(
+            application_session = AgentApplicationSession(
                 runner=runner,
                 active_project_session=active_session,
                 mcp_manager=mcp_manager,
             )
+            if isinstance(runner, AgentRunner):
+                from mycode.application.model_management import SessionModels
+                application_session.models = SessionModels(
+                    runner, active_session,
+                    store=connection_store,
+                    explicit=model_configuration is not None,
+                )
+                application_session.model_activity = application_session.models.activity
+            return application_session
         except BaseException:
+            if isinstance(runner, AgentRunner):
+                from mycode.application.model_management import close_model_clients
+                close_model_clients(runner)
             if mcp_manager is not None:
                 try:
                     mcp_manager.close()

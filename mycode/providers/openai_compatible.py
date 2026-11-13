@@ -81,8 +81,6 @@ class OpenAICompatibleLLMClient:
                 if self.reasoning_effort is None
                 else self.reasoning_effort
             )
-            if self.reasoning_effort is None:
-                self.reasoning_effort = "high"
         elif self.reasoning_effort is not None:
             raise ValueError("reasoning_effort requires thinking_enabled=True.")
         if self._client is None:
@@ -272,11 +270,19 @@ class OpenAICompatibleLLMClient:
             "messages": _format_openai_messages(conversation.get_messages()),
             "stream": stream,
         }
+        headers = dict(self.config.headers)
         if _is_opencode_go_base_url(self.config.base_url) and self.session_id:
-            request["extra_headers"] = {
+            # Session transport owns these headers, even with a custom mapping.
+            headers = {
+                name: value for name, value in headers.items()
+                if name.lower() not in {"user-agent", "x-opencode-session"}
+            }
+            headers.update({
                 "User-Agent": "mycode-agent",
                 "x-opencode-session": self.session_id,
-            }
+            })
+        if headers:
+            request["extra_headers"] = headers
         if tools:
             request["tools"] = _format_openai_tools(tools)
         if stream and self.config.stream_include_usage:
@@ -289,7 +295,7 @@ class OpenAICompatibleLLMClient:
                     "type": "enabled" if self.thinking_enabled else "disabled"
                 }
             }
-        if self.thinking_enabled is True:
+        if self.thinking_enabled is True and self.reasoning_effort is not None:
             request["reasoning_effort"] = self.reasoning_effort
         return request
 
@@ -598,7 +604,7 @@ def _extract_token_usage(response: Any) -> TokenUsage | None:
 
 def _usage_value(usage: Any, name: str) -> int | None:
     value = usage.get(name) if isinstance(usage, Mapping) else getattr(usage, name, None)
-    return value if isinstance(value, int) and value >= 0 else None
+    return value if type(value) is int and value >= 0 else None
 
 
 def _parse_tool_calls(tool_calls: list[Any]) -> list[ModelToolCall] | str:

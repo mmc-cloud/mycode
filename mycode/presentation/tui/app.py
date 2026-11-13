@@ -44,6 +44,7 @@ from mycode.presentation.commands import (
     CommandParseError,
     ParsedCommand,
     parse_slash_command,
+    model_editor_arguments,
 )
 from mycode.presentation.command_format import (
     format_command_help,
@@ -69,6 +70,7 @@ from mycode.presentation.tui.screens import (
     MainScreen,
     PermissionScreen,
     WelcomeScreen,
+    ModelSettingsScreen,
 )
 from mycode.presentation.tui.widgets import (
     SPLASH_LOGO,
@@ -81,6 +83,22 @@ from mycode.presentation.tui.widgets import (
 
 
 HistoryItem = tuple[str, str]
+
+
+class ModelCommandMessage(Message):
+    def __init__(self, lines=(), error="", context_status=None):
+        super().__init__()
+        self.lines = lines
+        self.error = error
+        self.context_status = context_status
+
+
+def _context_snapshot(session):
+    """Inspect in the owning worker; a display failure cannot fail its operation."""
+    try:
+        return session.get_context_status()
+    except Exception:
+        return None
 
 
 def _try_close_application_session(
@@ -129,10 +147,12 @@ class StartupSucceededMessage(Message):
         history: tuple[HistoryItem, ...],
         *,
         replace_current: bool = False,
+        context_status: ContextStatus | None = None,
     ) -> None:
         self.application_session = application_session
         self.history = history
         self.replace_current = replace_current
+        self.context_status = context_status
         super().__init__()
 
 
@@ -195,9 +215,10 @@ class TurnRuntimeEventMessage(Message):
 
 
 class TurnCompletedMessage(Message):
-    def __init__(self, turn_id: str, outcome: AgentRunOutcome) -> None:
+    def __init__(self, turn_id: str, outcome: AgentRunOutcome, context_status: ContextStatus | None = None) -> None:
         self.turn_id = turn_id
         self.outcome = outcome
+        self.context_status = context_status
         super().__init__()
 
 
@@ -586,6 +607,7 @@ class MyCodeTuiApp(App[None]):
                     application_session,
                     history,
                     replace_current=replace_current,
+                    context_status=_context_snapshot(application_session),
                 )
             )
         except SessionInUseError as caught:
@@ -732,9 +754,9 @@ class MyCodeTuiApp(App[None]):
     def _current_status_text(self) -> str:
         try:
             if isinstance(self.screen, MainScreen):
-                return str(self.screen.query_one(StatusBar).render())
+                return self.screen.query_one(StatusBar).status
             if self._status_bar is not None:
-                return str(self._status_bar.render())
+                return self._status_bar.status
         except Exception:  # noqa: BLE001 - snapshot is best-effort
             pass
         return "Ready"
@@ -748,6 +770,10 @@ class MyCodeTuiApp(App[None]):
                 self._status_bar.set_status(value)
         except Exception:  # noqa: BLE001 - status update is best-effort
             pass
+
+    def _set_context_status(self, status: ContextStatus | None) -> None:
+        if self._status_bar is not None:
+            self._status_bar.set_context(status)
 
     @on(StartupEventMessage)
     def _on_startup_event(self, message: StartupEventMessage) -> None:
@@ -789,6 +815,7 @@ class MyCodeTuiApp(App[None]):
             )
         else:
             self._show_context_status(message.status)
+        self._set_context_status(message.status)
         self._set_prompt_enabled(True)
         self._set_status("Ready")
         self._focus_prompt()
@@ -814,6 +841,7 @@ class MyCodeTuiApp(App[None]):
                 format_compact_result(result),
                 level=level,
             )
+        self._set_context_status(None if message.result is None else message.result.after)
         self._set_prompt_enabled(True)
         self._set_status("Ready")
         self._focus_prompt()
@@ -853,6 +881,9 @@ class MyCodeTuiApp(App[None]):
             _try_close_application_session(message.application_session)
             return
 
+        if getattr(message.application_session, "models", None) is not None:
+            self._llm_config = message.application_session.runner.llm_client.config
+
         if message.replace_current:
             close_warning = (
                 _try_close_application_session(old_session)
@@ -865,6 +896,7 @@ class MyCodeTuiApp(App[None]):
                     workspace=self.workspace_label,
                     model=self.model_label,
                     history=message.history,
+                    context_status=message.context_status,
                 )
             )
             if close_warning:
@@ -882,6 +914,7 @@ class MyCodeTuiApp(App[None]):
                 workspace=self.workspace_label,
                 model=self.model_label,
                 history=message.history,
+                context_status=message.context_status,
             )
         )
 
@@ -937,6 +970,7 @@ class MyCodeTuiApp(App[None]):
         if message.turn_id != self._active_turn_id:
             return
         self._active_turn_id = None
+        self._set_context_status(message.context_status)
         self._set_prompt_enabled(True)
         self._set_status("Ready")
         self._refresh_session_title()
@@ -997,6 +1031,22 @@ class MyCodeTuiApp(App[None]):
         )
 
     def _handle_command(self, command: ParsedCommand) -> None:
+        if command.name in {"connect", "model"}:
+            editing_connection = command.name == "connect" and len(command.args) == 2 and command.args[0] in {"add", "edit"}
+            if editing_connection or (command.name == "model" and command.args == ("edit",)):
+                self._command_worker_active = True
+                self._set_prompt_enabled(False)
+                selection = None
+                if not editing_connection and self._application_session is not None:
+                    models = self._application_session.models
+                    if models is not None:
+                        selection = models.selection
+                windows = None if editing_connection else self._application_session.models.windows
+                self.push_screen(ModelSettingsScreen(connection=editing_connection, selection=selection, windows=windows),
+                                 lambda values: self._model_settings_done(command, values))
+            else:
+                self._begin_model_command(command)
+            return
         if command.name == "help":
             self._show_command_help()
             return
@@ -1031,6 +1081,63 @@ class MyCodeTuiApp(App[None]):
             f"/{command.name} is not available yet.",
             level="info",
         )
+
+    def _model_settings_done(self, command, values):
+        self._command_worker_active = False
+        if values is None:
+            self._set_prompt_enabled(True)
+            self._focus_prompt()
+            return
+        try:
+            if command.name == "model":
+                command = ParsedCommand("model", model_editor_arguments(values))
+                values = None
+            self._begin_model_command(command, values)
+        except ValueError as error:
+            self._show_command_notice(str(error), level="error")
+            self._set_prompt_enabled(True)
+            self._focus_prompt()
+
+    def _begin_model_command(self, command, values=None):
+        self._command_worker_active = True
+        self._set_prompt_enabled(False)
+        self._set_status("Updating model settings…")
+        self.run_worker(lambda: self._model_command_worker(command, values),
+                        name="model-command", group="session-command", exclusive=True,
+                        thread=True, exit_on_error=False)
+
+    def _model_command_worker(self, command, values):
+        session = self._claim_command_session_for_worker()
+        if session is None:
+            self.post_message(ModelCommandMessage(error="Runtime unavailable."))
+            return
+        try:
+            if session.models is None:
+                raise ValueError("Model management is unavailable.")
+            message = ModelCommandMessage(session.models.command(command.name, command.args, values=values))
+        except Exception as error:
+            message = ModelCommandMessage(error=error_summary(error))
+        message.context_status = _context_snapshot(session)
+        if self._release_command_session_after_worker(session):
+            _try_close_application_session(session)
+            return
+        self.post_message(message)
+
+    @on(ModelCommandMessage)
+    def _on_model_command(self, message):
+        self._command_worker_active = False
+        self._set_context_status(message.context_status)
+        if message.error:
+            self._show_command_notice(message.error, level="error")
+        for line in message.lines:
+            self._show_command_notice(line)
+        self._set_prompt_enabled(True)
+        self._set_status("Ready")
+        if self._application_session is not None and self._application_session.models is not None and self.presenter is not None:
+            # Keep the visible header in sync with a successful Main switch.
+            self._llm_config = self._application_session.runner.llm_client.config
+            self.presenter.header.set_model(self._llm_config.model)
+        self._focus_prompt()
 
     def _show_command_help(self) -> None:
         for line in format_command_help():
@@ -1148,6 +1255,7 @@ class MyCodeTuiApp(App[None]):
     def _activate_main_screen(self, screen: MainScreen) -> None:
         conversation = screen.query_one(ConversationView)
         self._status_bar = screen.query_one(StatusBar)
+        self._set_context_status(screen.context_status)
         self.presenter = TuiPresenter(
             conversation=conversation,
             header=screen.query_one(HeaderBar),
@@ -1245,10 +1353,11 @@ class MyCodeTuiApp(App[None]):
                 return
             self.post_message(TurnFailedMessage(turn_id, caught, interrupt_error))
             return
+        context_status = _context_snapshot(application_session)
         if self._release_turn_session_after_turn(application_session):
             _try_close_application_session(application_session)
             return
-        self.post_message(TurnCompletedMessage(turn_id, outcome))
+        self.post_message(TurnCompletedMessage(turn_id, outcome, context_status))
 
     def _claim_command_session_for_worker(
         self,

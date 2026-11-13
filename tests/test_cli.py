@@ -716,8 +716,8 @@ def test_build_agent_runner_injects_loaded_instructions(
     assert runner.compactor.llm_client.thinking_enabled is False
     subagent_client = delegate_tool.runtime.llm_client_factory()
     assert subagent_client.model == "subagent-model"
-    assert subagent_client.thinking_enabled is True
-    assert subagent_client.reasoning_effort == "max"
+    assert subagent_client.thinking_enabled is None
+    assert subagent_client.reasoning_effort is None
 
 
 def test_build_agent_runner_registers_session_scoped_artifact_reader(
@@ -1342,7 +1342,9 @@ def test_cli_context_status_uses_max_input_and_shows_memory_none() -> None:
         outputs.append,
     )
 
-    assert "command> estimated input: 120 / 900 tokens (13.3%)" in outputs
+    assert "command> estimated input: ~120 tokens" in outputs
+    assert "command> context occupancy: ~120 / 1,000 tokens (12.0%)" in outputs
+    assert "command> input budget: ~120 / 900 tokens (13.3%)" in outputs
     assert "command> context window: 1,000" in outputs
     assert "command> memory: none" in outputs
 

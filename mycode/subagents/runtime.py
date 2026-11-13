@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from mycode.agent.events import AgentEvent, AgentModelResponse
 from mycode.context.budget import ContextBudget, MemoryContextStats, TokenEstimator
+from mycode.model_activity import model_operation
 from mycode.conversation import Conversation
 from mycode.instructions import InstructionBundle, load_instruction_bundle
 from mycode.llm_contracts import LLMClient
@@ -117,6 +118,7 @@ class SubAgentRuntime:
         repr=False,
         compare=False,
     )
+    model_activity: object | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_turns < 1:
@@ -150,6 +152,7 @@ class SubAgentRuntime:
         if not working_directory.is_relative_to(self.workspace.root):
             raise ValueError("working_directory must be inside the workspace.")
 
+    @model_operation("subagent")
     def execute(
         self,
         task: SubAgentTask,

@@ -109,7 +109,7 @@ class TokenEstimator:
         )
 
     def observe(self, estimate: "ConversationEstimate", usage: TokenUsage | None) -> None:
-        if usage is None or usage.prompt_tokens < 1 or estimate.total_chars < 1:
+        if usage is None or type(usage.prompt_tokens) is not int or usage.prompt_tokens < 1 or estimate.total_chars < 1:
             return
 
         samples = self._samples.setdefault(estimate.token_profile, [])

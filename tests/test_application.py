@@ -1,8 +1,13 @@
 from uuid import uuid4
+from types import SimpleNamespace
+
+import pytest
 
 from mycode.agent.events import AgentEvent
 from mycode.application import build_agent_runner, run_agent_turn
 from mycode.config import LLMConfig
+from mycode.model_config import APIConnectionConfig, ModelConfiguration
+from mycode.model_selection import ModelSelection, RoleSelection
 from mycode.agent.outcome import AgentRunOutcome
 from mycode.agent.runner import AgentRunner
 
@@ -110,3 +115,64 @@ def test_run_agent_turn_without_exactly_one_stop_is_runtime_failure() -> None:
     assert run_agent_turn(repeated_stop, "inspect") == AgentRunOutcome.from_stop_reason(
         None
     )
+
+
+def test_factory_keeps_eager_main_compact_and_fresh_deferred_subagents(tmp_path, monkeypatch):
+    created = []
+
+    def client(**kwargs):
+        result = SimpleNamespace(**kwargs, model=kwargs["config"].model)
+        created.append(result)
+        return result
+
+    monkeypatch.setattr("mycode.providers.factory.OpenAICompatibleLLMClient", client)
+    runner = build_agent_runner(
+        workspace_path=tmp_path,
+        llm_config=LLMConfig(api_key="test", base_url="https://example.com", model="main",
+                             compact_model="compact", subagent_model="subagent"),
+        llm_session_id="shared-session",
+    )
+    assert [item.model for item in created] == ["main", "compact"]
+    runtime = runner.tool_registry.require("delegate_task").runtime
+    first = runtime.llm_client_factory()
+    second = runtime.llm_client_factory()
+    assert first is not second
+    assert [item.model for item in created] == ["main", "compact", "subagent", "subagent"]
+    assert {item.session_id for item in created} == {"shared-session"}
+
+
+def test_runner_shares_connection_with_independent_models_and_budgets(tmp_path):
+    models = ModelConfiguration(connections={"main": APIConnectionConfig("main-key", "https://main.example/v1", {"X-Shared": "shared-header"})},
+        selection=ModelSelection(main=RoleSelection(connection_ref="main", model="main", thinking="on", effort="max"),
+            subagent=RoleSelection(model="sub", thinking="on", effort="high", context_window_tokens=16000,
+                reserved_output_tokens=2000, context_safety_margin_tokens=1000),
+            compact=RoleSelection(model="summary", context_window_tokens=32000,
+                reserved_output_tokens=4000, context_safety_margin_tokens=2000)))
+    runner = build_agent_runner(workspace_path=tmp_path, model_configuration=models)
+    runtime = runner.tool_registry.require("delegate_task").runtime
+    assert runner.context_budget.context_window_tokens == 128000
+    assert runtime.context_budget.max_input_tokens == 13000
+    assert runner.compactor.summary_budget.max_input_tokens == 26000
+    subagent = runtime.llm_client_factory()
+    for client in (runner.llm_client, subagent, runner.compactor.llm_client):
+        assert client.config.base_url == "https://main.example/v1"
+        assert client.config.api_key == "main-key"
+        assert client.config.headers == {"X-Shared": "shared-header"}
+        assert client.session_id == runner.llm_client.session_id
+    assert runner.llm_client.reasoning_effort == "max"
+    assert subagent.model == "sub"
+    assert subagent.reasoning_effort == "high"
+    assert runner.compactor.llm_client.model == "summary"
+    assert runner.compactor.llm_client.thinking_enabled is False
+
+
+def test_invalid_role_config_fails_before_any_client_creation(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "mycode.providers.factory.OpenAICompatibleLLMClient",
+        lambda **kwargs: pytest.fail("No client should be created for invalid role config"),
+    )
+    models = ModelConfiguration(connections={"main": APIConnectionConfig("test", "https://example.com")},
+        selection=ModelSelection(main=RoleSelection(connection_ref="main", model="main"),
+            subagent=RoleSelection(model="different", context_window_tokens=10)))
+    with pytest.raises(ValueError, match="reserves"):
+        build_agent_runner(workspace_path=tmp_path, model_configuration=models)

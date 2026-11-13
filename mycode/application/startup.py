@@ -16,7 +16,8 @@ from mycode.application.agent_session import (
     start_agent_application_session,
 )
 from mycode.application.sessions import SessionStartRequest
-from mycode.config import LLMConfig, load_llm_config
+from mycode.config import LLMConfig, MissingLLMConfigError, load_llm_config
+from mycode.model_config import ModelConfiguration
 from mycode.mcp.config import MCPConfig, MCPConfigError, load_mcp_config_layers
 from mycode.mcp.trust import MCPTrustConfirmer, resolve_project_mcp_trust
 from mycode.observability import ObservationSink
@@ -54,6 +55,7 @@ class ApplicationSessionFactory:
     confirmer: Confirmer | None = None
     external_observer: SubAgentObserver | None = None
     observability_sink: ObservationSink | None = None
+    model_configuration: ModelConfiguration | None = None
 
     def open_session(self, request: SessionStartRequest) -> AgentApplicationSession:
         """Create one independent AgentApplicationSession for ``request``."""
@@ -64,7 +66,11 @@ class ApplicationSessionFactory:
             mcp_config=self.resolved_mcp_config,
             confirmer=self.confirmer,
             external_observer=self.external_observer,
-            llm_config=self.llm_config,
+            **(
+                {"llm_config": self.llm_config}
+                if self.model_configuration is None
+                else {"model_configuration": self.model_configuration}
+            ),
             observability_sink=self.observability_sink,
         )
 
@@ -88,6 +94,7 @@ def prepare_application_session_factory(
     environment: ApplicationEnvironment,
     *,
     llm_config: LLMConfig | None = None,
+    model_configuration: ModelConfiguration | None = None,
     mcp_config: MCPConfig | None = None,
     mcp_trust_confirmer: MCPTrustConfirmer | None = None,
     trust_file: str | Path | None = None,
@@ -103,10 +110,15 @@ def prepare_application_session_factory(
     the returned factory reuse that snapshot while still getting their own
     MCPManager in ``start_agent_application_session``.
     """
-    effective_llm_config = resolve_application_llm_config(
-        environment,
-        llm_config=llm_config,
-    )
+    if model_configuration is not None and llm_config is not None:
+        raise ValueError("Supply either llm_config or model_configuration, not both.")
+    if model_configuration is None:
+        effective_llm_config = resolve_application_llm_config(environment, llm_config=llm_config)
+    else:
+        # Validate every role before opening any Session or connecting MCP.
+        for role in ("main", "subagent", "compact"):
+            model_configuration.resolve(role)
+        effective_llm_config = model_configuration.resolve("main")
 
     if mcp_config is not None:
         effective_mcp_config = mcp_config
@@ -142,6 +154,7 @@ def prepare_application_session_factory(
     return ApplicationSessionFactory(
         environment=environment,
         llm_config=effective_llm_config,
+        model_configuration=model_configuration,
         resolved_mcp_config=effective_mcp_config,
         confirmer=confirmer,
         external_observer=external_observer,
@@ -157,7 +170,23 @@ def resolve_application_llm_config(
     """Resolve one application-scoped LLM configuration snapshot."""
     if llm_config is not None:
         return llm_config
-    return load_llm_config(workspace_root=environment.workspace.root)
+    try:
+        return load_llm_config(workspace_root=environment.workspace.root)
+    except MissingLLMConfigError:
+        # Saved full defaults can bootstrap without env credentials. Never
+        # reinterpret an explicit env reference as a different connection.
+        from mycode.persistence.connection_store import ConnectionStore
+        doc = ConnectionStore().read()
+        selection = doc.default_models
+        if selection is None or any(getattr(selection, role).connection_ref == "env"
+                                    for role in ("main", "subagent", "compact")):
+            raise
+        saved = doc.connections.get(selection.main.connection_ref)
+        if saved is None:
+            raise
+        config = LLMConfig(api_key=saved.api_key, base_url=saved.base_url, headers=saved.headers,
+                          model=selection.main.model, env_source=False)
+        return ModelConfiguration(selection=selection, connections={key: item.connection() for key, item in doc.connections.items()}).resolve("main")
 
 
 __all__ = [

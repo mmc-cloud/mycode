@@ -16,6 +16,8 @@ def test_command_specs_define_all_canonical_commands() -> None:
         "resume",
         "context",
         "compact",
+        "connect",
+        "model",
         "exit",
     ]
     assert all(spec.usage and spec.description for spec in COMMAND_SPECS)
@@ -34,6 +36,9 @@ def test_command_specs_define_all_canonical_commands() -> None:
         ("/resume abc123", ParsedCommand("resume", ("abc123",))),
         ("/context", ParsedCommand("context")),
         ("/compact", ParsedCommand("compact")),
+        ("/connect", ParsedCommand("connect")),
+        ("/connect use service model", ParsedCommand("connect", ("use", "service", "model"))),
+        ("/model subagent worker connection=service", ParsedCommand("model", ("subagent", "worker", "connection=service"))),
         ("/exit", ParsedCommand("exit")),
     ],
 )

@@ -3,6 +3,7 @@
 from mycode import startup_profile
 
 import argparse
+import getpass
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -43,6 +44,7 @@ from mycode.presentation.commands import (
     CommandParseError,
     ParsedCommand,
     parse_slash_command,
+    model_editor_arguments,
 )
 from mycode.presentation.command_format import (
     format_command_help,
@@ -248,6 +250,29 @@ def run_agent_command(
 
     def handle_command(command: ParsedCommand) -> bool:
         nonlocal application_session
+
+        if command.name in {"connect", "model"}:
+            try:
+                values = None
+                args = command.args
+                if command.name == "connect" and len(args) == 2 and args[0] in {"add", "edit"}:
+                    values = {
+                        "base_url": input_func("Base URL (blank keeps existing): ").strip(),
+                        "api_key": getpass.getpass("API Key (hidden; blank keeps existing): "),
+                        "headers": getpass.getpass("Headers JSON (hidden; blank keeps existing, {} clears): "),
+                    }
+                if command.name == "model" and args == ("edit",):
+                    fields = ("role", "model", "connection", "thinking", "effort", "window", "reserve", "margin", "output")
+                    entries = {key: input_func(f"{key} (blank = default; model may be follow): ") for key in fields}
+                    entries["role"] = entries["role"] or "main"
+                    args = model_editor_arguments(entries)
+                if application_session.models is None:
+                    raise ValueError("Model management is unavailable for this runtime.")
+                for line in application_session.models.command(command.name, args, values=values):
+                    output_func(f"command> {line}")
+            except (ValueError, RuntimeError) as error:
+                output_func(f"command> {error_summary(error)}")
+            return False
 
         if command.name == "help":
             _output_command_help(output_func)

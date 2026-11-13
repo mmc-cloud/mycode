@@ -1,6 +1,13 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
+
+from mycode.model_config import (
+    APIConnectionConfig, ModelConfiguration,
+)
+
+from mycode.model_selection import ModelSelection, RoleSelection
 
 from mycode.config import (
     DEFAULT_LLM_CONTEXT_SAFETY_MARGIN_TOKENS,
@@ -119,8 +126,8 @@ def test_load_llm_config_reads_user_env_file(tmp_path) -> None:
     assert config.api_key == "test-key"
     assert config.base_url == "https://example.com/v1"
     assert config.model == "test-model"
-    assert config.compact_model == "test-model"
-    assert config.subagent_model == "test-model"
+    assert config.compact_model is None
+    assert config.subagent_model is None
 
 
 def test_load_llm_config_reads_project_env_without_user_env(tmp_path) -> None:
@@ -200,8 +207,8 @@ def test_load_llm_config_uses_defaults_for_optional_values(tmp_path) -> None:
 
     assert config.base_url == "https://example.com/v1"
     assert config.model == "test-model"
-    assert config.compact_model == "test-model"
-    assert config.subagent_model == "test-model"
+    assert config.compact_model is None
+    assert config.subagent_model is None
     assert config.context_window_tokens == DEFAULT_LLM_CONTEXT_WINDOW_TOKENS
     assert config.reserved_output_tokens == DEFAULT_LLM_RESERVED_OUTPUT_TOKENS
     assert (
@@ -231,7 +238,7 @@ def test_load_llm_config_reads_deepseek_reasoning_values(tmp_path) -> None:
     assert config.max_output_tokens == 4096
 
 
-def test_llm_config_defaults_enabled_thinking_effort_to_high() -> None:
+def test_llm_config_enabled_thinking_uses_api_default_effort() -> None:
     config = LLMConfig(
         api_key="test-key",
         base_url="https://example.com",
@@ -239,10 +246,10 @@ def test_llm_config_defaults_enabled_thinking_effort_to_high() -> None:
         thinking_enabled=True,
     )
 
-    assert config.reasoning_effort == "high"
+    assert config.reasoning_effort is None
 
 
-@pytest.mark.parametrize("effort", ["low", "medium", "xhigh", "invalid"])
+@pytest.mark.parametrize("effort", ["medium", "xhigh", "invalid"])
 def test_load_llm_config_rejects_unsupported_reasoning_effort(
     tmp_path,
     effort: str,
@@ -254,7 +261,7 @@ def test_load_llm_config_rejects_unsupported_reasoning_effort(
         f"LLM_REASONING_EFFORT={effort}",
     )
 
-    with pytest.raises(ValueError, match="high, max"):
+    with pytest.raises(ValueError, match="low, high or max"):
         load_llm_config(env_file)
 
 
@@ -312,8 +319,8 @@ def test_load_llm_config_ignores_empty_role_models(tmp_path) -> None:
 
     config = load_llm_config(env_file)
 
-    assert config.compact_model == "main-model"
-    assert config.subagent_model == "main-model"
+    assert config.compact_model is None
+    assert config.subagent_model is None
 
 
 def test_load_llm_config_reads_unchanged_context_budget_values(tmp_path) -> None:
@@ -512,3 +519,113 @@ def test_load_llm_config_requires_connection_values(
 
     with pytest.raises(MissingLLMConfigError, match=missing_name):
         load_llm_config(env_file)
+
+
+def _model_configuration(**roles) -> ModelConfiguration:
+    return ModelConfiguration(connections={"main": APIConnectionConfig("synthetic-secret", "https://example.com/v1")},
+        selection=ModelSelection(main=RoleSelection(connection_ref="main", model="main", thinking="on", effort="max"), **roles))
+
+
+def test_role_intent_preserves_following_and_explicit_same_model(tmp_path):
+    env_file = tmp_path / "user.env"
+    write_valid_env(env_file, "MYCODE_COMPACT_MODEL=test-model")
+    config = load_llm_config(env_file)
+    settings = ModelConfiguration.from_config(config)
+    assert settings.selection.subagent.model is None
+    assert settings.selection.compact.model == "test-model"
+    changed = replace(settings, selection=settings.selection.model_copy(update={
+        "main": settings.selection.main.model_copy(update={"model": "new-main"})}))
+    assert changed.resolve("subagent").model == "new-main"
+    assert changed.resolve("compact").model == "test-model"
+    assert config.subagent_model is None
+
+
+def test_local_overrides_preserve_omission_and_do_not_mutate_main():
+    settings = _model_configuration(subagent=RoleSelection(thinking="auto", max_output_tokens=1024),
+        compact=RoleSelection(reserved_output_tokens=4096))
+    subagent, compact = settings.resolve("subagent"), settings.resolve("compact")
+    assert subagent.thinking_enabled is None
+    assert subagent.reasoning_effort is None
+    assert subagent.max_output_tokens == 1024
+    assert subagent.context_window_tokens == settings.resolve("main").context_window_tokens
+    assert compact.thinking_enabled is False and compact.reasoning_effort is None
+    assert compact.reserved_output_tokens == 4096
+    assert settings.resolve("main").reasoning_effort == "max"
+
+
+def test_role_model_normalizes_identity_and_explicit_auto_clears_effort():
+    settings = _model_configuration(subagent=RoleSelection(model="  main  "))
+    assert settings.selection.subagent.model == "main"
+    assert settings.resolve("subagent").reasoning_effort == "max"
+    cleared = replace(settings, selection=settings.selection.model_copy(update={"subagent": RoleSelection(effort="auto")}))
+    assert cleared.resolve("subagent").reasoning_effort is None
+
+
+@pytest.mark.parametrize("role", ["subagent", "compact"])
+def test_new_model_uses_current_defaults_and_drops_incompatible_parameters(role):
+    settings = _model_configuration(**{role: RoleSelection(model="other")})
+    effective = settings.resolve(role)
+    assert effective.context_window_tokens == 128000
+    assert effective.thinking_enabled is (False if role == "compact" else None)
+    assert effective.reasoning_effort is None and effective.max_output_tokens is None
+    configured = replace(settings, selection=settings.selection.model_copy(update={role: RoleSelection(
+        model="other", context_window_tokens=16000, reserved_output_tokens=2000, context_safety_margin_tokens=1000)}))
+    assert configured.resolve(role).context_window_tokens == 16000
+
+
+def test_all_roles_share_one_immutable_redacted_connection():
+    headers = {"X-Provider-Token": "synthetic-header-secret"}
+    connection = APIConnectionConfig("synthetic-secret", "https://example.com/v1", headers)
+    settings = replace(_model_configuration(), connections={"main": connection})
+    headers["X-Provider-Token"] = "mutated"
+    for role in ("main", "subagent", "compact"):
+        effective = settings.resolve(role)
+        assert effective.api_key == connection.api_key
+        assert effective.base_url == connection.base_url
+        assert effective.headers == {"X-Provider-Token": "synthetic-header-secret"}
+        with pytest.raises(TypeError):
+            effective.headers["Other"] = "value"
+        assert "synthetic-secret" not in repr(effective)
+        assert "synthetic-header-secret" not in repr(effective)
+    assert "synthetic-secret" not in repr(settings)
+
+
+@pytest.mark.parametrize("field,value", [("api_key", "test"), ("base_url", "https://other.example"), ("headers", {})])
+def test_role_config_rejects_connection_field_overrides(field, value):
+    with pytest.raises(ValueError):
+        RoleSelection(**{field: value})
+
+
+@pytest.mark.parametrize("kwargs", [dict(context_window_tokens=True), dict(reserved_output_tokens=-1),
+    dict(context_window_tokens=100, reserved_output_tokens=100), dict(max_output_tokens=9000),
+    dict(thinking_enabled="yes"), dict(reasoning_effort="max")])
+def test_effective_llm_config_rejects_invalid_values(kwargs):
+    with pytest.raises(ValueError):
+        LLMConfig(api_key="synthetic", base_url="https://example.com", model="test", **kwargs)
+
+
+@pytest.mark.parametrize("headers", [{"Bad Name": "value"}, {"Good": "value\r\nInjected: bad"},
+    {"X-Key": "one", "x-key": "two"}, ["not a mapping"]])
+def test_structured_connections_reject_invalid_headers_without_values(headers):
+    with pytest.raises(ValueError) as error:
+        APIConnectionConfig("synthetic-secret", "https://example.com", headers=headers)
+    assert "synthetic-secret" not in str(error.value) and "Injected" not in str(error.value)
+
+
+def test_env_and_interactive_selection_use_one_thinking_rule():
+    config = LLMConfig(api_key="test", base_url="https://example.com", model="main", subagent_model="other",
+        compact_model="summary", thinking_enabled=True, max_output_tokens=1234)
+    settings = ModelConfiguration.from_config(config)
+    assert settings.resolve("main").reasoning_effort is None
+    assert settings.resolve("subagent").thinking_enabled is None
+    assert settings.resolve("compact").thinking_enabled is False
+    assert settings.resolve("subagent").max_output_tokens is None
+    assert settings.resolve("compact").max_output_tokens is None
+
+
+def test_env_accepts_explicit_low_reasoning_effort(tmp_path):
+    env_file = tmp_path / "user.env"
+    write_valid_env(env_file, "LLM_THINKING_ENABLED=true", "LLM_REASONING_EFFORT=low")
+    config = load_llm_config(env_file)
+    assert config.reasoning_effort == "low"
+    assert ModelConfiguration.from_config(config).resolve("main").reasoning_effort == "low"

@@ -14,6 +14,7 @@ class CommandSpec:
     usage: str
     description: str
     requires_arguments: bool = False
+    variadic: bool = False
     """Whether the command needs the user to supply an argument.
 
     This is the single source of truth for "can this command run as typed?".
@@ -57,6 +58,8 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     ),
     CommandSpec("context", (), "/context", "Show current context information."),
     CommandSpec("compact", (), "/compact", "Compact the current conversation."),
+    CommandSpec("connect", (), "/connect [list|add ID|edit ID|delete ID|default ID|models ID|use ID MODEL]", "Manage saved API connections.", variadic=True),
+    CommandSpec("model", (), "/model [edit|default [clear]|ROLE MODEL|follow [key=value ...]]", "Select role models, connections and Thinking.", variadic=True),
     CommandSpec(
         "exit",
         ("quit",),
@@ -96,13 +99,26 @@ def parse_slash_command(text: str) -> ParsedCommand | None:
         return None
 
     args = tuple(parts[1:])
-    if spec.requires_arguments:
+    if spec.variadic:
+        pass
+    elif spec.requires_arguments:
         if len(args) != 1:
             raise CommandParseError(spec.name, spec.usage)
     elif args:
         raise CommandParseError(spec.name, spec.usage)
 
     return ParsedCommand(name=spec.name, args=args)
+
+
+def model_editor_arguments(values: dict[str, str]) -> tuple[str, ...]:
+    role, model = values.get("role", "main"), values.get("model", "").strip()
+    if not model:
+        raise ValueError("Enter a model ID, or follow for a child role.")
+    args = [role, model]
+    for key in ("connection", "thinking", "effort", "window", "reserve", "margin", "output"):
+        if value := values.get(key, "").strip():
+            args.append(f"{key}={value}")
+    return tuple(args)
 
 
 __all__ = [
